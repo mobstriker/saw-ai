@@ -1,6 +1,6 @@
 import { AIProfile, BYOKSettings } from '../types';
 import { ModelRouter } from './modelRouter';
-import { resolveChatCompletionsUrl } from './chatProxy';
+import { resolveChatCompletionsUrl, universalFetch } from './chatProxy';
 
 export class ChatTitler {
   /**
@@ -129,7 +129,7 @@ export class ChatTitler {
       // full chat completions endpoint, the same way the chat path does.
       const chatUrl = resolveChatCompletionsUrl(baseUrl);
 
-      const response = await fetch(chatUrl, {
+      const response = await universalFetch(chatUrl, {
         method: 'POST',
         headers: requestHeaders,
         signal: controller.signal,

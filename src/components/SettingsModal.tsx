@@ -31,7 +31,7 @@ import { MCPTab } from './MCPTab';
 import { SkillsTab } from './SkillsTab';
 import { AddSkillModal } from './AddSkillModal';
 import { StorageService } from '../utils/storage';
-import { resolveChatCompletionsUrl } from '../utils/chatProxy';
+import { resolveChatCompletionsUrl, universalFetch } from '../utils/chatProxy';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -140,7 +140,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     });
   };
 
-  const handleAddNewProfile = (preset?: 'openai' | 'openrouter' | 'deepseek' | 'groq' | 'moonshot' | 'ollama' | 'custom') => {
+  const handleAddNewProfile = (preset?: 'openai' | 'openrouter' | 'deepseek' | 'groq' | 'moonshot' | 'gemini' | 'zhipu' | 'nvidia' | 'ollama' | 'custom') => {
     let newProf: AIProfile;
 
     if (preset === 'openrouter') {
@@ -201,6 +201,51 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         isActive: false,
         maxTokens: 16384,
         contextWindow: 256000,
+        updatedAt: Date.now(),
+      };
+    } else if (preset === 'gemini') {
+      newProf = {
+        id: `profile-${Date.now()}`,
+        name: 'Google Gemini',
+        provider: 'gemini',
+        baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
+        apiKey: '',
+        model: 'gemini-2.5-flash',
+        customHeaders: '',
+        systemPrompt: 'You are Gemini, a fast and capable AI assistant by Google.',
+        isActive: false,
+        maxTokens: 8192,
+        contextWindow: 1000000,
+        updatedAt: Date.now(),
+      };
+    } else if (preset === 'zhipu') {
+      newProf = {
+        id: `profile-${Date.now()}`,
+        name: 'Zhipu GLM (Z-AI)',
+        provider: 'custom',
+        baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
+        apiKey: '',
+        model: 'glm-4-flash',
+        customHeaders: '',
+        systemPrompt: 'You are GLM, a capable AI assistant by Zhipu AI.',
+        isActive: false,
+        maxTokens: 8192,
+        contextWindow: 128000,
+        updatedAt: Date.now(),
+      };
+    } else if (preset === 'nvidia') {
+      newProf = {
+        id: `profile-${Date.now()}`,
+        name: 'NVIDIA NIM',
+        provider: 'custom',
+        baseUrl: 'https://integrate.api.nvidia.com/v1',
+        apiKey: '',
+        model: 'nvidia/llama-3.1-nemotron-70b-instruct',
+        customHeaders: '',
+        systemPrompt: 'You are a high-performance AI assistant running on NVIDIA NIM.',
+        isActive: false,
+        maxTokens: 8192,
+        contextWindow: 128000,
         updatedAt: Date.now(),
       };
     } else if (preset === 'ollama') {
@@ -313,6 +358,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       trimmedUrl.includes('api.groq.com') ? 'Groq' :
       trimmedUrl.includes('api.moonshot.cn') ? 'Moonshot' :
       trimmedUrl.includes('generativelanguage.googleapis.com') ? 'Google Gemini' :
+      trimmedUrl.includes('open.bigmodel.cn') ? 'Zhipu (Z-AI)' :
+      trimmedUrl.includes('integrate.api.nvidia.com') ? 'NVIDIA NIM' :
       trimmedUrl.includes('api.anthropic.com') ? 'Anthropic' :
       trimmedUrl.includes('localhost') || trimmedUrl.includes('127.0.0.1') ? 'Local' : 'Custom';
 
@@ -341,7 +388,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
     const startTime = Date.now();
     try {
-      const res = await fetch(probeUrl, { method, headers, body, signal: AbortSignal.timeout(8000) });
+      const res = await universalFetch(probeUrl, { method, headers, body, signal: AbortSignal.timeout(8000) });
       const latencyMs = Date.now() - startTime;
 
       if (res.ok) {
@@ -355,19 +402,23 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           [id]: `Provider: ${detectedProvider} • Status: HTTP ${res.status}`,
         }));
       } else {
-        // Non-200 still confirms the key/endpoint is reachable for most providers
-        // (e.g. OpenAI returns 401 for bad keys, 400 for bad model). Surface the status.
+        // Surface the real provider error so the user knows exactly what's wrong
+        // (e.g. "model not found", "invalid api key"). A 401/429 confirms the
+        // endpoint is reachable but the key/quota has an issue. A 400 usually
+        // means the model name is wrong — show the error, not "verified".
         let errDetail = `Endpoint responded with HTTP ${res.status}`;
         try {
           const errData = await res.json();
           errDetail = errData?.error?.message || errData?.error || errData?.message || errDetail;
         } catch {}
-        const reachable = res.status === 400 || res.status === 401 || res.status === 404 || res.status === 429;
-        setPingStatusMap((prev) => ({ ...prev, [id]: reachable ? 'success' : 'error' }));
+        // 401 = key issue but endpoint reachable; 429 = rate limit but reachable.
+        // 400 = bad request (wrong model name) — show the real error.
+        const keyReachable = res.status === 401 || res.status === 429;
+        setPingStatusMap((prev) => ({ ...prev, [id]: keyReachable ? 'success' : 'error' }));
         setPingMessageMap((prev) => ({
           ...prev,
-          [id]: reachable
-            ? `Connection verified! (${latencyMs}ms latency)`
+          [id]: keyReachable
+            ? `Endpoint reachable (${latencyMs}ms). Note: ${errDetail}`
             : `Connection failed: ${errDetail}`,
         }));
         setDetectedInfoMap((prev) => ({
@@ -646,6 +697,27 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-[#FAF8F5] text-[#2C2825] font-medium"
                           >
                             Moonshot Kimi K3
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleAddNewProfile('gemini')}
+                            className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-[#FAF8F5] text-[#2C2825] font-medium"
+                          >
+                            Google Gemini
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleAddNewProfile('zhipu')}
+                            className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-[#FAF8F5] text-[#2C2825] font-medium"
+                          >
+                            Zhipu GLM (Z-AI)
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleAddNewProfile('nvidia')}
+                            className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-[#FAF8F5] text-[#2C2825] font-medium"
+                          >
+                            NVIDIA NIM
                           </button>
                           <button
                             type="button"

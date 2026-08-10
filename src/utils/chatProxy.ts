@@ -28,6 +28,60 @@ export function resolveChatCompletionsUrl(rawUrl: string): string {
   return url + '/chat/completions';
 }
 
+/**
+ * Universal fetch that tries the browser's fetch first (fast, native
+ * streaming for CORS-friendly providers) and falls back to Tauri's
+ * Rust-side HTTP plugin when the browser blocks the request (CSP or CORS).
+ *
+ * This makes NVAPI / Nvidia, Zhipu (Z-AI), and any other CORS-restrictive
+ * OpenAI-compatible endpoint work in the desktop app, because the fallback
+ * request originates from Rust, which is not subject to browser CORS or CSP.
+ *
+ * The Response shape is identical for both paths (body is a ReadableStream),
+ * so SSE streaming works transparently.
+ */
+let _tauriFetch: ((input: string, init?: any) => Promise<Response>) | null = null;
+async function getTauriFetch() {
+  if (_tauriFetch) return _tauriFetch;
+  try {
+    const mod = await import('@tauri-apps/plugin-http');
+    _tauriFetch = mod.fetch as typeof fetch;
+  } catch {
+    _tauriFetch = null;
+  }
+  return _tauriFetch;
+}
+
+export async function universalFetch(
+  input: string,
+  init?: RequestInit
+): Promise<Response> {
+  try {
+    return await fetch(input, init);
+  } catch (browserErr: any) {
+    // Only fall back to the Rust HTTP plugin on a network-layer failure
+    // (TypeError "Failed to fetch" caused by CSP/CORS). HTTP error
+    // responses (4xx/5xx) are NOT caught here — they are valid Responses.
+    const isNetworkFailure =
+      browserErr instanceof TypeError ||
+      browserErr?.name === 'TypeError' ||
+      /failed to fetch|networkerror|load failed/i.test(browserErr?.message || '');
+    if (!isNetworkFailure) throw browserErr;
+
+    const tauriFetch = await getTauriFetch();
+    if (!tauriFetch) throw browserErr; // not running in Tauri — rethrow original
+
+    // Retry via Rust-side HTTP (bypasses CSP + CORS).
+    const tauriInit: any = {
+      method: init?.method || 'GET',
+      headers: init?.headers,
+      body: init?.body,
+    };
+    if (init?.signal) tauriInit.signal = init.signal;
+    return await tauriFetch(input, tauriInit);
+  }
+}
+
 export async function performChatRequest(payloadObj: any) {
   const { baseUrl: targetUrl, apiKey, model, messages, stream, system_prompt, custom_headers, max_tokens, reasoning_effort, web_search_context } = payloadObj.body ? JSON.parse(payloadObj.body) : payloadObj;
 
@@ -97,7 +151,7 @@ export async function performChatRequest(payloadObj: any) {
     fetchPayload.max_tokens = max_tokens;
   }
 
-  return await fetch(resolvedUrl, {
+  return await universalFetch(resolvedUrl, {
     method: 'POST',
     headers,
     body: JSON.stringify(fetchPayload),
@@ -122,7 +176,7 @@ export async function performSearchRequest(payloadObj: any) {
   try {
     // 1. DuckDuckGo Instant Answer API — gives a concise abstract / answer when available
     const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(q)}&format=json&no_redirect=1&no_html=1&skip_disambig=1`;
-    const ddgRes = await fetch(ddgUrl, { signal: payloadObj.signal });
+    const ddgRes = await universalFetch(ddgUrl, { signal: payloadObj.signal });
     if (ddgRes.ok) {
       const ddg = await ddgRes.json();
       const abstractText = (ddg.AbstractText || '').trim();
@@ -171,7 +225,7 @@ export async function performSearchRequest(payloadObj: any) {
   try {
     // 2. Wikipedia API — rich full-text search results to round out the answer set
     const wikiUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(q)}&format=json&origin=*&srlimit=${limit}`;
-    const wikiRes = await fetch(wikiUrl, { signal: payloadObj.signal });
+    const wikiRes = await universalFetch(wikiUrl, { signal: payloadObj.signal });
     if (wikiRes.ok) {
       const wiki = await wikiRes.json();
       const hits = wiki?.query?.search || [];

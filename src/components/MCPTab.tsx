@@ -12,6 +12,7 @@ import {
   ShieldCheck,
 } from 'lucide-react';
 import { MCPServer, MCPTool } from '../types';
+import { universalFetch } from '../utils/chatProxy';
 
 interface MCPTabProps {
   servers: MCPServer[];
@@ -92,7 +93,7 @@ export const MCPTab: React.FC<MCPTabProps> = ({ servers, onUpdateServers }) => {
           ? JSON.stringify({ jsonrpc: '2.0', method: 'ping', id: 1 })
           : undefined;
 
-      const res = await fetch(server.url, {
+      const res = await universalFetch(server.url, {
         method,
         headers,
         body,
@@ -107,7 +108,7 @@ export const MCPTab: React.FC<MCPTabProps> = ({ servers, onUpdateServers }) => {
       let discoveredTools: MCPTool[] | null = null;
       if (online) {
         try {
-          const toolsRes = await fetch(server.url, {
+          const toolsRes = await universalFetch(server.url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
             body: JSON.stringify({ jsonrpc: '2.0', method: 'tools/list', id: 2 }),

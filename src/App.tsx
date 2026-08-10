@@ -1651,9 +1651,9 @@ When handling complex multi-step tasks:
           err.message?.includes('API key') ||
           err.message?.includes('API Key') ||
           err.message?.includes('configure an API') ||
-          err.message?.includes('400') ||
           err.message?.includes('401') ||
-          err.message?.includes('Unauthorized');
+          err.message?.includes('Unauthorized') ||
+          err.message?.includes('Invalid Authentication');
 
         const isQuotaError =
           err.message?.includes('resource_exhausted') ||
