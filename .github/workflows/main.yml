@@ -1,0 +1,51 @@
+name: Build Windows Executable
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: # Allows you to run this build manually from the GitHub Actions tab
+
+jobs:
+  build:
+    name: Build Windows App
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Rust (Tauri Backend)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install NPM dependencies
+        run: npm install
+
+      - name: Build React Frontend
+        run: npm run build
+
+      - name: Build Tauri Windows Executable
+        # Using npx ensures it downloads the exact Tauri v2 CLI even if it's missing locally
+        run: npx @tauri-apps/cli@2.0.0 build
+
+      - name: Upload Standalone Executable (.exe)
+        uses: actions/upload-artifact@v4
+        with:
+          name: SAW-AI-Workspace-Standalone
+          path: src-tauri/target/release/saw-ai-workspace.exe
+          if-no-files-found: warn
+
+      - name: Upload Setup Installer (.exe)
+        uses: actions/upload-artifact@v4
+        with:
+          name: SAW-AI-Workspace-Installer
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: warn
