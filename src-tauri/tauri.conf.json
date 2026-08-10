@@ -35,9 +35,5 @@
       "icons/icon.ico"
     ]
   },
-  "plugins": {
-    "fs": {
-      "scope": ["$APP_DATA/**/*"]
-    }
-  }
+  "plugins": {}
 }
