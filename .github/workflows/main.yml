@@ -29,11 +29,16 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
+          
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
 
-      - name: Install Frontend Dependencies & Fix Rollup
+      - name: Install Frontend Dependencies & Fix Native Binaries
         run: |
           npm install
-          npm install -D @rollup/rollup-win32-x64-msvc
+          npm install -D @rollup/rollup-win32-x64-msvc lightningcss-win32-x64-msvc
 
       - name: Build Tauri App
         uses: tauri-apps/tauri-action@v0
