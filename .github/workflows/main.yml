@@ -1,14 +1,21 @@
-name: Build Windows Executable
+name: Build and Release Tauri App
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
   build-tauri:
-    runs-on: windows-latest
-    
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [windows-latest]
+    runs-on: ${{ matrix.platform }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -18,24 +25,24 @@ jobs:
         with:
           node-version: 20
 
-      - name: Setup Rust (MSVC)
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Fix NPM Optional Dependencies Bug & Install
-        # We delete the Linux-generated package-lock.json and force the 
-        # installation of the missing Windows Rollup MSVC module.
+      - name: Install Frontend Dependencies & Fix Rollup
         run: |
-          Remove-Item -ErrorAction Ignore package-lock.json
           npm install
-          npm install -f @rollup/rollup-win32-x64-msvc
-        shell: pwsh
+          npm install -D @rollup/rollup-win32-x64-msvc
 
-      - name: Build Tauri Executable
+      - name: Build Tauri App
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          # Tauri action automatically runs the build scripts and wraps them in an .exe
-          args: --target x86_64-pc-windows-msvc
+          tagName: "v__VERSION__" 
+          releaseName: "SAW AI Workspace v__VERSION__"
+          releaseBody: "Release of SAW AI Workspace. See the assets below to download the .exe file."
+          releaseDraft: false
+          prerelease: false
+          args: "--target x86_64-pc-windows-msvc"
