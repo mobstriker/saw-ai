@@ -1,4 +1,4 @@
-name: Build and Release Tauri App
+name: Build Windows App
 
 on:
   push:
@@ -7,14 +7,10 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-tauri:
+  build-windows:
+    runs-on: windows-latest
     permissions:
       contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: [windows-latest]
-    runs-on: ${{ matrix.platform }}
 
     steps:
       - name: Checkout repository
@@ -25,29 +21,28 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install Rust toolchain
+      - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-          
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: './src-tauri -> target'
 
-      - name: Install Frontend Dependencies & Fix Native Binaries
+      - name: Fix Windows Optional Dependencies
+        # This deletes the Linux-created package-lock so npm can properly download the Windows-specific binaries for Rollup and LightningCSS.
         run: |
+          if (Test-Path package-lock.json) { Remove-Item package-lock.json -Force }
+          if (Test-Path node_modules) { Remove-Item -Recurse -Force node_modules }
           npm install
-          npm install -D @rollup/rollup-win32-x64-msvc lightningcss-win32-x64-msvc
+          npm install @rollup/rollup-win32-x64-msvc lightningcss-win32-x64-msvc --no-save
+        shell: powershell
 
       - name: Build Tauri App
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: "v__VERSION__" 
-          releaseName: "SAW AI Workspace v__VERSION__"
-          releaseBody: "Release of SAW AI Workspace. See the assets below to download the .exe file."
-          releaseDraft: false
+          tagName: app-v__VERSION__
+          releaseName: 'SAW AI Workspace v__VERSION__'
+          releaseBody: 'Here is the latest Windows release.'
+          releaseDraft: true
           prerelease: false
-          args: "--target x86_64-pc-windows-msvc"
+          args: --target x86_64-pc-windows-msvc
