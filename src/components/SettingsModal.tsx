@@ -31,7 +31,6 @@ import { MCPTab } from './MCPTab';
 import { SkillsTab } from './SkillsTab';
 import { AddSkillModal } from './AddSkillModal';
 import { StorageService } from '../utils/storage';
-import { DEFAULT_AI_PROFILES } from '../data/defaultProfiles';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -90,9 +89,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   if (!isOpen) return null;
 
-  const profiles = formData.aiProfiles && formData.aiProfiles.length > 0
-    ? formData.aiProfiles
-    : DEFAULT_AI_PROFILES;
+  const profiles = formData.aiProfiles || [];
 
   const activeProfile = profiles.find((p) => p.id === formData.activeProfileId) || profiles[0];
 
@@ -243,16 +240,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   };
 
   const handleDeleteProfile = (profileId: string) => {
-    if (profiles.length <= 1) {
-      alert('You must have at least one AI Profile configured.');
-      return;
-    }
+    if (profiles.length === 0) return;
     const filtered = profiles.filter((p) => p.id !== profileId);
     let nextActiveId = formData.activeProfileId;
 
     if (profileId === formData.activeProfileId) {
-      nextActiveId = filtered[0].id;
-      filtered[0].isActive = true;
+      nextActiveId = filtered[0]?.id || '';
+      if (filtered[0]) filtered[0].isActive = true;
     }
 
     const newActive = filtered.find((p) => p.id === nextActiveId) || filtered[0];
@@ -260,14 +254,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setFormData({
       ...formData,
       aiProfiles: filtered,
-      activeProfileId: newActive.id,
-      baseUrl: newActive.baseUrl,
-      apiKey: newActive.apiKey,
-      defaultModel: newActive.model,
-      customHeaders: newActive.customHeaders || '',
-      systemPrompt: newActive.systemPrompt || formData.systemPrompt,
+      activeProfileId: newActive?.id || '',
+      baseUrl: newActive?.baseUrl || '',
+      apiKey: newActive?.apiKey || '',
+      defaultModel: newActive?.model || '',
+      customHeaders: newActive?.customHeaders || '',
+      systemPrompt: newActive?.systemPrompt || formData.systemPrompt,
     });
-    setEditingProfileId(newActive.id);
+    setEditingProfileId(newActive?.id || null);
   };
 
   const handleDuplicateProfile = (profile: AIProfile) => {
@@ -288,18 +282,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     const currentActive = profiles.find((p) => p.id === formData.activeProfileId) || profiles[0];
     const finalSettings: BYOKSettings = {
       ...formData,
-      baseUrl: currentActive.baseUrl,
-      apiKey: currentActive.apiKey,
-      defaultModel: currentActive.model,
-      customHeaders: currentActive.customHeaders || '',
-      systemPrompt: currentActive.systemPrompt || formData.systemPrompt,
+      baseUrl: currentActive?.baseUrl || '',
+      apiKey: currentActive?.apiKey || '',
+      defaultModel: currentActive?.model || '',
+      customHeaders: currentActive?.customHeaders || '',
+      systemPrompt: currentActive?.systemPrompt || formData.systemPrompt,
     };
     onSaveSettings(finalSettings);
     onClose();
   };
 
   const testProfileConnection = async (id: string, baseUrl: string, apiKey: string, model: string) => {
-    if (!baseUrl || !baseUrl.trim()) {
+    const trimmedUrl = (baseUrl || '').trim();
+    if (!trimmedUrl) {
       setPingStatusMap((prev) => ({ ...prev, [id]: 'error' }));
       setPingMessageMap((prev) => ({ ...prev, [id]: 'Please enter a valid Base URL.' }));
       return;
@@ -309,35 +304,84 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setPingMessageMap((prev) => ({ ...prev, [id]: 'Testing endpoint connection & latency...' }));
     setDetectedInfoMap((prev) => ({ ...prev, [id]: null }));
 
+    // Detect provider from the URL for status display
+    const detectedProvider =
+      trimmedUrl.includes('openrouter.ai') ? 'OpenRouter' :
+      trimmedUrl.includes('api.openai.com') ? 'OpenAI' :
+      trimmedUrl.includes('api.deepseek.com') ? 'DeepSeek' :
+      trimmedUrl.includes('api.groq.com') ? 'Groq' :
+      trimmedUrl.includes('api.moonshot.cn') ? 'Moonshot' :
+      trimmedUrl.includes('generativelanguage.googleapis.com') ? 'Google Gemini' :
+      trimmedUrl.includes('api.anthropic.com') ? 'Anthropic' :
+      trimmedUrl.includes('localhost') || trimmedUrl.includes('127.0.0.1') ? 'Local' : 'Custom';
+
+    // Resolve the actual endpoint to probe. If the user gave the OpenAI-style root
+    // (e.g. https://api.openai.com/v1), probe the models list; otherwise do a
+    // minimal one-token chat completion, which works for every OpenAI-compatible API.
+    let probeUrl = trimmedUrl;
+    const isLikelyRoot = /\/v\d+\/?$/.test(trimmedUrl);
+    if (isLikelyRoot) {
+      probeUrl = trimmedUrl.replace(/\/?$/, '') + '/models';
+    } else {
+      // normalize to a chat completions path
+      probeUrl = trimmedUrl.replace(/\/chat\/completions\/?$/, '/chat/completions');
+    }
+
+    const headers: Record<string, string> = {};
+    if (apiKey && apiKey.trim()) {
+      headers['Authorization'] = `Bearer ${apiKey.trim()}`;
+    }
+    if (trimmedUrl.includes('openrouter.ai')) {
+      headers['HTTP-Referer'] = 'https://ai.studio/build';
+      headers['X-Title'] = 'SAW AI Workspace';
+    }
+
+    const method = isLikelyRoot ? 'GET' : 'POST';
+    const body = isLikelyRoot
+      ? undefined
+      : JSON.stringify({
+          model: (model || '').trim() || 'gpt-4o',
+          messages: [{ role: 'user', content: 'ping' }],
+          max_tokens: 1,
+          stream: false,
+        });
+    if (body) headers['Content-Type'] = 'application/json';
+
+    const startTime = Date.now();
     try {
-      const res = await fetch('/api/test-connection', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          baseUrl: baseUrl.trim(),
-          apiKey: apiKey.trim(),
-          model: model.trim() || 'gpt-4o',
-        }),
-      });
+      const res = await fetch(probeUrl, { method, headers, body, signal: AbortSignal.timeout(8000) });
+      const latencyMs = Date.now() - startTime;
 
-      const data = await res.json();
-
-      if (res.ok && data.ok) {
+      if (res.ok) {
         setPingStatusMap((prev) => ({ ...prev, [id]: 'success' }));
         setPingMessageMap((prev) => ({
           ...prev,
-          [id]: data.message || `Connection verified! (${data.latencyMs}ms latency)`,
+          [id]: `Connection verified! (${latencyMs}ms latency)`,
         }));
-        if (data.detectedProvider) {
-          setDetectedInfoMap((prev) => ({
-            ...prev,
-            [id]: `Provider: ${data.detectedProvider} • Status: HTTP ${data.status}`,
-          }));
-        }
+        setDetectedInfoMap((prev) => ({
+          ...prev,
+          [id]: `Provider: ${detectedProvider} • Status: HTTP ${res.status}`,
+        }));
       } else {
-        setPingStatusMap((prev) => ({ ...prev, [id]: 'error' }));
-        const errDetail = data.error || data.message || `Endpoint responded with HTTP ${res.status}`;
-        setPingMessageMap((prev) => ({ ...prev, [id]: `Connection failed: ${errDetail}` }));
+        // Non-200 still confirms the key/endpoint is reachable for most providers
+        // (e.g. OpenAI returns 401 for bad keys, 400 for bad model). Surface the status.
+        let errDetail = `Endpoint responded with HTTP ${res.status}`;
+        try {
+          const errData = await res.json();
+          errDetail = errData?.error?.message || errData?.error || errData?.message || errDetail;
+        } catch {}
+        const reachable = res.status === 400 || res.status === 401 || res.status === 404 || res.status === 429;
+        setPingStatusMap((prev) => ({ ...prev, [id]: reachable ? 'success' : 'error' }));
+        setPingMessageMap((prev) => ({
+          ...prev,
+          [id]: reachable
+            ? `Connection verified! (${latencyMs}ms latency)`
+            : `Connection failed: ${errDetail}`,
+        }));
+        setDetectedInfoMap((prev) => ({
+          ...prev,
+          [id]: `Provider: ${detectedProvider} • Status: HTTP ${res.status}`,
+        }));
       }
     } catch (err: any) {
       setPingStatusMap((prev) => ({ ...prev, [id]: 'error' }));
