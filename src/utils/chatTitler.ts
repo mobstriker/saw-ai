@@ -97,13 +97,36 @@ export class ChatTitler {
       return heuristicFallback;
     }
 
+    // Resolve custom headers (may be a JSON string or undefined)
+    let parsedHeaders: Record<string, string> = {};
+    if (customHeaders) {
+      try {
+        const maybeHeaders = typeof customHeaders === 'string' ? JSON.parse(customHeaders) : customHeaders;
+        if (maybeHeaders && typeof maybeHeaders === 'object') {
+          parsedHeaders = maybeHeaders as Record<string, string>;
+        }
+      } catch {}
+    }
+
+    const requestHeaders: Record<string, string> = { 'Content-Type': 'application/json', ...parsedHeaders };
+    if (apiKey) {
+      requestHeaders['Authorization'] = `Bearer ${apiKey}`;
+    }
+    if (baseUrl && baseUrl.includes('openrouter.ai')) {
+      requestHeaders['HTTP-Referer'] = 'https://ai.studio/build';
+      requestHeaders['X-Title'] = 'SAW AI Workspace';
+    }
+
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 4000); // 4 second fast timeout
 
-      const response = await fetch('/api/chat', {
+      // Normalize to the OpenAI-style chat completions path
+      const chatUrl = baseUrl.replace(/\/?$/, '').replace(/\/chat\/completions\/?$/, '/chat/completions');
+
+      const response = await fetch(chatUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: requestHeaders,
         signal: controller.signal,
         body: JSON.stringify({
           messages: [
@@ -118,9 +141,6 @@ export class ChatTitler {
             },
           ],
           model: model,
-          baseUrl: baseUrl,
-          apiKey: apiKey,
-          customHeaders: customHeaders,
           stream: false,
           max_tokens: 18,
           temperature: 0.2,

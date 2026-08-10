@@ -15,9 +15,9 @@ const STORAGE_KEYS = {
 export const DEFAULT_MCP_SERVERS: MCPServer[] = [];
 
 export const DEFAULT_SETTINGS: BYOKSettings = {
-  baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
+  baseUrl: '',
   apiKey: '',
-  defaultModel: 'gemini-2.5-flash',
+  defaultModel: '',
   customHeaders: '',
   systemPrompt:
     'You are a high-speed, senior AI programming assistant and context engineer working inside SAW AI. All project files provided in the prompt are raw, unchunked ground-truth code. When writing interactive frontend components, provide clean, complete, modern React/Tailwind/HTML code blocks so the Claude-style Artifacts sandbox can render them immediately. If you need clarification from the user before making large changes, output exactly this JSON block and nothing else (do not use for simple greetings): ```json\n{"clarification_requests": [{"question": "...", "options": ["Option 1", "Option 2"]}]}\n```',
@@ -26,7 +26,7 @@ export const DEFAULT_SETTINGS: BYOKSettings = {
   mcpServers: DEFAULT_MCP_SERVERS,
   skills: DEFAULT_SKILLS,
   aiProfiles: DEFAULT_AI_PROFILES,
-  activeProfileId: 'profile-gemini-studio',
+  activeProfileId: '',
   streamResponse: true,
   themeAesthetic: 'warm-organic',
   reasoningMode: 'medium',
@@ -41,18 +41,10 @@ export const StorageService = {
         const profiles = parsed.aiProfiles && Array.isArray(parsed.aiProfiles) && parsed.aiProfiles.length > 0
           ? parsed.aiProfiles
           : DEFAULT_AI_PROFILES;
-        
-        let activeId = parsed.activeProfileId || DEFAULT_SETTINGS.activeProfileId;
-        if (activeId === 'profile-gemini-bundle' || !profiles.some((p: any) => p.id === activeId)) {
-          activeId = profiles[0]?.id || DEFAULT_SETTINGS.activeProfileId;
-        }
 
-        const activeProf = profiles.find((p: any) => p.id === activeId);
-        if (activeProf && activeProf.id === 'profile-openai-bundle' && !activeProf.apiKey && !parsed.apiKey) {
-          const geminiProf = profiles.find((p: any) => p.id === 'profile-gemini-studio');
-          if (geminiProf) {
-            activeId = 'profile-gemini-studio';
-          }
+        let activeId = parsed.activeProfileId || DEFAULT_SETTINGS.activeProfileId;
+        if (!profiles.some((p: any) => p.id === activeId)) {
+          activeId = profiles[0]?.id || DEFAULT_SETTINGS.activeProfileId;
         }
 
         return {

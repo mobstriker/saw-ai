@@ -80,26 +80,53 @@ export const MCPTab: React.FC<MCPTabProps> = ({ servers, onUpdateServers }) => {
 
   const testServerPing = async (server: MCPServer) => {
     setTestingId(server.id);
+    const startTime = Date.now();
     try {
-      const res = await fetch('/api/mcp/ping', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ endpoint: server.url, type: server.type }),
+      // Direct reachability probe to the registered MCP endpoint.
+      // SSE endpoints respond to GET with a stream; JSON-RPC endpoints respond
+      // to POST. We use a short timeout and treat any HTTP response as "online".
+      const method = server.type === 'jsonrpc' ? 'POST' : 'GET';
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      const body =
+        server.type === 'jsonrpc'
+          ? JSON.stringify({ jsonrpc: '2.0', method: 'ping', id: 1 })
+          : undefined;
+
+      const res = await fetch(server.url, {
+        method,
+        headers,
+        body,
+        signal: AbortSignal.timeout(6000),
+        // Don't let an opaque/error response throw; we just want reachability.
+        // Note: fetch rejects on network failure (unreachable host), which we catch below.
       });
-      const data = await res.json();
+      const latencyMs = Date.now() - startTime;
+      const online = res.status > 0 && res.status < 500;
+
       onUpdateServers(
         servers.map((s) => {
           if (s.id !== server.id) return s;
           return {
             ...s,
-            status: data.ok ? 'online' : 'offline',
-            latencyMs: data.latencyMs || 25,
+            status: online ? 'online' : 'offline',
+            latencyMs: latencyMs,
           };
         })
       );
     } catch (e) {
+      // For SSE streams the connection opens but never "completes" until closed;
+      // an AbortError after the stream started still means the server is reachable.
+      const latencyMs = Date.now() - startTime;
+      const isAbort = (e as any)?.name === 'TimeoutError' || (e as any)?.name === 'AbortError';
       onUpdateServers(
-        servers.map((s) => (s.id === server.id ? { ...s, status: 'offline' } : s))
+        servers.map((s) => {
+          if (s.id !== server.id) return s;
+          return {
+            ...s,
+            status: isAbort && server.type === 'sse' ? 'online' : 'offline',
+            latencyMs,
+          };
+        })
       );
     } finally {
       setTestingId(null);
