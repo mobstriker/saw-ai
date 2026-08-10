@@ -82,7 +82,7 @@ export const MCPTab: React.FC<MCPTabProps> = ({ servers, onUpdateServers }) => {
     setTestingId(server.id);
     const startTime = Date.now();
     try {
-      // Direct reachability probe to the registered MCP endpoint.
+      // Step 1: reachability probe.
       // SSE endpoints respond to GET with a stream; JSON-RPC endpoints respond
       // to POST. We use a short timeout and treat any HTTP response as "online".
       const method = server.type === 'jsonrpc' ? 'POST' : 'GET';
@@ -97,11 +97,38 @@ export const MCPTab: React.FC<MCPTabProps> = ({ servers, onUpdateServers }) => {
         headers,
         body,
         signal: AbortSignal.timeout(6000),
-        // Don't let an opaque/error response throw; we just want reachability.
-        // Note: fetch rejects on network failure (unreachable host), which we catch below.
       });
       const latencyMs = Date.now() - startTime;
       const online = res.status > 0 && res.status < 500;
+
+      // Step 2: discover real tools via JSON-RPC tools/list (best-effort).
+      // Many MCP servers expose a JSON-RPC endpoint; if CORS allows it we
+      // replace the placeholder tool list with the server's actual tools.
+      let discoveredTools: MCPTool[] | null = null;
+      if (online) {
+        try {
+          const toolsRes = await fetch(server.url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify({ jsonrpc: '2.0', method: 'tools/list', id: 2 }),
+            signal: AbortSignal.timeout(6000),
+          });
+          if (toolsRes.ok) {
+            const toolsJson = await toolsRes.json();
+            const list = toolsJson?.result?.tools || toolsJson?.tools;
+            if (Array.isArray(list) && list.length > 0) {
+              discoveredTools = list.map((t: any, i: number) => ({
+                id: `t-${server.id}-${i}-${Date.now()}`,
+                name: t.name || `tool-${i}`,
+                description: t.description || '',
+                enabled: true,
+              }));
+            }
+          }
+        } catch {
+          // CORS or transport blocked tool discovery — keep existing tools.
+        }
+      }
 
       onUpdateServers(
         servers.map((s) => {
@@ -110,6 +137,7 @@ export const MCPTab: React.FC<MCPTabProps> = ({ servers, onUpdateServers }) => {
             ...s,
             status: online ? 'online' : 'offline',
             latencyMs: latencyMs,
+            ...(discoveredTools ? { tools: discoveredTools } : {}),
           };
         })
       );

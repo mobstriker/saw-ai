@@ -1,5 +1,6 @@
 import { AIProfile, BYOKSettings } from '../types';
 import { ModelRouter } from './modelRouter';
+import { resolveChatCompletionsUrl } from './chatProxy';
 
 export class ChatTitler {
   /**
@@ -96,6 +97,9 @@ export class ChatTitler {
     if (!apiKey && !isLocal) {
       return heuristicFallback;
     }
+    if (!baseUrl || !baseUrl.trim()) {
+      return heuristicFallback;
+    }
 
     // Resolve custom headers (may be a JSON string or undefined)
     let parsedHeaders: Record<string, string> = {};
@@ -121,8 +125,9 @@ export class ChatTitler {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 4000); // 4 second fast timeout
 
-      // Normalize to the OpenAI-style chat completions path
-      const chatUrl = baseUrl.replace(/\/?$/, '').replace(/\/chat\/completions\/?$/, '/chat/completions');
+      // Normalize the API root (e.g. https://api.openai.com/v1) to the
+      // full chat completions endpoint, the same way the chat path does.
+      const chatUrl = resolveChatCompletionsUrl(baseUrl);
 
       const response = await fetch(chatUrl, {
         method: 'POST',

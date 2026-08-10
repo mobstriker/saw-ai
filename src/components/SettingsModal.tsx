@@ -31,6 +31,7 @@ import { MCPTab } from './MCPTab';
 import { SkillsTab } from './SkillsTab';
 import { AddSkillModal } from './AddSkillModal';
 import { StorageService } from '../utils/storage';
+import { resolveChatCompletionsUrl } from '../utils/chatProxy';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -315,19 +316,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       trimmedUrl.includes('api.anthropic.com') ? 'Anthropic' :
       trimmedUrl.includes('localhost') || trimmedUrl.includes('127.0.0.1') ? 'Local' : 'Custom';
 
-    // Resolve the actual endpoint to probe. If the user gave the OpenAI-style root
-    // (e.g. https://api.openai.com/v1), probe the models list; otherwise do a
-    // minimal one-token chat completion, which works for every OpenAI-compatible API.
-    let probeUrl = trimmedUrl;
-    const isLikelyRoot = /\/v\d+\/?$/.test(trimmedUrl);
-    if (isLikelyRoot) {
-      probeUrl = trimmedUrl.replace(/\/?$/, '') + '/models';
-    } else {
-      // normalize to a chat completions path
-      probeUrl = trimmedUrl.replace(/\/chat\/completions\/?$/, '/chat/completions');
-    }
+    // Always probe the real /chat/completions endpoint with a minimal
+    // 1-token request. This validates the key + model + endpoint together,
+    // the same way the chat path does, and works for every OpenAI-compatible
+    // provider (OpenAI, OpenRouter, DeepSeek, Groq, Moonshot, Gemini, Ollama).
+    const probeUrl = resolveChatCompletionsUrl(trimmedUrl);
 
-    const headers: Record<string, string> = {};
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (apiKey && apiKey.trim()) {
       headers['Authorization'] = `Bearer ${apiKey.trim()}`;
     }
@@ -336,16 +331,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       headers['X-Title'] = 'SAW AI Workspace';
     }
 
-    const method = isLikelyRoot ? 'GET' : 'POST';
-    const body = isLikelyRoot
-      ? undefined
-      : JSON.stringify({
-          model: (model || '').trim() || 'gpt-4o',
-          messages: [{ role: 'user', content: 'ping' }],
-          max_tokens: 1,
-          stream: false,
-        });
-    if (body) headers['Content-Type'] = 'application/json';
+    const method = 'POST';
+    const body = JSON.stringify({
+      model: (model || '').trim() || 'gpt-4o',
+      messages: [{ role: 'user', content: 'ping' }],
+      max_tokens: 1,
+      stream: false,
+    });
 
     const startTime = Date.now();
     try {

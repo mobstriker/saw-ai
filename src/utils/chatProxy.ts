@@ -1,10 +1,54 @@
+/**
+ * Normalizes an OpenAI-compatible base URL so it always points at the
+ * `/chat/completions` endpoint.
+ *
+ * AI profiles store the API *root* (e.g. `https://api.openai.com/v1`),
+ * never the full chat endpoint. The old Node.js backend appended
+ * `/chat/completions` server-side; in the standalone desktop build we must
+ * do it client-side, otherwise the request hits the provider root, which
+ * returns 404 with NO CORS headers → the browser blocks it and fetch()
+ * throws "Failed to fetch".
+ *
+ * Handles every supported preset root:
+ *  - https://api.openai.com/v1
+ *  - https://openrouter.ai/api/v1
+ *  - https://api.deepseek.com/v1
+ *  - https://api.groq.com/openai/v1
+ *  - https://api.moonshot.cn/v1
+ *  - http://localhost:11434/v1          (Ollama)
+ *  - https://generativelanguage.googleapis.com/v1beta/openai   (Gemini OpenAI-compat)
+ * And no-ops when the user already pasted the full endpoint.
+ */
+export function resolveChatCompletionsUrl(rawUrl: string): string {
+  let url = (rawUrl || '').trim();
+  if (!url) return url;
+  // Strip trailing slashes (but keep the scheme/host intact)
+  url = url.replace(/\/+$/, '');
+  if (/\/chat\/completions$/i.test(url)) return url;
+  return url + '/chat/completions';
+}
+
 export async function performChatRequest(payloadObj: any) {
-  const { baseUrl: targetUrl, apiKey, model, messages, stream, system_prompt, custom_headers, max_tokens, reasoning_effort } = payloadObj.body ? JSON.parse(payloadObj.body) : payloadObj;
-  
+  const { baseUrl: targetUrl, apiKey, model, messages, stream, system_prompt, custom_headers, max_tokens, reasoning_effort, web_search_context } = payloadObj.body ? JSON.parse(payloadObj.body) : payloadObj;
+
+  // --- Transparency guards: fail loudly instead of silently falling back ---
+  if (!targetUrl || !targetUrl.trim()) {
+    throw new Error('No API endpoint configured. Add an AI profile in Settings (⚙️) and enter a Base URL.');
+  }
+  const isLocalEndpoint =
+    targetUrl.includes('localhost') ||
+    targetUrl.includes('127.0.0.1') ||
+    targetUrl.includes('0.0.0.0');
+  if (!apiKey && !isLocalEndpoint) {
+    throw new Error('No API key configured for this profile. Add your API key in Settings (⚙️).');
+  }
+
+  const resolvedUrl = resolveChatCompletionsUrl(targetUrl);
+
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
   };
-  
+
   if (apiKey) {
     headers['Authorization'] = `Bearer ${apiKey}`;
   }
@@ -18,12 +62,29 @@ export async function performChatRequest(payloadObj: any) {
     Object.assign(headers, custom_headers);
   }
 
+  // Build the message list. Inject web search results into the latest user
+  // message so the model actually sees them (the old backend did this).
+  let finalMessages = Array.isArray(messages) ? messages : [];
+  if (web_search_context && Array.isArray(web_search_context) && web_search_context.length > 0) {
+    const searchBlock = web_search_context
+      .map((r: any, i: number) => `[${i + 1}] ${r.title || '(untitled)'}\n${r.snippet || ''}\nURL: ${r.url || ''}`)
+      .join('\n\n');
+    const injection = `\n\n---\n[WEB SEARCH RESULTS]\nUse these fresh web results to answer accurately. Cite sources by number.\n\n${searchBlock}\n---`;
+
+    finalMessages = finalMessages.map((m: any, i: number) => {
+      if (m.role === 'user' && i === finalMessages.length - 1) {
+        return { ...m, content: (m.content || '') + injection };
+      }
+      return m;
+    });
+  }
+
   const fetchPayload: any = {
     model: model || 'gpt-4o',
-    messages: messages,
+    messages: finalMessages,
     stream,
   };
-  
+
   if (system_prompt) {
     if (fetchPayload.messages.length > 0 && fetchPayload.messages[0].role === 'system') {
       fetchPayload.messages[0].content = system_prompt;
@@ -36,7 +97,7 @@ export async function performChatRequest(payloadObj: any) {
     fetchPayload.max_tokens = max_tokens;
   }
 
-  return await fetch(targetUrl, {
+  return await fetch(resolvedUrl, {
     method: 'POST',
     headers,
     body: JSON.stringify(fetchPayload),
