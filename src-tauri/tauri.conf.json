@@ -21,8 +21,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self' 'unsafe-inline' 'unsafe-eval' https://api.anthropic.com https://generativelanguage.googleapis.com; connect-src 'self' https://api.anthropic.com https://generativelanguage.googleapis.com blob: data: ws: wss:; img-src 'self' data: blob: https:; frame-src 'self' data: blob:; worker-src 'self' blob:;",
-      "contextIsolation": true
+      "csp": "default-src 'self' 'unsafe-inline' 'unsafe-eval' https://api.anthropic.com https://generativelanguage.googleapis.com; connect-src 'self' https://api.anthropic.com https://generativelanguage.googleapis.com blob: data: ws: wss:; img-src 'self' data: blob: https:; frame-src 'self' data: blob:; worker-src 'self' blob:;"
     }
   },
   "plugins": {
