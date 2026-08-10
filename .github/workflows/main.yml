@@ -43,6 +43,6 @@ jobs:
           tagName: app-v__VERSION__
           releaseName: 'SAW AI Workspace v__VERSION__'
           releaseBody: 'Here is the latest Windows release.'
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           args: --target x86_64-pc-windows-msvc
