@@ -1,0 +1,33 @@
+{
+  "productName": "SAW AI Workspace",
+  "version": "2.4.0",
+  "identifier": "com.saw.aiworkspace",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:3000",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "SAW AI Workspace",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 600,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' 'unsafe-inline' 'unsafe-eval' https://api.anthropic.com https://generativelanguage.googleapis.com; connect-src 'self' https://api.anthropic.com https://generativelanguage.googleapis.com blob: data: ws: wss:; img-src 'self' data: blob: https:; frame-src 'self' data: blob:; worker-src 'self' blob:;",
+      "contextIsolation": true
+    }
+  },
+  "plugins": {
+    "fs": {
+      "scope": ["$APP_DATA/**/*"]
+    }
+  }
+}

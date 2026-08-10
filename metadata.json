@@ -1,0 +1,6 @@
+{
+  "name": "SAW AI",
+  "description": "High-speed AI workspace with pure folder context injection, nested file explorer, live code artifacts sandbox, web search, and MCP tool support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
