@@ -171,21 +171,19 @@ export async function performChatRequest(payloadObj: any) {
   // need the bare model name without the "provider/" prefix.
   const resolvedModel = resolveModelForEndpoint(targetUrl, model);
 
+  const APP_URL = 'https://github.com/mobstriker/saw-ai'; 
+
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
-    // Spoof a standard Chrome browser to bypass 403 blocks, 
-    // while keeping your app name appended at the end for identity.
+    // Spoof a standard browser to bypass Cloudflare bot checks
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 SAW-AI-Workspace/2.4.0',
-    'Origin': 'https://ai.studio', 
+    'Origin': APP_URL,
+    'HTTP-Referer': APP_URL,
+    'X-Title': 'SAW AI Workspace',
   };
 
   if (apiKey) {
     headers['Authorization'] = `Bearer ${apiKey}`;
-  }
-
-  if (targetUrl.includes('openrouter.ai')) {
-    headers['HTTP-Referer'] = 'https://ai.studio/build';
-    headers['X-Title'] = 'SAW AI Workspace';
   }
 
   if (custom_headers) {
