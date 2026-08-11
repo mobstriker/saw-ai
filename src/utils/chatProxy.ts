@@ -73,20 +73,24 @@ export function resolveModelForEndpoint(baseUrl: string, model: string): string 
 }
 
 /**
- * Universal fetch that tries the browser's fetch first (fast, native
- * streaming for CORS-friendly providers) and falls back to Tauri's
- * Rust-side HTTP plugin when the browser blocks the request (CSP or CORS).
- *
- * This makes NVAPI / Nvidia, Zhipu (Z-AI), and any other CORS-restrictive
- * OpenAI-compatible endpoint work in the desktop app, because the fallback
- * request originates from Rust, which is not subject to browser CORS or CSP.
- *
- * The Response shape is identical for both paths (body is a ReadableStream),
- * so SSE streaming works transparently.
+ * Detects whether the app is running inside the Tauri desktop webview.
+ * When true, we prefer the Rust-side HTTP plugin for all API requests
+ * because it bypasses browser CORS/CSP entirely — the request originates
+ * from native Rust code, not the webview. This is what makes providers
+ * like OpenRouter, Zhipu, Moonshot, and NVIDIA work reliably in the
+ * desktop app regardless of their CORS headers.
  */
+function isTauriEnvironment(): boolean {
+  if (typeof window === 'undefined') return false;
+  // Tauri v2 injects __TAURI_INTERNALS__ into the webview
+  return !!(window as any).__TAURI_INTERNALS__ || !!(window as any).__TAURI__;
+}
+
 let _tauriFetch: ((input: string, init?: any) => Promise<Response>) | null = null;
+let _tauriFetchChecked = false;
 async function getTauriFetch() {
-  if (_tauriFetch) return _tauriFetch;
+  if (_tauriFetchChecked) return _tauriFetch;
+  _tauriFetchChecked = true;
   try {
     const mod = await import('@tauri-apps/plugin-http');
     _tauriFetch = mod.fetch as typeof fetch;
@@ -96,16 +100,48 @@ async function getTauriFetch() {
   return _tauriFetch;
 }
 
+function buildTauriInit(init?: RequestInit): any {
+  const tauriInit: any = {
+    method: init?.method || 'GET',
+    headers: init?.headers,
+    body: init?.body,
+  };
+  if (init?.signal) tauriInit.signal = init.signal;
+  return tauriInit;
+}
+
+/**
+ * Universal fetch that uses the Tauri Rust-side HTTP plugin when running
+ * inside the desktop app (bypassing CORS/CSP), and falls back to the
+ * browser's native fetch when running in a plain web browser.
+ *
+ * In the desktop app, CORS preflight failures in the webview can manifest
+ * as HTTP 403/0 responses rather than TypeError exceptions, so we PREFER
+ * the Tauri HTTP plugin upfront for all requests in Tauri — this eliminates
+ * CORS as a failure mode entirely for every OpenAI-compatible provider.
+ *
+ * The Response shape is identical for both paths (body is a ReadableStream),
+ * so SSE streaming works transparently.
+ */
 export async function universalFetch(
   input: string,
   init?: RequestInit
 ): Promise<Response> {
+  // In the Tauri desktop app, use the Rust HTTP plugin directly — it is
+  // not subject to browser CORS or CSP, so every provider works.
+  if (isTauriEnvironment()) {
+    const tauriFetch = await getTauriFetch();
+    if (tauriFetch) {
+      return await tauriFetch(input, buildTauriInit(init));
+    }
+    // Tauri plugin not available — fall through to browser fetch
+  }
+
   try {
     return await fetch(input, init);
   } catch (browserErr: any) {
-    // Only fall back to the Rust HTTP plugin on a network-layer failure
-    // (TypeError "Failed to fetch" caused by CSP/CORS). HTTP error
-    // responses (4xx/5xx) are NOT caught here — they are valid Responses.
+    // In a plain browser, fall back to Tauri HTTP if available (e.g. the
+    // dev server running inside Tauri's dev mode).
     const isNetworkFailure =
       browserErr instanceof TypeError ||
       browserErr?.name === 'TypeError' ||
@@ -115,14 +151,7 @@ export async function universalFetch(
     const tauriFetch = await getTauriFetch();
     if (!tauriFetch) throw browserErr; // not running in Tauri — rethrow original
 
-    // Retry via Rust-side HTTP (bypasses CSP + CORS).
-    const tauriInit: any = {
-      method: init?.method || 'GET',
-      headers: init?.headers,
-      body: init?.body,
-    };
-    if (init?.signal) tauriInit.signal = init.signal;
-    return await tauriFetch(input, tauriInit);
+    return await tauriFetch(input, buildTauriInit(init));
   }
 }
 
@@ -149,6 +178,7 @@ export async function performChatRequest(payloadObj: any) {
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
+    'User-Agent': 'SAW-AI-Workspace/2.4.0',
   };
 
   if (apiKey) {
@@ -160,8 +190,20 @@ export async function performChatRequest(payloadObj: any) {
     headers['X-Title'] = 'SAW AI Workspace';
   }
 
-  if (custom_headers && typeof custom_headers === 'object') {
-    Object.assign(headers, custom_headers);
+  if (custom_headers) {
+    let parsedCustom: Record<string, string> = {};
+    if (typeof custom_headers === 'string') {
+      try {
+        parsedCustom = JSON.parse(custom_headers);
+      } catch {
+        // malformed JSON string — skip
+      }
+    } else if (typeof custom_headers === 'object') {
+      parsedCustom = custom_headers;
+    }
+    if (parsedCustom && typeof parsedCustom === 'object') {
+      Object.assign(headers, parsedCustom);
+    }
   }
 
   // Build the message list. Inject web search results into the latest user

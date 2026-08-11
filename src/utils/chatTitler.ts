@@ -114,7 +114,11 @@ export class ChatTitler {
       } catch {}
     }
 
-    const requestHeaders: Record<string, string> = { 'Content-Type': 'application/json', ...parsedHeaders };
+    const requestHeaders: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'User-Agent': 'SAW-AI-Workspace/2.4.0',
+      ...parsedHeaders,
+    };
     if (apiKey) {
       requestHeaders['Authorization'] = `Bearer ${apiKey}`;
     }

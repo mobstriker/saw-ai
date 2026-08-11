@@ -121,8 +121,8 @@ export default function App() {
             createdAt: Date.now(),
             updatedAt: Date.now(),
             messages: [],
-            model: 'gpt-4o',
-            reasoningMode: 'medium',
+            model: loadedSettings.defaultModel || 'gpt-4o',
+            reasoningMode: loadedSettings.reasoningMode || 'medium',
           };
           setChats([defaultChat]);
           setActiveChatId(defaultChat.id);
@@ -138,9 +138,11 @@ export default function App() {
 
   // Sync state to local storage
   useEffect(() => {
-    if (chats && chats.length > 0) {
-      StorageService.saveChats(chats);
-    }
+    // Always save — even when the array is empty — so deleted chats are
+    // actually persisted. The guard `chats.length > 0` caused deletions to
+    // be skipped when the last chat was removed, so deleted chats reappeared
+    // on restart.
+    StorageService.saveChats(chats);
   }, [chats]);
 
   useEffect(() => {
