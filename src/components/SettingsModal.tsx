@@ -379,7 +379,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     onClose();
   };
 
-  const testProfileConnection = async (id: string, baseUrl: string, apiKey: string, model: string) => {
+  const testProfileConnection = async (id: string, baseUrl: string, apiKey: string, model: string, customHeaders?: string) => {
     const trimmedUrl = (baseUrl || '').trim();
     if (!trimmedUrl) {
       setPingStatusMap((prev) => ({ ...prev, [id]: 'error' }));
@@ -410,13 +410,28 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     // provider (OpenAI, OpenRouter, DeepSeek, Groq, Moonshot, Gemini, Ollama).
     const probeUrl = resolveChatCompletionsUrl(trimmedUrl);
 
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'User-Agent': 'SAW-AI-Workspace/2.4.0',
+    };
     if (apiKey && apiKey.trim()) {
       headers['Authorization'] = `Bearer ${apiKey.trim()}`;
     }
     if (trimmedUrl.includes('openrouter.ai')) {
       headers['HTTP-Referer'] = 'https://ai.studio/build';
       headers['X-Title'] = 'SAW AI Workspace';
+    }
+    // Apply any user-configured custom headers from the profile so the
+    // test connection uses the same headers as the real chat request.
+    if (customHeaders && customHeaders.trim()) {
+      try {
+        const parsed = JSON.parse(customHeaders);
+        if (parsed && typeof parsed === 'object') {
+          Object.assign(headers, parsed);
+        }
+      } catch {
+        // malformed JSON — skip
+      }
     }
 
     const method = 'POST';
@@ -1269,7 +1284,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                                         selectedProfileForEdit.id,
                                         selectedProfileForEdit.baseUrl,
                                         selectedProfileForEdit.apiKey,
-                                        selectedProfileForEdit.model
+                                        selectedProfileForEdit.model,
+                                        selectedProfileForEdit.customHeaders
                                       )
                                     }
                                     disabled={pingStatusMap[selectedProfileForEdit.id] === 'testing'}
@@ -1591,7 +1607,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                                   <button
                                     type="button"
                                     onClick={() =>
-                                      testProfileConnection(sub.id, sub.baseUrl, sub.apiKey, sub.model)
+                                      testProfileConnection(sub.id, sub.baseUrl, sub.apiKey, sub.model, sub.customHeaders)
                                     }
                                     disabled={pingStatusMap[sub.id] === 'testing'}
                                     className="px-3 py-1.5 rounded-lg bg-white border border-[#E6DFD3] hover:border-[#C58B51] text-xs font-bold text-[#2C2825] shadow-2xs flex items-center gap-1.5 cursor-pointer disabled:opacity-50 shrink-0"

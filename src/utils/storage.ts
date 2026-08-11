@@ -83,7 +83,11 @@ export const StorageService = {
 
   saveProjects(projects: Project[]): void {
     try {
-      db.projects.bulkPut(projects).catch(e => console.error(e));
+      // Clear + bulkPut so deleted projects are actually removed from
+      // IndexedDB. bulkPut alone only upserts — it never deletes records
+      // that are no longer in the array, so deleted items would reappear
+      // on restart.
+      db.projects.clear().then(() => db.projects.bulkPut(projects)).catch(e => console.error(e));
     } catch (e) {
       console.error('Failed to save projects to DB', e);
     }
@@ -103,7 +107,11 @@ export const StorageService = {
 
   saveChats(chats: ChatSession[]): void {
     try {
-      db.chats.bulkPut(chats).catch(e => console.error(e));
+      // Clear + bulkPut so deleted chats are actually removed from
+      // IndexedDB. bulkPut alone only upserts — it never deletes records
+      // that are no longer in the array, so deleted chats would reappear
+      // on restart.
+      db.chats.clear().then(() => { if (chats.length > 0) return db.chats.bulkPut(chats); }).catch(e => console.error(e));
     } catch (e) {
       console.error('Failed to save chats to DB', e);
     }
