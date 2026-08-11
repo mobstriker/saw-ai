@@ -29,6 +29,50 @@ export function resolveChatCompletionsUrl(rawUrl: string): string {
 }
 
 /**
+ * Normalizes a model identifier for the target provider endpoint.
+ *
+ * OpenRouter uses the `provider/model` format (e.g. `z-ai/glm-5.2`,
+ * `moonshot-ai/kimi-k3`) and REQUIRES the provider prefix to route the
+ * request. Direct provider APIs (Zhipu/Z.ai `open.bigmodel.cn`,
+ * Moonshot `api.moonshot.cn`, NVIDIA `integrate.api.nvidia.com`) do NOT
+ * understand the `provider/` prefix — they only accept the bare model id
+ * (e.g. `glm-4-flash`, `moonshot-v1-auto`).
+ *
+ * This strips the author/provider prefix when the request is NOT going to
+ * OpenRouter, so universal `provider/model` identifiers actually work
+ * against direct provider endpoints. When the endpoint IS OpenRouter, the
+ * full `provider/model` string is preserved (OpenRouter needs it).
+ */
+export function resolveModelForEndpoint(baseUrl: string, model: string): string {
+  const trimmedModel = (model || '').trim();
+  if (!trimmedModel) return trimmedModel;
+  const trimmedUrl = (baseUrl || '').trim().toLowerCase();
+
+  // OpenRouter requires the provider/model format — keep it intact.
+  if (trimmedUrl.includes('openrouter.ai')) {
+    return trimmedModel;
+  }
+
+  // For direct provider APIs, strip a leading "provider/" prefix if present.
+  // e.g. "z-ai/glm-4-flash" -> "glm-4-flash" for open.bigmodel.cn
+  //      "moonshot-ai/kimi-k3" -> "kimi-k3" for api.moonshot.cn
+  //      "nvidia/llama-3.1-nemotron-70b-instruct" -> keep bare model for nvidia
+  if (trimmedModel.includes('/')) {
+    const slashIndex = trimmedModel.indexOf('/');
+    const prefix = trimmedModel.slice(0, slashIndex).toLowerCase();
+    const rest = trimmedModel.slice(slashIndex + 1).trim();
+    // Only strip well-known author prefixes; some model ids legitimately
+    // contain slashes (rare). We strip the first segment when it looks like
+    // an author/org prefix (alphanumeric + hyphen, no spaces).
+    if (rest && /^[a-z0-9._-]+$/i.test(prefix)) {
+      return rest;
+    }
+  }
+
+  return trimmedModel;
+}
+
+/**
  * Universal fetch that tries the browser's fetch first (fast, native
  * streaming for CORS-friendly providers) and falls back to Tauri's
  * Rust-side HTTP plugin when the browser blocks the request (CSP or CORS).
@@ -98,6 +142,10 @@ export async function performChatRequest(payloadObj: any) {
   }
 
   const resolvedUrl = resolveChatCompletionsUrl(targetUrl);
+  // Normalize the model id for the target endpoint: OpenRouter keeps the
+  // provider/model prefix; direct provider APIs (Zhipu, Moonshot, NVIDIA)
+  // need the bare model name without the "provider/" prefix.
+  const resolvedModel = resolveModelForEndpoint(targetUrl, model);
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -134,7 +182,7 @@ export async function performChatRequest(payloadObj: any) {
   }
 
   const fetchPayload: any = {
-    model: model || 'gpt-4o',
+    model: resolvedModel || model || 'gpt-4o',
     messages: finalMessages,
     stream,
   };

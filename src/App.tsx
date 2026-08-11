@@ -709,9 +709,11 @@ export default function App() {
 
     try {
       let fullSystemPrompt = settings.systemPrompt || '';
+      // Project context is injected ONLY for chats bound to a project.
+      // Universal chats (no projectId) must not see any project files.
       const chatProject = targetChat.projectId
-        ? projects.find((p) => p.id === targetChat.projectId) || activeProject
-        : activeProject || (projects.length > 0 ? projects[0] : null);
+        ? projects.find((p) => p.id === targetChat.projectId) || null
+        : null;
 
       if (chatProject && chatProject.files && chatProject.files.length > 0) {
         const { promptText } = ContextInjector.buildProjectPromptContext(chatProject);
@@ -921,10 +923,11 @@ export default function App() {
       ).trim();
 
       const newArtifacts = ArtifactParser.extractArtifacts(fullCombinedFinal);
-      let targetProject =
-        activeProject ||
-        (targetChat.projectId ? projects.find((p) => p.id === targetChat.projectId) : null) ||
-        (projects.length > 0 ? projects[0] : null);
+      // Autopilot only targets the chat's bound project. Universal chats
+      // (no projectId) do not auto-apply changes to any project workspace.
+      let targetProject = targetChat.projectId
+        ? projects.find((p) => p.id === targetChat.projectId) || null
+        : null;
       const effectiveAutoMode = (targetChat.automationMode ||
         automationMode ||
         settings.automationMode ||
@@ -1094,8 +1097,12 @@ export default function App() {
     let targetChat = forcedChatId ? chats.find(c => c.id === forcedChatId) || activeChat : activeChat;
     let currentChats = [...chats];
 
-    // Create a new chat if there isn't one
-    if (!targetChat) {
+    // Create a new universal chat if there is no real active chat. The
+    // activeChat fallback (id: 'default') is a transient placeholder used
+    // when no persisted chat exists yet — typing into it must spawn a new
+    // universal chat (projectId: undefined) rather than mutate the phantom.
+    const targetChatIsPersisted = targetChat && chats.some(c => c.id === targetChat.id);
+    if (!targetChat || !targetChatIsPersisted) {
       const fastTitle = ChatTitler.generateFastHeuristicTitle(userPrompt);
       const newChat: ChatSession = {
         id: `chat-${Date.now()}`,
@@ -1104,6 +1111,9 @@ export default function App() {
         createdAt: Date.now(),
         updatedAt: Date.now(),
         model: settings.defaultModel,
+        // Universal chat — not bound to any project. Project context is
+        // only injected for chats created via "New Chat" inside a project.
+        projectId: undefined,
       };
       targetChat = newChat;
       currentChats = [newChat, ...chats];
@@ -1272,10 +1282,14 @@ export default function App() {
         fullSystemPrompt = `${skillsContext.promptText}\n\n${fullSystemPrompt}`;
       }
 
-      // Inject project context: resolve from chat's projectId, activeProject, or first workspace project
+      // Inject project context: ONLY for chats bound to a project.
+      // Universal chats (no projectId) must NOT have access to any
+      // project workspace — they are standalone conversations. Project
+      // context is injected exclusively when the chat was created via
+      // "New Chat" inside a project (handleNewChatInProject sets projectId).
       const chatProject = targetChat.projectId
-        ? projects.find((p) => p.id === targetChat.projectId) || activeProject
-        : activeProject || (projects.length > 0 ? projects[0] : null);
+        ? projects.find((p) => p.id === targetChat.projectId) || null
+        : null;
 
       if (chatProject && chatProject.files && chatProject.files.length > 0) {
         const { promptText } = ContextInjector.buildProjectPromptContext(chatProject);
@@ -1285,7 +1299,8 @@ export default function App() {
       }
 
       // If multiple projects exist in workspace, inject workspace directory overview
-      if (projects.length > 1) {
+      // ONLY for project-bound chats. Universal chats do not see projects.
+      if (targetChat.projectId && projects.length > 1) {
         const projectsCatalog = projects
           .map((p) => `- Project "${p.name}" (ID: ${p.id}): ${p.files.length} file(s) [${p.files.map((f) => f.path).join(', ')}]`)
           .join('\n');
@@ -1515,7 +1530,9 @@ When handling complex multi-step tasks:
       const fullAssistantOutput = finalParsed.content || assistantMessageContent;
       const newArtifacts = ArtifactParser.extractArtifacts(fullAssistantOutput);
 
-      let targetProject = activeProject || currentChatProject || (projects.length > 0 ? projects[0] : null);
+      let targetProject = targetChat.projectId
+        ? projects.find((p) => p.id === targetChat.projectId) || null
+        : null;
       const effectiveAutoMode = (targetChat.automationMode || automationMode || settings.automationMode || 'automatic') as AutomationMode;
 
       if (targetProject) {

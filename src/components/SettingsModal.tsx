@@ -31,7 +31,7 @@ import { MCPTab } from './MCPTab';
 import { SkillsTab } from './SkillsTab';
 import { AddSkillModal } from './AddSkillModal';
 import { StorageService } from '../utils/storage';
-import { resolveChatCompletionsUrl, universalFetch } from '../utils/chatProxy';
+import { resolveChatCompletionsUrl, resolveModelForEndpoint, universalFetch } from '../utils/chatProxy';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -140,7 +140,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     });
   };
 
-  const handleAddNewProfile = (preset?: 'openai' | 'openrouter' | 'deepseek' | 'groq' | 'moonshot' | 'gemini' | 'zhipu' | 'nvidia' | 'ollama' | 'custom') => {
+  const handleAddNewProfile = (preset?: 'openai' | 'openrouter' | 'deepseek' | 'groq' | 'moonshot' | 'moonshot-openrouter' | 'gemini' | 'zhipu' | 'zai-openrouter' | 'nvidia' | 'ollama' | 'custom') => {
     let newProf: AIProfile;
 
     if (preset === 'openrouter') {
@@ -156,6 +156,40 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         isActive: false,
         maxTokens: 8192,
         contextWindow: 200000,
+        updatedAt: Date.now(),
+      };
+    } else if (preset === 'zai-openrouter') {
+      // Zhipu GLM via OpenRouter — model id keeps the z-ai/ prefix because
+      // OpenRouter routes by the provider prefix in the model id.
+      newProf = {
+        id: `profile-${Date.now()}`,
+        name: 'Zhipu GLM-5.2 (Z-AI via OpenRouter)',
+        provider: 'openrouter',
+        baseUrl: 'https://openrouter.ai/api/v1',
+        apiKey: '',
+        model: 'z-ai/glm-5.2',
+        customHeaders: '{"HTTP-Referer": "https://ai.studio/build", "X-Title": "SAW AI"}',
+        systemPrompt: 'You are GLM, a capable AI assistant by Zhipu AI.',
+        isActive: false,
+        maxTokens: 8192,
+        contextWindow: 128000,
+        updatedAt: Date.now(),
+      };
+    } else if (preset === 'moonshot-openrouter') {
+      // Moonshot Kimi K3 via OpenRouter — model id keeps the moonshot-ai/
+      // prefix because OpenRouter routes by the provider prefix.
+      newProf = {
+        id: `profile-${Date.now()}`,
+        name: 'Moonshot Kimi K3 (via OpenRouter)',
+        provider: 'openrouter',
+        baseUrl: 'https://openrouter.ai/api/v1',
+        apiKey: '',
+        model: 'moonshot-ai/kimi-k3',
+        customHeaders: '{"HTTP-Referer": "https://ai.studio/build", "X-Title": "SAW AI"}',
+        systemPrompt: 'You are Kimi, a long-context code synthesis engine.',
+        isActive: false,
+        maxTokens: 16384,
+        contextWindow: 256000,
         updatedAt: Date.now(),
       };
     } else if (preset === 'deepseek') {
@@ -219,9 +253,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         updatedAt: Date.now(),
       };
     } else if (preset === 'zhipu') {
+      // Zhipu / Z.ai direct OpenAI-compatible API. Direct provider APIs do
+      // NOT accept the "z-ai/" provider prefix in the model id — the bare
+      // model name (e.g. glm-4-flash) is required here.
       newProf = {
         id: `profile-${Date.now()}`,
-        name: 'Zhipu GLM (Z-AI)',
+        name: 'Zhipu GLM (Z-AI Direct)',
         provider: 'custom',
         baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
         apiKey: '',
@@ -234,13 +271,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         updatedAt: Date.now(),
       };
     } else if (preset === 'nvidia') {
+      // NVIDIA NIM direct API. The preset used to ship "nvidia/llama-3.1-..."
+      // as the model id, but NVIDIA's direct endpoint expects the bare model
+      // name without the "nvidia/" prefix. resolveModelForEndpoint() strips
+      // it at request time, but we also store the clean id here.
       newProf = {
         id: `profile-${Date.now()}`,
         name: 'NVIDIA NIM',
         provider: 'custom',
         baseUrl: 'https://integrate.api.nvidia.com/v1',
         apiKey: '',
-        model: 'nvidia/llama-3.1-nemotron-70b-instruct',
+        model: 'llama-3.1-nemotron-70b-instruct',
         customHeaders: '',
         systemPrompt: 'You are a high-performance AI assistant running on NVIDIA NIM.',
         isActive: false,
@@ -380,7 +421,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
     const method = 'POST';
     const body = JSON.stringify({
-      model: (model || '').trim() || 'gpt-4o',
+      // Normalize model id for the endpoint (strip provider/ prefix for direct APIs)
+      model: resolveModelForEndpoint(trimmedUrl, (model || '').trim()) || 'gpt-4o',
       messages: [{ role: 'user', content: 'ping' }],
       max_tokens: 1,
       stream: false,
@@ -696,7 +738,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             onClick={() => handleAddNewProfile('moonshot')}
                             className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-[#FAF8F5] text-[#2C2825] font-medium"
                           >
-                            Moonshot Kimi K3
+                            Moonshot Kimi (Direct API)
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleAddNewProfile('moonshot-openrouter')}
+                            className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-[#FAF8F5] text-[#2C2825] font-medium"
+                          >
+                            Moonshot Kimi K3 (OpenRouter)
                           </button>
                           <button
                             type="button"
@@ -710,7 +759,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             onClick={() => handleAddNewProfile('zhipu')}
                             className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-[#FAF8F5] text-[#2C2825] font-medium"
                           >
-                            Zhipu GLM (Z-AI)
+                            Zhipu GLM (Z-AI Direct)
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleAddNewProfile('zai-openrouter')}
+                            className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-[#FAF8F5] text-[#2C2825] font-medium"
+                          >
+                            Zhipu GLM-5.2 (OpenRouter)
                           </button>
                           <button
                             type="button"

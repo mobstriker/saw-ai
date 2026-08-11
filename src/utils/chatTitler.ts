@@ -1,6 +1,6 @@
 import { AIProfile, BYOKSettings } from '../types';
 import { ModelRouter } from './modelRouter';
-import { resolveChatCompletionsUrl, universalFetch } from './chatProxy';
+import { resolveChatCompletionsUrl, resolveModelForEndpoint, universalFetch } from './chatProxy';
 
 export class ChatTitler {
   /**
@@ -86,7 +86,9 @@ export class ChatTitler {
     const resolvedTarget = ModelRouter.resolveModel(profile || undefined, 'flash');
     const baseUrl = resolvedTarget.baseUrl || settings?.baseUrl;
     const apiKey = resolvedTarget.apiKey || settings?.apiKey;
-    const model = resolvedTarget.model || 'gpt-4o-mini';
+    const rawModel = resolvedTarget.model || 'gpt-4o-mini';
+    // Normalize model id for the endpoint (strip provider/ prefix for direct APIs)
+    const model = baseUrl ? resolveModelForEndpoint(baseUrl, rawModel) : rawModel;
     const customHeaders = resolvedTarget.customHeaders || settings?.customHeaders;
 
     // If user has not configured an API key (and not local endpoint), keep the fast heuristic title
