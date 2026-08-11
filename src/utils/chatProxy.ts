@@ -43,32 +43,27 @@ export function resolveChatCompletionsUrl(rawUrl: string): string {
  * against direct provider endpoints. When the endpoint IS OpenRouter, the
  * full `provider/model` string is preserved (OpenRouter needs it).
  */
+const BARE_MODEL_ID_HOSTS = [
+  'open.bigmodel.cn', // Zhipu / Z.ai direct API
+  'api.moonshot.cn',  // Moonshot direct API (China endpoint)
+];
+
 export function resolveModelForEndpoint(baseUrl: string, model: string): string {
   const trimmedModel = (model || '').trim();
   if (!trimmedModel) return trimmedModel;
   const trimmedUrl = (baseUrl || '').trim().toLowerCase();
 
-  // OpenRouter requires the provider/model format — keep it intact.
-  if (trimmedUrl.includes('openrouter.ai')) {
+  const requiresBareId = BARE_MODEL_ID_HOSTS.some((host) => trimmedUrl.includes(host));
+  if (!requiresBareId) {
+    // Default: send the model id exactly as configured.
     return trimmedModel;
   }
 
-  // For direct provider APIs, strip a leading "provider/" prefix if present.
-  // e.g. "z-ai/glm-4-flash" -> "glm-4-flash" for open.bigmodel.cn
-  //      "moonshot-ai/kimi-k3" -> "kimi-k3" for api.moonshot.cn
-  //      "nvidia/llama-3.1-nemotron-70b-instruct" -> keep bare model for nvidia
   if (trimmedModel.includes('/')) {
     const slashIndex = trimmedModel.indexOf('/');
-    const prefix = trimmedModel.slice(0, slashIndex).toLowerCase();
     const rest = trimmedModel.slice(slashIndex + 1).trim();
-    // Only strip well-known author prefixes; some model ids legitimately
-    // contain slashes (rare). We strip the first segment when it looks like
-    // an author/org prefix (alphanumeric + hyphen, no spaces).
-    if (rest && /^[a-z0-9._-]+$/i.test(prefix)) {
-      return rest;
-    }
+    if (rest) return rest;
   }
-
   return trimmedModel;
 }
 
