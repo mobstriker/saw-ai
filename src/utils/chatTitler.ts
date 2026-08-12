@@ -122,10 +122,9 @@ export class ChatTitler {
     if (apiKey) {
       requestHeaders['Authorization'] = `Bearer ${apiKey}`;
     }
-    if (baseUrl && baseUrl.includes('openrouter.ai')) {
-      requestHeaders['HTTP-Referer'] = 'https://ai.studio/build';
-      requestHeaders['X-Title'] = 'SAW AI Workspace';
-    }
+    // Provider-specific headers (e.g. OpenRouter's optional HTTP-Referer/X-Title
+    // ranking signals) are added via the profile's Custom Headers field — the
+    // titler is fully provider-agnostic and never hardcodes host behavior.
 
     try {
       const controller = new AbortController();

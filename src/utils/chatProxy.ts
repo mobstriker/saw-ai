@@ -39,11 +39,12 @@ export function resolveModelForEndpoint(_baseUrl: string, model: string): string
 
 /**
  * Detects whether the app is running inside the Tauri desktop webview.
- * When true, we prefer the Rust-side HTTP plugin for all API requests
- * because it bypasses browser CORS/CSP entirely — the request originates
- * from native Rust code, not the webview. This is what makes providers
- * like OpenRouter, Zhipu, Moonshot, and NVIDIA work reliably in the
- * desktop app regardless of their CORS headers.
+ *
+ * The desktop webview (WebView2 on Windows, WebKit on macOS/Linux) IS a real
+ * browser engine, so its native `fetch` behaves exactly like the web app's
+ * fetch — same TLS/HTTP2 fingerprint, same redirect/cookie handling, same
+ * streaming. This is why requests that work on the web must also be sent
+ * through the webview's native fetch on desktop: it is the same engine.
  */
 function isTauriEnvironment(): boolean {
   if (typeof window === 'undefined') return false;
@@ -75,48 +76,64 @@ function buildTauriInit(init?: RequestInit): any {
   return tauriInit;
 }
 
+function isNetworkOrCorsFailure(err: any): boolean {
+  return (
+    err instanceof TypeError ||
+    err?.name === 'TypeError' ||
+    /failed to fetch|networkerror|load failed|cors|blocked/i.test(
+      err?.message || ''
+    )
+  );
+}
+
 /**
- * Universal fetch that uses the Tauri Rust-side HTTP plugin when running
- * inside the desktop app (bypassing CORS/CSP), and falls back to the
- * browser's native fetch when running in a plain web browser.
+ * Universal fetch for both web and desktop.
  *
- * In the desktop app, CORS preflight failures in the webview can manifest
- * as HTTP 403/0 responses rather than TypeError exceptions, so we PREFER
- * the Tauri HTTP plugin upfront for all requests in Tauri — this eliminates
- * CORS as a failure mode entirely for every OpenAI-compatible provider.
+ * Strategy (provider-agnostic — no host lists, no special-casing):
  *
- * The Response shape is identical for both paths (body is a ReadableStream),
- * so SSE streaming works transparently.
+ *  1. ALWAYS try the webview/browser's NATIVE fetch first. On the web this
+ *     is the only path. On desktop, the Tauri webview is a real browser
+ *     engine (WebView2/WebKit), so native fetch behaves identically to the
+ *     web app — same TLS fingerprint, same streaming, same behavior. This
+ *     is what makes every provider that worked on web also work on desktop.
+ *
+ *  2. Only if native fetch throws a genuine network/CORS failure (the
+ *     provider doesn't send permissive CORS headers, so the browser engine
+ *     blocks the cross-origin request) do we fall back to the Tauri
+ *     Rust-side HTTP plugin, which originates the request from native code
+ *     and therefore bypasses CORS entirely.
+ *
+ * This is strictly better than preferring the Rust client: the Rust client
+ * (reqwest) is not a browser, and some providers' edge gateways treat its
+ * TLS/HTTP2 fingerprint differently than a real browser's, causing
+ * provider-specific failures that look like "this provider's models don't
+ * work" even though a real browser reaches them fine. Routing through the
+ * real browser engine first eliminates that entire class of bug.
+ *
+ * HTTP error responses (401/403/429/500...) are NOT network failures — they
+ * are returned as normal Responses so the caller can surface the real
+ * provider error message; we never retry those via the fallback.
  */
 export async function universalFetch(
   input: string,
   init?: RequestInit
 ): Promise<Response> {
-  // In the Tauri desktop app, use the Rust HTTP plugin directly — it is
-  // not subject to browser CORS or CSP, so every provider works.
-  if (isTauriEnvironment()) {
-    const tauriFetch = await getTauriFetch();
-    if (tauriFetch) {
-      return await tauriFetch(input, buildTauriInit(init));
-    }
-    // Tauri plugin not available — fall through to browser fetch
-  }
-
+  // 1. Native browser/webview fetch first — identical to the web app.
   try {
     return await fetch(input, init);
-  } catch (browserErr: any) {
-    // In a plain browser, fall back to Tauri HTTP if available (e.g. the
-    // dev server running inside Tauri's dev mode).
-    const isNetworkFailure =
-      browserErr instanceof TypeError ||
-      browserErr?.name === 'TypeError' ||
-      /failed to fetch|networkerror|load failed/i.test(browserErr?.message || '');
-    if (!isNetworkFailure) throw browserErr;
+  } catch (err: any) {
+    if (!isNetworkOrCorsFailure(err)) throw err;
 
-    const tauriFetch = await getTauriFetch();
-    if (!tauriFetch) throw browserErr; // not running in Tauri — rethrow original
+    // 2. Network/CORS failure — fall back to the Tauri Rust HTTP plugin,
+    //    which bypasses CORS. Only available inside the desktop app.
+    if (isTauriEnvironment()) {
+      const tauriFetch = await getTauriFetch();
+      if (tauriFetch) {
+        return await tauriFetch(input, buildTauriInit(init));
+      }
+    }
 
-    return await tauriFetch(input, buildTauriInit(init));
+    throw err; // not in Tauri, or plugin unavailable — rethrow original
   }
 }
 
