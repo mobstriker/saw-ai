@@ -140,191 +140,31 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     });
   };
 
-  const handleAddNewProfile = (preset?: 'openai' | 'openrouter' | 'deepseek' | 'groq' | 'moonshot' | 'moonshot-openrouter' | 'gemini' | 'zhipu' | 'zai-openrouter' | 'nvidia' | 'ollama' | 'custom') => {
-    let newProf: AIProfile;
-
-    if (preset === 'openrouter') {
-      newProf = {
-        id: `profile-${Date.now()}`,
-        name: 'Claude 3.5 Sonnet (OpenRouter)',
-        provider: 'openrouter',
-        baseUrl: 'https://openrouter.ai/api/v1',
-        apiKey: '',
-        model: 'anthropic/claude-3.5-sonnet',
-        customHeaders: '{"HTTP-Referer": "https://ai.studio/build", "X-Title": "SAW AI"}',
-        systemPrompt: 'You are Claude, a world-class coding assistant.',
-        isActive: false,
-        maxTokens: 8192,
-        contextWindow: 200000,
-        updatedAt: Date.now(),
-      };
-    } else if (preset === 'zai-openrouter') {
-      // Zhipu GLM via OpenRouter — model id keeps the z-ai/ prefix because
-      // OpenRouter routes by the provider prefix in the model id.
-      newProf = {
-        id: `profile-${Date.now()}`,
-        name: 'Zhipu GLM-5.2 (Z-AI via OpenRouter)',
-        provider: 'openrouter',
-        baseUrl: 'https://openrouter.ai/api/v1',
-        apiKey: '',
-        model: 'z-ai/glm-5.2',
-        customHeaders: '{"HTTP-Referer": "https://ai.studio/build", "X-Title": "SAW AI"}',
-        systemPrompt: 'You are GLM, a capable AI assistant by Zhipu AI.',
-        isActive: false,
-        maxTokens: 8192,
-        contextWindow: 128000,
-        updatedAt: Date.now(),
-      };
-    } else if (preset === 'moonshot-openrouter') {
-      // Moonshot Kimi K3 via OpenRouter — model id keeps the moonshot-ai/
-      // prefix because OpenRouter routes by the provider prefix.
-      newProf = {
-        id: `profile-${Date.now()}`,
-        name: 'Moonshot Kimi K3 (via OpenRouter)',
-        provider: 'openrouter',
-        baseUrl: 'https://openrouter.ai/api/v1',
-        apiKey: '',
-        model: 'moonshot-ai/kimi-k3',
-        customHeaders: '{"HTTP-Referer": "https://ai.studio/build", "X-Title": "SAW AI"}',
-        systemPrompt: 'You are Kimi, a long-context code synthesis engine.',
-        isActive: false,
-        maxTokens: 16384,
-        contextWindow: 256000,
-        updatedAt: Date.now(),
-      };
-    } else if (preset === 'deepseek') {
-      newProf = {
-        id: `profile-${Date.now()}`,
-        name: 'DeepSeek Chat (V3 / R1)',
-        provider: 'deepseek',
-        baseUrl: 'https://api.deepseek.com/v1',
-        apiKey: '',
-        model: 'deepseek-chat',
-        customHeaders: '',
-        systemPrompt: 'You are DeepSeek, an expert software developer and reasoning assistant.',
-        isActive: false,
-        maxTokens: 8192,
-        contextWindow: 64000,
-        updatedAt: Date.now(),
-      };
-    } else if (preset === 'groq') {
-      newProf = {
-        id: `profile-${Date.now()}`,
-        name: 'Groq LPU (Llama 3.3)',
-        provider: 'groq',
-        baseUrl: 'https://api.groq.com/openai/v1',
-        apiKey: '',
-        model: 'llama-3.3-70b-versatile',
-        customHeaders: '',
-        systemPrompt: 'You are a high-speed Llama 3 programming assistant on Groq LPUs.',
-        isActive: false,
-        maxTokens: 8192,
-        contextWindow: 128000,
-        updatedAt: Date.now(),
-      };
-    } else if (preset === 'moonshot') {
-      newProf = {
-        id: `profile-${Date.now()}`,
-        name: 'Moonshot Kimi K3',
-        provider: 'moonshot',
-        baseUrl: 'https://api.moonshot.cn/v1',
-        apiKey: '',
-        model: 'moonshot-v1-auto',
-        customHeaders: '',
-        systemPrompt: 'You are Kimi, a long-context code synthesis engine.',
-        isActive: false,
-        maxTokens: 16384,
-        contextWindow: 256000,
-        updatedAt: Date.now(),
-      };
-    } else if (preset === 'gemini') {
-      newProf = {
-        id: `profile-${Date.now()}`,
-        name: 'Google Gemini',
-        provider: 'gemini',
-        baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
-        apiKey: '',
-        model: 'gemini-2.5-flash',
-        customHeaders: '',
-        systemPrompt: 'You are Gemini, a fast and capable AI assistant by Google.',
-        isActive: false,
-        maxTokens: 8192,
-        contextWindow: 1000000,
-        updatedAt: Date.now(),
-      };
-    } else if (preset === 'zhipu') {
-      // Zhipu / Z.ai direct OpenAI-compatible API. Direct provider APIs do
-      // NOT accept the "z-ai/" provider prefix in the model id — the bare
-      // model name (e.g. glm-4-flash) is required here.
-      newProf = {
-        id: `profile-${Date.now()}`,
-        name: 'Zhipu GLM (Z-AI Direct)',
-        provider: 'custom',
-        baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
-        apiKey: '',
-        model: 'glm-4-flash',
-        customHeaders: '',
-        systemPrompt: 'You are GLM, a capable AI assistant by Zhipu AI.',
-        isActive: false,
-        maxTokens: 8192,
-        contextWindow: 128000,
-        updatedAt: Date.now(),
-      };
-    } else if (preset === 'nvidia') {
-      // NVIDIA NIM direct API. The preset used to ship "nvidia/llama-3.1-..."
-      // as the model id, but NVIDIA's direct endpoint expects the bare model
-      // name without the "nvidia/" prefix. resolveModelForEndpoint() strips
-      // it at request time, but we also store the clean id here.
-      newProf = {
-        id: `profile-${Date.now()}`,
-        name: 'NVIDIA NIM',
-        provider: 'custom',
-        baseUrl: 'https://integrate.api.nvidia.com/v1',
-        apiKey: '',
-        model: 'llama-3.1-nemotron-70b-instruct',
-        customHeaders: '',
-        systemPrompt: 'You are a high-performance AI assistant running on NVIDIA NIM.',
-        isActive: false,
-        maxTokens: 8192,
-        contextWindow: 128000,
-        updatedAt: Date.now(),
-      };
-    } else if (preset === 'ollama') {
-      newProf = {
-        id: `profile-${Date.now()}`,
-        name: 'Local Ollama Endpoint',
-        provider: 'ollama',
-        baseUrl: 'http://localhost:11434/v1',
-        apiKey: 'ollama',
-        model: 'qwen2.5-coder:7b',
-        customHeaders: '',
-        systemPrompt: 'You are a private offline code assistant.',
-        isActive: false,
-        maxTokens: 4096,
-        contextWindow: 32768,
-        updatedAt: Date.now(),
-      };
-    } else {
-      newProf = {
-        id: `profile-${Date.now()}`,
-        name: 'Custom OpenAI-Compatible AI',
-        provider: 'custom',
-        baseUrl: 'https://api.openai.com/v1',
-        apiKey: '',
-        model: 'gpt-4o',
-        customHeaders: '',
-        systemPrompt: formData.systemPrompt,
-        isActive: false,
-        maxTokens: 16384,
-        contextWindow: 128000,
-        updatedAt: Date.now(),
-      };
-    }
+  const handleAddNewProfile = () => {
+    // The only kind of profile this app creates is a custom OpenAI-compatible
+    // endpoint. Every field is left blank so the user can plug in ANY provider
+    // (OpenAI, OpenRouter, Zhipu, Moonshot, NVIDIA NIM, Token Router, local
+    // Ollama/vLLM, ...) with whatever URL, key, and model that provider expects.
+    const newProf: AIProfile = {
+      id: `profile-${Date.now()}`,
+      name: 'Custom Endpoint',
+      provider: 'custom',
+      baseUrl: '',
+      apiKey: '',
+      model: '',
+      customHeaders: '',
+      systemPrompt: formData.systemPrompt,
+      isActive: false,
+      maxTokens: 0,
+      contextWindow: 0,
+      updatedAt: Date.now(),
+    };
 
     const updated = [...profiles, newProf];
     setFormData({ ...formData, aiProfiles: updated });
     setEditingProfileId(newProf.id);
   };
+
 
   const handleDeleteProfile = (profileId: string) => {
     if (profiles.length === 0) return;
@@ -406,8 +246,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
     // Always probe the real /chat/completions endpoint with a minimal
     // 1-token request. This validates the key + model + endpoint together,
-    // the same way the chat path does, and works for every OpenAI-compatible
-    // provider (OpenAI, OpenRouter, DeepSeek, Groq, Moonshot, Gemini, Ollama).
+    // the same way the chat path does, and works for any OpenAI-compatible
+    // provider.
     const probeUrl = resolveChatCompletionsUrl(trimmedUrl);
 
     const headers: Record<string, string> = {
@@ -416,10 +256,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     };
     if (apiKey && apiKey.trim()) {
       headers['Authorization'] = `Bearer ${apiKey.trim()}`;
-    }
-    if (trimmedUrl.includes('openrouter.ai')) {
-      headers['HTTP-Referer'] = 'https://ai.studio/build';
-      headers['X-Title'] = 'SAW AI Workspace';
     }
     // Apply any user-configured custom headers from the profile so the
     // test connection uses the same headers as the real chat request.
@@ -710,111 +546,22 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <div className="md:col-span-5 space-y-3">
                     <div className="flex items-center justify-between">
                       <span className="text-xs font-bold text-[#2C2825]">Configured AI Profiles</span>
-                      <div className="relative group">
-                        <button
-                          type="button"
-                          className="px-2.5 py-1 rounded-lg bg-[#FAF8F5] hover:bg-[#F5F1EA] text-xs font-bold text-[#C58B51] border border-[#E6DFD3] flex items-center gap-1 cursor-pointer transition-colors shadow-2xs"
-                        >
-                          <Plus size={13} />
-                          <span>Add Profile</span>
-                        </button>
-                        {/* Quick Presets Menu */}
-                        <div className="absolute right-0 top-full mt-1 w-48 bg-white border border-[#E6DFD3] rounded-xl shadow-lg p-1.5 z-20 hidden group-hover:block animate-in fade-in">
-                          <button
-                            type="button"
-                            onClick={() => handleAddNewProfile('openai')}
-                            className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-[#FAF8F5] text-[#2C2825] font-medium"
-                          >
-                            OpenAI GPT-4o
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleAddNewProfile('openrouter')}
-                            className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-[#FAF8F5] text-[#2C2825] font-medium"
-                          >
-                            Claude 3.5 (OpenRouter)
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleAddNewProfile('deepseek')}
-                            className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-[#FAF8F5] text-[#2C2825] font-medium"
-                          >
-                            DeepSeek Chat V3
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleAddNewProfile('groq')}
-                            className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-[#FAF8F5] text-[#2C2825] font-medium"
-                          >
-                            Groq LPU (Llama 3.3)
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleAddNewProfile('moonshot')}
-                            className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-[#FAF8F5] text-[#2C2825] font-medium"
-                          >
-                            Moonshot Kimi (Direct API)
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleAddNewProfile('moonshot-openrouter')}
-                            className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-[#FAF8F5] text-[#2C2825] font-medium"
-                          >
-                            Moonshot Kimi K3 (OpenRouter)
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleAddNewProfile('gemini')}
-                            className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-[#FAF8F5] text-[#2C2825] font-medium"
-                          >
-                            Google Gemini
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleAddNewProfile('zhipu')}
-                            className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-[#FAF8F5] text-[#2C2825] font-medium"
-                          >
-                            Zhipu GLM (Z-AI Direct)
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleAddNewProfile('zai-openrouter')}
-                            className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-[#FAF8F5] text-[#2C2825] font-medium"
-                          >
-                            Zhipu GLM-5.2 (OpenRouter)
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleAddNewProfile('nvidia')}
-                            className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-[#FAF8F5] text-[#2C2825] font-medium"
-                          >
-                            NVIDIA NIM
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleAddNewProfile('ollama')}
-                            className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-[#FAF8F5] text-[#2C2825] font-medium"
-                          >
-                            Local Ollama / vLLM
-                          </button>
-                          <div className="border-t border-[#E6DFD3] my-1"></div>
-                          <button
-                            type="button"
-                            onClick={() => handleAddNewProfile('custom')}
-                            className="w-full text-left px-2.5 py-1.5 rounded-lg text-xs hover:bg-[#FAF8F5] text-[#C58B51] font-bold"
-                          >
-                            + Custom Endpoint
-                          </button>
-                        </div>
-                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handleAddNewProfile()}
+                        className="px-2.5 py-1 rounded-lg bg-[#FAF8F5] hover:bg-[#F5F1EA] text-xs font-bold text-[#C58B51] border border-[#E6DFD3] flex items-center gap-1 cursor-pointer transition-colors shadow-2xs"
+                      >
+                        <Plus size={13} />
+                        <span>Add Custom Endpoint</span>
+                      </button>
                     </div>
 
                     {/* Profiles Cards */}
                     <div className="space-y-2 max-h-[460px] overflow-y-auto pr-1">
                       {profiles.length === 0 && (
                         <div className="text-center py-6 px-4 bg-[#FAF8F5] rounded-xl border border-dashed border-[#E6DFD3]">
-                          <p className="text-xs font-medium text-[#7C756E] mb-2">No AI profiles configured.</p>
-                          <p className="text-[10px] text-[#A09890]">Add a profile above to connect to an API provider.</p>
+                          <p className="text-xs font-medium text-[#7C756E] mb-2">No AI endpoints configured.</p>
+                          <p className="text-[10px] text-[#A09890]">Click “Add Custom Endpoint” to connect any OpenAI-compatible API.</p>
                         </div>
                       )}
                       {profiles.map((p) => {

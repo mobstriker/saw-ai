@@ -109,7 +109,7 @@ export interface SubModelConfig {
 export interface AIProfile {
   id: string;
   name: string; // e.g. "Google Gemini Intelligence", "OpenAI GPT-4o", "Claude 3.5 Sonnet (OpenRouter)", "DeepSeek V3", "Local Ollama Llama 3"
-  provider: 'gemini' | 'openai' | 'openrouter' | 'anthropic' | 'deepseek' | 'groq' | 'ollama' | 'moonshot' | 'custom';
+  provider: 'custom';
   baseUrl: string;
   apiKey: string;
   model: string;
@@ -119,10 +119,6 @@ export interface AIProfile {
   maxTokens?: number;
   contextWindow?: number;
   updatedAt?: number;
-  isBundle?: boolean; // Flag if this is a smart model bundle
-  modelSmall?: string; // e.g. gemini-2.5-flash or gpt-4o-mini
-  modelMedium?: string; // e.g. gemini-2.5-pro or gpt-4o
-  modelLarge?: string; // e.g. gemini-2.5-pro or moonshot-v1-auto
   mainModelRole?: 'heavy' | 'medium' | 'flash'; // Role of the primary model
   subModels?: SubModelConfig[]; // Up to 2 sub-models (max 3 total models)
 }

@@ -1,70 +1,40 @@
 /**
- * Normalizes an OpenAI-compatible base URL so it always points at the
- * `/chat/completions` endpoint.
+ * Normalizes a user-provided OpenAI-compatible endpoint URL so it always
+ * points at `/chat/completions`.
  *
- * AI profiles store the API *root* (e.g. `https://api.openai.com/v1`),
- * never the full chat endpoint. The old Node.js backend appended
- * `/chat/completions` server-side; in the standalone desktop build we must
- * do it client-side, otherwise the request hits the provider root, which
- * returns 404 with NO CORS headers → the browser blocks it and fetch()
- * throws "Failed to fetch".
- *
- * Handles every supported preset root:
- *  - https://api.openai.com/v1
- *  - https://openrouter.ai/api/v1
- *  - https://api.deepseek.com/v1
- *  - https://api.groq.com/openai/v1
- *  - https://api.moonshot.cn/v1
- *  - http://localhost:11434/v1          (Ollama)
- *  - https://generativelanguage.googleapis.com/v1beta/openai   (Gemini OpenAI-compat)
- * And no-ops when the user already pasted the full endpoint.
+ * This app is universal: the user pastes whatever their provider gives them —
+ * the API root (`https://api.openai.com/v1`), a partial chat path
+ * (`…/v1/chat`), or the full endpoint (`…/v1/chat/completions`). Whatever the
+ * shape, with or without a trailing slash, this produces a correct
+ * `/chat/completions` URL. Examples:
+ *   https://api.openai.com/v1                         -> …/v1/chat/completions
+ *   https://openrouter.ai/api/v1/                     -> …/api/v1/chat/completions
+ *   https://api.example.com/v1/chat                  -> …/v1/chat/completions
+ *   https://api.example.com/v1/chat/completions       -> (unchanged)
+ *   https://api.example.com/v1/responses              -> …/v1/chat/completions
  */
 export function resolveChatCompletionsUrl(rawUrl: string): string {
   let url = (rawUrl || '').trim();
   if (!url) return url;
-  // Strip trailing slashes (but keep the scheme/host intact)
   url = url.replace(/\/+$/, '');
   if (/\/chat\/completions$/i.test(url)) return url;
+  // Strip a lone trailing `/chat` or `/responses` so we don't end up with
+  // `/chat/chat/completions`.
+  url = url.replace(/\/(chat|responses)$/i, '');
   return url + '/chat/completions';
 }
 
 /**
- * Normalizes a model identifier for the target provider endpoint.
+ * Returns the model identifier exactly as configured.
  *
- * OpenRouter uses the `provider/model` format (e.g. `z-ai/glm-5.2`,
- * `moonshot-ai/kimi-k3`) and REQUIRES the provider prefix to route the
- * request. Direct provider APIs (Zhipu/Z.ai `open.bigmodel.cn`,
- * Moonshot `api.moonshot.cn`, NVIDIA `integrate.api.nvidia.com`) do NOT
- * understand the `provider/` prefix — they only accept the bare model id
- * (e.g. `glm-4-flash`, `moonshot-v1-auto`).
- *
- * This strips the author/provider prefix when the request is NOT going to
- * OpenRouter, so universal `provider/model` identifiers actually work
- * against direct provider endpoints. When the endpoint IS OpenRouter, the
- * full `provider/model` string is preserved (OpenRouter needs it).
+ * The app is provider-agnostic: whatever model string the user enters is sent
+ * verbatim to their OpenAI-compatible endpoint. No per-host special-casing,
+ * no prefix stripping -- so it works with every provider (OpenAI, OpenRouter,
+ * Zhipu, Moonshot, NVIDIA NIM, Token Router, local Ollama/vLLM, ...) without
+ * the app ever guessing what the endpoint expects. The user is in full control.
  */
-const BARE_MODEL_ID_HOSTS = [
-  'open.bigmodel.cn', // Zhipu / Z.ai direct API
-  'api.moonshot.cn',  // Moonshot direct API (China endpoint)
-];
-
-export function resolveModelForEndpoint(baseUrl: string, model: string): string {
-  const trimmedModel = (model || '').trim();
-  if (!trimmedModel) return trimmedModel;
-  const trimmedUrl = (baseUrl || '').trim().toLowerCase();
-
-  const requiresBareId = BARE_MODEL_ID_HOSTS.some((host) => trimmedUrl.includes(host));
-  if (!requiresBareId) {
-    // Default: send the model id exactly as configured.
-    return trimmedModel;
-  }
-
-  if (trimmedModel.includes('/')) {
-    const slashIndex = trimmedModel.indexOf('/');
-    const rest = trimmedModel.slice(slashIndex + 1).trim();
-    if (rest) return rest;
-  }
-  return trimmedModel;
+export function resolveModelForEndpoint(_baseUrl: string, model: string): string {
+  return (model || '').trim();
 }
 
 /**
@@ -166,20 +136,16 @@ export async function performChatRequest(payloadObj: any) {
   }
 
   const resolvedUrl = resolveChatCompletionsUrl(targetUrl);
-  // Normalize the model id for the target endpoint: OpenRouter keeps the
-  // provider/model prefix; direct provider APIs (Zhipu, Moonshot, NVIDIA)
-  // need the bare model name without the "provider/" prefix.
+  // Send the model id exactly as the user configured it; the endpoint knows
+  // what it expects (e.g. OpenRouter's "provider/model", or a bare model name).
   const resolvedModel = resolveModelForEndpoint(targetUrl, model);
-
-  const APP_URL = 'https://github.com/mobstriker/saw-ai'; 
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
-    // Spoof a standard browser to bypass Cloudflare bot checks
+    // A standard browser-like User-Agent bypasses Cloudflare bot checks for
+    // providers that gate on it; harmless everywhere else. Any provider-specific
+    // headers (e.g. OpenRouter's HTTP-Referer/X-Title) are added via custom_headers.
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 SAW-AI-Workspace/2.4.0',
-    'Origin': APP_URL,
-    'HTTP-Referer': APP_URL,
-    'X-Title': 'SAW AI Workspace',
   };
 
   if (apiKey) {
