@@ -13,10 +13,30 @@ export default defineConfig(() => {
     },
     server: {
       // HMR is disabled in AI Studio via DISABLE_HMR env var.
-      // Do not modifyâfile watching is disabled to prevent flickering during agent edits.
+      // Do not modify—file watching is disabled to prevent flickering during agent edits.
       hmr: process.env.DISABLE_HMR !== 'true',
       // Disable file watching when DISABLE_HMR is true to save CPU during agent edits.
       watch: process.env.DISABLE_HMR === 'true' ? null : {},
+    },
+    build: {
+      // Split the ~1MB bundle into cacheable vendor chunks so the main thread
+      // spends less time parsing/evaluating JS on startup (important on slower
+      // CPUs). Vendor code changes rarely, so it stays cached across releases.
+      rollupOptions: {
+        output: {
+          manualChunks: {
+            'react-vendor': ['react', 'react-dom'],
+            'markdown-vendor': ['katex'],
+            'tauri-vendor': ['@tauri-apps/api', '@tauri-apps/plugin-fs', '@tauri-apps/plugin-http'],
+            // motion and dexie/jszip share transitive imports; grouping them
+            // avoids a circular-chunk warning and keeps both out of the app chunk.
+            'data-vendor': ['dexie', 'dexie-react-hooks', 'jszip', 'motion', 'lucide-react'],
+          },
+        },
+      },
+      // Suppress the size warning for the app chunk; it is expected because the
+      // app itself is large. Code-splitting above still reduces per-chunk cost.
+      chunkSizeWarningLimit: 1100,
     },
   };
 });

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import {
   Copy,
   Check,
@@ -29,7 +29,7 @@ interface MarkdownRendererProps {
   targetArtifact?: Artifact | null;
 }
 
-export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
+export const MarkdownRenderer: React.FC<MarkdownRendererProps> = React.memo(({
   content,
   onOpenArtifact,
   onImplementCode,
@@ -40,18 +40,27 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
 }) => {
   if (!content) return null;
 
-  // Parse out code blocks, targeted search/replace patches, task checklists, and math blocks
-  const elements = parseMarkdownBlocks(
-    content,
-    onOpenArtifact,
-    onImplementCode,
-    onApplyPatch,
-    onRevertPatch,
-    targetFile,
-    targetArtifact
+  // Memoize the parsed AST so it is only recomputed when the content string
+  // or the target file/artifact identity changes — not on every parent
+  // re-render. Callbacks are intentionally excluded from the dep list: they
+  // are stable (useCallback) and including them would defeat the memo when a
+  // parent recreates them.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const elements = useMemo(
+    () =>
+      parseMarkdownBlocks(
+        content,
+        onOpenArtifact,
+        onImplementCode,
+        onApplyPatch,
+        onRevertPatch,
+        targetFile,
+        targetArtifact
+      ),
+    [content, targetFile, targetArtifact]
   );
   return <div className="space-y-3.5 leading-relaxed text-[#2C2825] text-sm">{elements}</div>;
-};
+});
 
 interface TaskItem {
   id: string;

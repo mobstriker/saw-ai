@@ -136,17 +136,19 @@ export default function App() {
     loadData();
   }, []);
 
-  // Sync state to local storage
+  // Sync state to local storage. Uses debounced writers so a burst of
+  // changes (e.g. every token during a streamed response) coalesces into a
+  // single write rather than rewriting the whole table hundreds of times.
   useEffect(() => {
     // Always save — even when the array is empty — so deleted chats are
     // actually persisted. The guard `chats.length > 0` caused deletions to
     // be skipped when the last chat was removed, so deleted chats reappeared
     // on restart.
-    StorageService.saveChats(chats);
+    StorageService.saveChatsDebounced(chats);
   }, [chats]);
 
   useEffect(() => {
-    StorageService.saveProjects(projects);
+    StorageService.saveProjectsDebounced(projects);
   }, [projects]);
 
   useEffect(() => {
@@ -203,6 +205,48 @@ export default function App() {
   const [automationMode, setAutomationMode] = useState<AutomationMode>(() => settings.automationMode || 'automatic');
   const [aiStatus, setAiStatus] = useState<'idle' | 'searching_web' | 'thinking' | 'generating'>('idle');
   const abortControllerRef = useRef<AbortController | null>(null);
+
+  // --- Live-stream overlay (decouples streaming from the global chats state) ---
+  // During a streamed response the assistant message accumulates token-by-token.
+  // Writing each token into `chats` rebuilt the entire chat/message tree on
+  // every token (the main cause of UI freezes on low-spec hardware). Instead,
+  // tokens accumulate in a mutable ref and a single rAF-throttled state copy
+  // drives re-render of ONLY the streaming message. The message is committed
+  // to `chats` once, on completion/stop/error.
+  const [liveStream, setLiveStream] = useState<{
+    chatId: string;
+    assistantMsgId: string;
+    content: string;
+    thinkingContent: string;
+    isThinking: boolean;
+    searchResults: SearchResult[];
+    modelUsed: string;
+  } | null>(null);
+  const liveStreamRef = useRef<typeof liveStream>(null);
+  const rafPendingRef = useRef(false);
+  const rafIdRef = useRef<number | null>(null);
+
+  // Coalesce live-stream updates to animation-frame cadence (≤60fps) instead
+  // of one React render per token (which can be hundreds/sec).
+  const scheduleLiveStreamFlush = () => {
+    if (rafPendingRef.current) return;
+    rafPendingRef.current = true;
+    rafIdRef.current = requestAnimationFrame(() => {
+      rafPendingRef.current = false;
+      rafIdRef.current = null;
+      setLiveStream(liveStreamRef.current ? { ...liveStreamRef.current } : null);
+    });
+  };
+
+  const clearLiveStream = () => {
+    if (rafIdRef.current !== null) {
+      cancelAnimationFrame(rafIdRef.current);
+      rafIdRef.current = null;
+    }
+    rafPendingRef.current = false;
+    liveStreamRef.current = null;
+    setLiveStream(null);
+  };
 
   // Active Project & Chat Helpers
   const activeProject = projects.find((p) => p.id === activeProjectId) || null;
@@ -348,20 +392,6 @@ export default function App() {
       handleAddFilesToProject(newFiles);
     }
   };
-
-  // Sync projects and chats to localStorage whenever they change
-  useEffect(() => {
-    StorageService.saveProjects(projects);
-  }, [projects]);
-
-  useEffect(() => {
-    StorageService.saveChats(chats);
-  }, [chats]);
-
-  useEffect(() => {
-    StorageService.saveSettings(settings);
-  }, [settings]);
-
 
   // Extract all artifacts from the active chat messages
   useEffect(() => {
@@ -851,27 +881,18 @@ export default function App() {
               setAiStatus('generating');
             }
 
-            setChats((prevChats) =>
-              prevChats.map((c) => {
-                if (c.id !== targetChat.id) return c;
-                return {
-                  ...c,
-                  messages: c.messages.map((m) =>
-                    m.id === assistantMsgId
-                      ? {
-                          ...m,
-                          content: fullCombined,
-                          thinkingContent: combinedThinking,
-                          isThinking: isCurrentlyThinking,
-                          isStopped: false,
-                          isError: false,
-                        }
-                      : m
-                  ),
-                  updatedAt: Date.now(),
-                };
-              })
-            );
+            // Update the live-stream overlay (rAF-throttled) instead of
+            // rebuilding the entire chats state on every token.
+            liveStreamRef.current = {
+              chatId: targetChat.id,
+              assistantMsgId,
+              content: fullCombined,
+              thinkingContent: combinedThinking,
+              isThinking: isCurrentlyThinking,
+              searchResults: [],
+              modelUsed: chosenModelDisplayName,
+            };
+            scheduleLiveStreamFlush();
           }
         }
       }
@@ -904,6 +925,10 @@ export default function App() {
           } catch {}
         }
       }
+
+      // Commit complete: clear the live-stream overlay so the message now
+      // renders from the committed chats state (single source of truth).
+      clearLiveStream();
 
       // Final save on completion
       const parsedStream = parseThinkingFromStream(rawAccumulatedStream);
@@ -982,6 +1007,9 @@ export default function App() {
         return updated;
       });
     } catch (err: any) {
+      // Stop feeding the in-flight message from the overlay; the committed
+      // chats state below takes over.
+      clearLiveStream();
       const isAbort = err.name === 'AbortError';
       const parsedStream = parseThinkingFromStream(rawAccumulatedStream);
       const combinedThinking = (
@@ -1033,6 +1061,8 @@ export default function App() {
         return updated;
       });
     } finally {
+      // Belt-and-suspenders: ensure no live-stream overlay lingers.
+      clearLiveStream();
       setIsGenerating(false);
       setCurrentGeneratingModelName(null);
       setAiStatus('idle');
@@ -1342,7 +1372,7 @@ When handling complex multi-step tasks:
         console.warn('Failed to parse custom headers JSON', e);
       }
 
-      // 4. Send to Node.js proxy endpoint `/api/chat` with SSE streaming
+      // 4. Send chat request via universalFetch with SSE streaming
       const response = await performChatRequest({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1436,32 +1466,20 @@ When handling complex multi-step tasks:
               setAiStatus('generating');
             }
 
-            // Live stream update to chat messages
-            setChats((prevChats) =>
-              prevChats.map((c) => {
-                if (c.id !== targetChat.id) return c;
-                const existingAssIdx = c.messages.findIndex((m) => m.id === assistantMsgId);
-
-                const newAssistantMsg: Message = {
-                  id: assistantMsgId,
-                  role: 'assistant',
-                  content: effectiveContent,
-                  thinkingContent: combinedThinking,
-                  isThinking: isCurrentlyThinking,
-                  reasoningMode: reasoningMode,
-                  timestamp: Date.now(),
-                  searchResults: webSearchResults,
-                  modelUsed: chosenModelDisplayName,
-                };
-
-                const updatedMsgs =
-                  existingAssIdx >= 0
-                    ? c.messages.map((m) => (m.id === assistantMsgId ? newAssistantMsg : m))
-                    : [...c.messages, newAssistantMsg];
-
-                return { ...c, messages: updatedMsgs, updatedAt: Date.now() };
-              })
-            );
+            // Update the live-stream overlay (rAF-throttled) instead of
+            // rebuilding the entire chats state on every token. The overlay
+            // feeds only the in-flight assistant message; the rest of the
+            // message list stays referentially stable and does not re-render.
+            liveStreamRef.current = {
+              chatId: targetChat.id,
+              assistantMsgId,
+              content: effectiveContent,
+              thinkingContent: combinedThinking,
+              isThinking: isCurrentlyThinking,
+              searchResults: webSearchResults,
+              modelUsed: chosenModelDisplayName,
+            };
+            scheduleLiveStreamFlush();
           }
         }
       }
@@ -1526,6 +1544,10 @@ When handling complex multi-step tasks:
           };
         })
       );
+
+      // Commit complete: clear the live-stream overlay so the message now
+      // renders from the committed chats state (single source of truth).
+      clearLiveStream();
 
       // 6. After completion, parse artifacts, patches, and execute workspace autopilot
       const finalParsed = parseThinkingFromStream(rawAccumulatedStream);
@@ -1642,6 +1664,9 @@ When handling complex multi-step tasks:
         }
       }
     } catch (err: any) {
+      // Stop feeding the in-flight message from the overlay regardless of
+      // how the stream ended; the committed chats state below takes over.
+      clearLiveStream();
       if (err.name === 'AbortError') {
         console.log('Stream aborted by user');
         setChats((prevChats) => {
@@ -1733,6 +1758,9 @@ When handling complex multi-step tasks:
         });
       }
     } finally {
+      // Belt-and-suspenders: ensure no live-stream overlay lingers after the
+      // generation ends, regardless of which path (success/abort/error) ran.
+      clearLiveStream();
       setIsGenerating(false);
       setCurrentGeneratingModelName(null);
       setAiStatus('idle');
@@ -1850,6 +1878,7 @@ When handling complex multi-step tasks:
             setActiveProjectId(projectId);
             setSidebarTab('projects');
           }}
+          liveStream={liveStream}
         />
       )}
 

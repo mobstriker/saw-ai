@@ -69,6 +69,52 @@ export const StorageService = {
     }
   },
 
+  // Debounced persistence: during a streaming response the in-flight chat
+  // changes on every token — none of those intermediate states need to hit
+  // disk. Only the settled state does. These debounce the writer so we
+  // coalesce a burst of changes into a single write.
+  _saveChatsTimer: null as ReturnType<typeof setTimeout> | null,
+  _saveProjectsTimer: null as ReturnType<typeof setTimeout> | null,
+  _lastChatsSignature: '' as string,
+  _lastProjectsSignature: '' as string,
+
+  saveChatsDebounced(chats: ChatSession[], delay = 600): void {
+    // Skip writing when nothing actually changed.
+    const sig = chats.map((c) => `${c.id}:${c.updatedAt ?? 0}`).join('|');
+    if (sig === this._lastChatsSignature) return;
+    this._lastChatsSignature = sig;
+    if (this._saveChatsTimer) clearTimeout(this._saveChatsTimer);
+    this._saveChatsTimer = setTimeout(() => {
+      this._saveChatsNow(chats);
+      this._saveChatsTimer = null;
+    }, delay);
+  },
+
+  saveProjectsDebounced(projects: Project[], delay = 600): void {
+    const sig = projects.map((p) => `${p.id}:${p.updatedAt ?? 0}`).join('|');
+    if (sig === this._lastProjectsSignature) return;
+    this._lastProjectsSignature = sig;
+    if (this._saveProjectsTimer) clearTimeout(this._saveProjectsTimer);
+    this._saveProjectsTimer = setTimeout(() => {
+      this._saveProjectsNow(projects);
+      this._saveProjectsTimer = null;
+    }, delay);
+  },
+
+  // Force-flush any pending debounced writes immediately (e.g. on completion
+  // of a stream so the final message is persisted without waiting for the
+  // trailing debounce).
+  flushPending(): void {
+    if (this._saveChatsTimer) {
+      clearTimeout(this._saveChatsTimer);
+      this._saveChatsTimer = null;
+    }
+    if (this._saveProjectsTimer) {
+      clearTimeout(this._saveProjectsTimer);
+      this._saveProjectsTimer = null;
+    }
+  },
+
   async getProjectsAsync(): Promise<Project[]> {
     try {
       const data = await db.projects.toArray();
@@ -82,12 +128,25 @@ export const StorageService = {
   },
 
   saveProjects(projects: Project[]): void {
+    this._saveProjectsNow(projects);
+  },
+
+  // Per-record diff instead of clear()+bulkPut(). Reads the current table,
+  // upserts only changed records, deletes removed ones. Turns a full-table
+  // rewrite into a minimal write for a typical single-project update.
+  async _saveProjectsNow(projects: Project[]): Promise<void> {
     try {
-      // Clear + bulkPut so deleted projects are actually removed from
-      // IndexedDB. bulkPut alone only upserts — it never deletes records
-      // that are no longer in the array, so deleted items would reappear
-      // on restart.
-      db.projects.clear().then(() => db.projects.bulkPut(projects)).catch(e => console.error(e));
+      const existing = await db.projects.toArray();
+      const existingIds = new Set(existing.map((p) => p.id));
+      const newIds = new Set(projects.map((p) => p.id));
+
+      const toDelete = existing.filter((p) => !newIds.has(p.id)).map((p) => p.id);
+      const toUpsert = projects.filter((p) => !existingIds.has(p.id));
+
+      const ops: Promise<any>[] = [];
+      if (toDelete.length > 0) ops.push(db.projects.bulkDelete(toDelete));
+      if (toUpsert.length > 0) ops.push(db.projects.bulkPut(toUpsert));
+      if (ops.length > 0) await Promise.all(ops);
     } catch (e) {
       console.error('Failed to save projects to DB', e);
     }
@@ -106,12 +165,23 @@ export const StorageService = {
   },
 
   saveChats(chats: ChatSession[]): void {
+    this._saveChatsNow(chats);
+  },
+
+  // Delete removed records + bulkPut (upsert by id) the rest. Avoids the
+  // clear()+bulkPut() full-table wipe that previously rewrote every chat on
+  // every change. bulkPut upserts by primary key, so existing records are
+  // updated in place and new ones inserted; only removed ids are deleted.
+  async _saveChatsNow(chats: ChatSession[]): Promise<void> {
     try {
-      // Clear + bulkPut so deleted chats are actually removed from
-      // IndexedDB. bulkPut alone only upserts — it never deletes records
-      // that are no longer in the array, so deleted chats would reappear
-      // on restart.
-      db.chats.clear().then(() => { if (chats.length > 0) return db.chats.bulkPut(chats); }).catch(e => console.error(e));
+      const existing = await db.chats.toArray();
+      const newIds = new Set(chats.map((c) => c.id));
+
+      const toDelete = existing.filter((c) => !newIds.has(c.id)).map((c) => c.id);
+      const ops: Promise<any>[] = [];
+      if (toDelete.length > 0) ops.push(db.chats.bulkDelete(toDelete));
+      if (chats.length > 0) ops.push(db.chats.bulkPut(chats));
+      if (ops.length > 0) await Promise.all(ops);
     } catch (e) {
       console.error('Failed to save chats to DB', e);
     }

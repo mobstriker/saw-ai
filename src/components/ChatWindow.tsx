@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   Send,
   Square,
@@ -122,6 +122,15 @@ interface ChatWindowProps {
   targetFile?: ProjectFile | null;
   targetArtifact?: Artifact | null;
   onGoToProject?: (projectId: string) => void;
+  liveStream?: {
+    chatId: string;
+    assistantMsgId: string;
+    content: string;
+    thinkingContent: string;
+    isThinking: boolean;
+    searchResults: SearchResult[];
+    modelUsed: string;
+  } | null;
 }
 
 const SAMPLE_PROMPT_SUGGESTIONS = [
@@ -163,6 +172,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   targetFile,
   targetArtifact,
   onGoToProject,
+  liveStream,
 }) => {
   const [inputText, setInputText] = useState('');
   const [webSearchActive, setWebSearchActive] = useState(settings.webSearchEnabled);
@@ -183,6 +193,13 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   const reasoningPopoverRef = useRef<HTMLDivElement | null>(null);
   const skillsPopoverRef = useRef<HTMLDivElement | null>(null);
   const automationPopoverRef = useRef<HTMLDivElement | null>(null);
+
+  // Stable callback for clarification answers so memoized MessageItems don't
+  // re-render just because this inline closure was recreated.
+  const handleClarificationAnswer = useCallback(
+    (text: string) => onSendMessage(text, webSearchActive),
+    [onSendMessage, webSearchActive]
+  );
 
   // Model reasoning capability detection
   const activeModelName = settings.defaultModel || 'gpt-4o';
@@ -817,10 +834,30 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
                 ? chat.messages.slice(0, idx).reverse().find((m) => m.role === 'user')?.content
                 : undefined;
 
+              // During streaming the in-flight assistant message is fed from
+              // the live-stream overlay (updated at animation-frame cadence)
+              // instead of from the global chats state, so the rest of the
+              // message list does not re-render on every token.
+              const isLiveStreaming =
+                liveStream != null &&
+                liveStream.chatId === chat.id &&
+                liveStream.assistantMsgId === message.id;
+
+              const effectiveMessage = isLiveStreaming
+                ? {
+                    ...message,
+                    content: liveStream!.content,
+                    thinkingContent: liveStream!.thinkingContent,
+                    isThinking: liveStream!.isThinking,
+                    searchResults: liveStream!.searchResults,
+                    modelUsed: liveStream!.modelUsed,
+                  }
+                : message;
+
               return (
                 <MessageItem
                   key={message.id}
-                  message={message}
+                  message={effectiveMessage}
                   userPrompt={previousUserPrompt}
                   isLastMessage={idx === chat.messages.length - 1}
                   isGenerating={isGenerating && idx === chat.messages.length - 1}
@@ -828,7 +865,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
                   onRetry={onRetryGeneration}
                   onOpenArtifact={onOpenArtifact}
                   onImplementCode={onImplementCode}
-                  onClarificationAnswer={(text) => onSendMessage(text, webSearchActive)}
+                  onClarificationAnswer={handleClarificationAnswer}
                   onAcceptArtifacts={onAcceptArtifacts}
                   onRejectArtifacts={onRejectArtifacts}
                   onOpenSettings={onOpenSettings}

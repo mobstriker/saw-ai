@@ -48,7 +48,11 @@ interface MessageItemProps {
   targetArtifact?: Artifact | null;
 }
 
-export const MessageItem: React.FC<MessageItemProps> = ({
+// Memoized so a finished message whose props are unchanged does not re-render
+// when another message (e.g. the streaming one) updates. The custom comparator
+// checks only the fields that actually affect output; callbacks are expected to
+// be referentially stable (useCallback) from the parent.
+export const MessageItem: React.FC<MessageItemProps> = React.memo(({
   message,
   userPrompt,
   isLastMessage,
@@ -506,6 +510,29 @@ export const MessageItem: React.FC<MessageItemProps> = ({
       </div>
     </div>
   );
-};
+}, (prev, next) => {
+  // Custom comparator: re-render only when something that affects output
+  // changed. Referentially-stable callbacks (useCallback) are assumed, so we
+  // don't compare them — comparing them would be cheap but redundant.
+  const pm = prev.message;
+  const nm = next.message;
+  if (pm.id !== nm.id) return false;
+  if (pm.content !== nm.content) return false;
+  if (pm.thinkingContent !== nm.thinkingContent) return false;
+  if (pm.isThinking !== nm.isThinking) return false;
+  if (pm.isStopped !== nm.isStopped) return false;
+  if (pm.isError !== nm.isError) return false;
+  if (pm.artifactsState !== nm.artifactsState) return false;
+  if (pm.clarificationRequests !== nm.clarificationRequests) return false;
+  if (pm.searchResults !== nm.searchResults) return false;
+  if (pm.modelUsed !== nm.modelUsed) return false;
+  if (pm.generationDurationMs !== nm.generationDurationMs) return false;
+  if (prev.userPrompt !== next.userPrompt) return false;
+  if (prev.isLastMessage !== next.isLastMessage) return false;
+  if (prev.isGenerating !== next.isGenerating) return false;
+  if (prev.targetFile !== next.targetFile) return false;
+  if (prev.targetArtifact !== next.targetArtifact) return false;
+  return true;
+});
 
 
