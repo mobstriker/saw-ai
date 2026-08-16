@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   X,
   Copy,
@@ -20,12 +20,14 @@ import {
 } from 'lucide-react';
 import { Artifact } from '../types';
 import { FlutterPhoneSimulator } from './FlutterPhoneSimulator';
+import { buildHtmlPreview, buildSvgPreview, buildReactPreview, isPreviewErrorReport } from '../utils/previewBuilder';
 
 interface ArtifactViewerProps {
   artifact: Artifact | null;
   allArtifacts?: Artifact[];
   onClose: () => void;
   onSelectArtifact?: (artifact: Artifact) => void;
+  onReportBug?: (bugMessage: string) => void;
 }
 
 type ViewportMode = 'responsive' | 'desktop' | 'tablet' | 'mobile';
@@ -35,12 +37,14 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
   allArtifacts = [],
   onClose,
   onSelectArtifact,
+  onReportBug,
 }) => {
   const [activeTab, setActiveTab] = useState<'preview' | 'code'>('preview');
   const [viewportMode, setViewportMode] = useState<ViewportMode>('responsive');
   const [copied, setCopied] = useState(false);
   const [key, setKey] = useState(0); // for reload iframe
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const [webError, setWebError] = useState<string | null>(null);
 
   const isFlutterOrDart =
     artifact?.language.toLowerCase() === 'dart' ||
@@ -51,17 +55,34 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
     artifact?.code.includes('MaterialApp') ||
     artifact?.title.endsWith('.dart');
 
+  const isSwift =
+    artifact?.language.toLowerCase() === 'swift' ||
+    artifact?.code.includes('import SwiftUI') ||
+    artifact?.code.includes('UIKit') ||
+    artifact?.title.endsWith('.swift');
+
+  const isKotlin =
+    artifact?.language.toLowerCase() === 'kotlin' ||
+    artifact?.language.toLowerCase() === 'kt' ||
+    artifact?.code.includes('androidx.compose') ||
+    artifact?.code.includes('Jetpack') ||
+    artifact?.title.endsWith('.kt');
+
+  const isNativeMobile = isSwift || isKotlin;
+
   const isPreviewableWeb =
-    ['html', 'htm', 'svg', 'tsx', 'jsx'].includes(artifact?.language.toLowerCase() || '') ||
+    ['html', 'htm', 'svg', 'tsx', 'jsx', 'javascript', 'js', 'typescript', 'ts'].includes(artifact?.language.toLowerCase() || '') ||
     artifact?.title.endsWith('.html') ||
     artifact?.title.endsWith('.htm') ||
     artifact?.title.endsWith('.svg') ||
     artifact?.title.endsWith('.tsx') ||
-    artifact?.title.endsWith('.jsx');
+    artifact?.title.endsWith('.jsx') ||
+    artifact?.title.endsWith('.ts') ||
+    artifact?.title.endsWith('.js');
 
-  const hasPreview = isFlutterOrDart || isPreviewableWeb;
+  const hasPreview = isFlutterOrDart || isNativeMobile || isPreviewableWeb;
 
-  // Auto-switch to preview for HTML/SVG/TSX/Flutter, or code for others (Python, JSON, SQL, etc.)
+  // Auto-switch to preview for HTML/SVG/TSX/Flutter/native-mobile, or code for others (Python, JSON, SQL, etc.)
   useEffect(() => {
     if (artifact) {
       if (hasPreview) {
@@ -69,8 +90,34 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
       } else {
         setActiveTab('code');
       }
+      setWebError(null);
     }
   }, [artifact?.id, hasPreview]);
+
+  // Listen for runtime errors posted from the sandboxed web preview iframe so
+  // the debug button can light up and report the bug to the AI (Feature 3).
+  useEffect(() => {
+    const handler = (e: MessageEvent) => {
+      if (e.source !== iframeRef.current?.contentWindow) return;
+      if (isPreviewErrorReport(e.data)) {
+        setWebError(e.data.message || 'Unknown preview error');
+      }
+    };
+    window.addEventListener('message', handler);
+    return () => window.removeEventListener('message', handler);
+  }, []);
+
+  // Reset captured errors when the artifact or reload key changes.
+  useEffect(() => {
+    setWebError(null);
+  }, [artifact?.id, key]);
+
+  const handleReportWebBug = useCallback(() => {
+    if (!webError || !onReportBug) return;
+    onReportBug(
+      `🐛 Preview bug in ${artifact?.title || 'web artifact'}:\n${webError}\n\nPlease fix the code so it previews correctly without errors.`
+    );
+  }, [webError, onReportBug, artifact?.title]);
 
   if (!artifact) {
     return (
@@ -108,97 +155,20 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
     window.open(url, '_blank');
   };
 
-  // Build sandboxed HTML for the iframe preview
+  // Build sandboxed HTML for the iframe preview via the shared preview builder.
   const generatePreviewHtml = (): string => {
     const lang = artifact.language.toLowerCase();
     const code = artifact.code;
+    const filename = artifact.title || `artifact.${lang}`;
 
-    if (lang === 'html' || artifact.title.endsWith('.html')) {
-      if (!code.includes('<html') && !code.includes('<!DOCTYPE')) {
-        return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Playfair+Display:wght@600;700&display=swap" rel="stylesheet">
-  <style>
-    body { font-family: 'Plus Jakarta Sans', system-ui, sans-serif; background-color: #FAF8F5; color: #2C2825; padding: 20px; margin: 0; min-height: 100vh; }
-  </style>
-</head>
-<body>
-  ${code}
-</body>
-</html>`;
-      }
-      return code;
+    if (lang === 'html' || artifact.title.endsWith('.html') || artifact.title.endsWith('.htm')) {
+      return buildHtmlPreview(code, filename);
     }
-
     if (lang === 'svg' || artifact.title.endsWith('.svg')) {
-      return `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <style>
-    body { margin: 0; display: flex; align-items: center; justify-content: center; min-height: 100vh; background: #FAF8F5; }
-    svg { max-width: 90%; max-height: 90vh; }
-  </style>
-</head>
-<body>
-  ${code}
-</body>
-</html>`;
+      return buildSvgPreview(code, filename);
     }
-
-    // For TSX / JSX / React or JS
-    return `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
-  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-  <script src="https://unpkg.com/lucide@latest"></script>
-  <style>
-    body { font-family: 'Plus Jakarta Sans', system-ui, sans-serif; background-color: #FAF8F5; color: #2C2825; margin: 0; padding: 20px; min-height: 100vh; }
-  </style>
-</head>
-<body>
-  <div id="root"></div>
-  <script type="text/babel">
-    try {
-      const MockLucide = new Proxy({}, {
-        get: (target, prop) => {
-          return (props) => (
-            <span style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: props.size || 16, height: props.size || 16, ...props.style }}>
-              ✦
-            </span>
-          );
-        }
-      });
-      window.lucideReact = MockLucide;
-
-      ${code.replace(/import\s+.*?;/g, '')}
-
-      const componentToRender = typeof App !== 'undefined' ? App : 
-                                typeof FintechNavbar !== 'undefined' ? FintechNavbar :
-                                typeof Component !== 'undefined' ? Component :
-                                null;
-
-      if (componentToRender) {
-        ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(componentToRender));
-      } else {
-        document.getElementById('root').innerHTML = '<div style="padding: 20px; background: white; border-radius: 12px; border: 1px solid #E6DFD3;"><h3 style="margin: 0 0 8px 0; color: #C58B51; font-weight: bold;">Interactive Sandbox Ready</h3><p style="margin: 0; font-size: 13px; color: #7C756E;">React code evaluated. Switch to Code tab for full inspection.</p></div>';
-      }
-    } catch (e) {
-      document.getElementById('root').innerHTML = '<div style="padding: 16px; background: #FFF5F5; border-radius: 12px; border: 1px solid #FED7D7; color: #C53030; font-size: 12px; font-family: monospace;"><strong>Preview Sandbox Notice:</strong> ' + e.message + '</div>';
-    }
-  </script>
-</body>
-</html>`;
+    // TSX / JSX / TS / JS / React
+    return buildReactPreview(code, filename);
   };
 
   const currentIndex = allArtifacts.findIndex((a) => a.id === artifact.id);
@@ -210,14 +180,14 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
       <div className="flex items-center justify-between px-4 py-3 border-b border-[#E6DFD3] bg-[#FAF8F5]">
         <div className="flex items-center gap-2.5">
           <div className="w-8 h-8 rounded-xl bg-white border border-[#E6DFD3] flex items-center justify-center text-[#C58B51] shadow-2xs">
-            {isFlutterOrDart ? <Flame size={16} className="text-[#C58B51]" /> : <Sparkles size={16} />}
+            {isFlutterOrDart || isNativeMobile ? <Flame size={16} className="text-[#C58B51]" /> : <Sparkles size={16} />}
           </div>
           <div>
-            <h3 className="text-xs font-bold text-[#2C2825] truncate max-w-[150px]">
+            <h3 className="text-xs font-bold text-[#2C2825] truncate max-w-[180px]" title={artifact.title}>
               {artifact.title}
             </h3>
             <span className="text-[10px] font-mono text-[#7C756E] uppercase">
-              {isFlutterOrDart ? 'FLUTTER / DART' : artifact.language} • {lines.length} lines
+              {isFlutterOrDart ? 'FLUTTER / DART' : isSwift ? 'SWIFTUI / IOS' : isKotlin ? 'KOTLIN / ANDROID' : artifact.language} • {lines.length} lines
             </span>
           </div>
         </div>
@@ -268,8 +238,8 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
                   : 'text-[#7C756E] hover:text-[#2C2825]'
               }`}
             >
-              {isFlutterOrDart ? <Smartphone size={13} /> : <Eye size={13} />}
-              <span>{isFlutterOrDart ? 'Phone Simulator' : 'Live Web Preview'}</span>
+              {isFlutterOrDart || isNativeMobile ? <Smartphone size={13} /> : <Eye size={13} />}
+              <span>{isFlutterOrDart || isNativeMobile ? 'Phone Simulator' : 'Live Web Preview'}</span>
             </button>
             <button
               onClick={() => setActiveTab('code')}
@@ -293,7 +263,7 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
         )}
 
         {/* Viewport Toggles for HTML / Web Preview */}
-        {activeTab === 'preview' && !isFlutterOrDart && (
+        {activeTab === 'preview' && !isFlutterOrDart && !isNativeMobile && (
           <div className="hidden sm:flex items-center gap-1 bg-[#FAF8F5] p-0.5 rounded-lg border border-[#E6DFD3]">
             <button
               type="button"
@@ -348,7 +318,7 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
 
         {/* Action Controls */}
         <div className="flex items-center gap-1.5">
-          {activeTab === 'preview' && !isFlutterOrDart && (
+          {activeTab === 'preview' && !isFlutterOrDart && !isNativeMobile && (
             <>
               <button
                 onClick={() => setKey((k) => k + 1)}
@@ -363,6 +333,21 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
                 title="Open Live Webpage in New Tab"
               >
                 <ExternalLink size={13} />
+              </button>
+              {/* Web Debug button: red when a preview bug is detected, gray when clean.
+                  Clicking when red sends the bug to the AI to fix. Gray is a no-op. */}
+              <button
+                type="button"
+                onClick={handleReportWebBug}
+                disabled={!webError}
+                className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-bold border transition-all ${
+                  webError
+                    ? 'bg-red-50 text-red-700 border-red-200 hover:bg-red-100 cursor-pointer'
+                    : 'bg-gray-50 text-gray-400 border-gray-200 cursor-default'
+                }`}
+                title={webError ? `Bug detected — click to send to AI: ${webError}` : 'No preview bugs detected'}
+              >
+                DEBUG
               </button>
             </>
           )}
@@ -396,9 +381,14 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
       {/* Main Content Area */}
       <div className="flex-1 overflow-hidden relative bg-[#FAF8F5]">
         {activeTab === 'preview' ? (
-          isFlutterOrDart ? (
-            /* Flutter & Android Phone Simulator Preview */
-            <FlutterPhoneSimulator code={artifact.code} title={artifact.title} />
+          isFlutterOrDart || isNativeMobile ? (
+            /* Flutter / Dart / Swift (iOS) / Kotlin (Android) Phone Simulator Preview */
+            <FlutterPhoneSimulator
+              code={artifact.code}
+              title={artifact.title}
+              platform={isSwift ? 'swift' : isKotlin ? 'kotlin' : 'flutter'}
+              onReportBug={onReportBug}
+            />
           ) : (
             /* Live Webpage Preview (with optional Browser Chrome & Viewport Sizing) */
             <div className="w-full h-full flex flex-col items-center overflow-auto p-2 sm:p-4">

@@ -22,6 +22,10 @@ interface RightPanelProps {
   onCreateFolder: (parentFolder?: string) => void;
   onUploadFilesClick?: () => void;
   onMoveFile: (file: ProjectFile) => void;
+  onReportBug?: (bugMessage: string) => void;
+  isUniversalChat?: boolean;
+  onSaveAsProject?: () => void;
+  isSavingAsProject?: boolean;
 }
 
 export const RightPanel: React.FC<RightPanelProps> = ({
@@ -42,6 +46,10 @@ export const RightPanel: React.FC<RightPanelProps> = ({
   onCreateFolder,
   onUploadFilesClick,
   onMoveFile,
+  onReportBug,
+  isUniversalChat,
+  onSaveAsProject,
+  isSavingAsProject,
 }) => {
   const handleMouseDownResize = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -165,6 +173,19 @@ export const RightPanel: React.FC<RightPanelProps> = ({
               </span>
             )}
           </button>
+
+          {/* "Save as a Project" — only in a universal (no-project) chat with 2+ artifacts (Feature 4) */}
+          {isUniversalChat && allArtifacts.length >= 2 && onSaveAsProject && (
+            <button
+              onClick={onSaveAsProject}
+              disabled={isSavingAsProject}
+              className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-bold bg-[#C58B51] text-white hover:bg-[#b0783f] disabled:opacity-60 disabled:cursor-wait transition-all cursor-pointer"
+              title="Promote these chat artifacts into a new Project (AI will name it and write build instructions)"
+            >
+              <FolderTree size={13} />
+              <span>{isSavingAsProject ? 'Saving…' : 'Save as Project'}</span>
+            </button>
+          )}
         </div>
 
         {/* Collapse Button */}
@@ -195,6 +216,7 @@ export const RightPanel: React.FC<RightPanelProps> = ({
             allArtifacts={allArtifacts}
             onClose={onCloseArtifact}
             onSelectArtifact={onSelectArtifact}
+            onReportBug={onReportBug}
           />
         )}
       </div>

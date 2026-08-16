@@ -1,5 +1,5 @@
 import { performChatRequest, performSearchRequest } from "./utils/chatProxy";
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   BYOKSettings,
   ChatSession,
@@ -449,6 +449,122 @@ export default function App() {
     setRightPanelTab('files');
     setIsRightPanelOpen(true);
   };
+
+  /**
+   * Feature 4 — "Save as a Project" from universal chat artifacts.
+   *
+   * When a standalone (no-project) chat has accumulated 2+ code artifacts, the
+   * user can promote them into a real Project. We ask the AI (one non-streaming
+   * call) to name the project and write a description + build instructions from
+   * the artifact filenames/languages, then create the Project with the artifact
+   * contents as files and rebind the active chat to it. Falls back to sensible
+   * defaults if the AI call fails or returns malformed JSON.
+   */
+  const [isSavingAsProject, setIsSavingAsProject] = useState(false);
+
+  const handleSaveArtifactsAsProject = useCallback(async () => {
+    if (allArtifacts.length < 2 || isSavingAsProject) return;
+    setIsSavingAsProject(true);
+    try {
+      const activeProfile =
+        (settings.aiProfiles || []).find((p) => p.id === settings.activeProfileId) ||
+        (settings.aiProfiles && settings.aiProfiles[0]);
+      const finalBaseUrl = activeProfile?.baseUrl || settings.baseUrl;
+      const finalApiKey = activeProfile?.apiKey || settings.apiKey;
+      const chosenModel = activeProfile?.model || settings.defaultModel || 'gpt-4o';
+      const finalCustomHeaders =
+        activeProfile?.customHeaders !== undefined
+          ? activeProfile.customHeaders
+          : settings.customHeaders;
+      let parsedHeaders: Record<string, string> | undefined;
+      if (finalCustomHeaders) {
+        try {
+          parsedHeaders = typeof finalCustomHeaders === 'string'
+            ? JSON.parse(finalCustomHeaders)
+            : finalCustomHeaders;
+        } catch {
+          parsedHeaders = undefined;
+        }
+      }
+
+      const fileListSummary = allArtifacts
+        .map((a, i) => `${i + 1}. ${a.title} (${a.language})`)
+        .join('\n');
+
+      const metaSystem =
+        'You generate project metadata as strict JSON. Respond with ONLY a JSON object, no markdown fences, no prose. Schema: {"name": string (short project name, 2-5 words, Title Case), "description": string (one sentence), "instructions": string (2-4 bullet build/run instructions for an AI coding assistant, newline-separated)}';
+      const metaUser = `Based on these code files generated in a chat, suggest a project name, description, and build instructions.\n\nFiles:\n${fileListSummary}`;
+
+      let meta = { name: '', description: '', instructions: '' };
+      try {
+        const res = await performChatRequest({
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            baseUrl: finalBaseUrl,
+            apiKey: finalApiKey,
+            model: chosenModel,
+            messages: [{ role: 'user', content: metaUser }],
+            stream: false,
+            system_prompt: metaSystem,
+            custom_headers: parsedHeaders,
+            max_tokens: 400,
+          }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const content: string = data?.choices?.[0]?.message?.content || '';
+          const jsonMatch = content.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const parsed = JSON.parse(jsonMatch[0]);
+            meta = {
+              name: String(parsed.name || '').trim(),
+              description: String(parsed.description || '').trim(),
+              instructions: String(parsed.instructions || '').trim(),
+            };
+          }
+        }
+      } catch {
+        // Non-fatal — fall back to derived defaults below.
+      }
+
+      const now = Date.now();
+      const files: ProjectFile[] = allArtifacts.map((a, i) => ({
+        id: `file-${now}-${i}`,
+        name: a.title || `artifact-${i + 1}`,
+        path: a.title || `artifact-${i + 1}`,
+        content: a.code,
+        size: a.code.length,
+        lastModified: now,
+        includedInContext: true,
+        language: a.language,
+      }));
+
+      const newProj: Project = {
+        id: `proj-${now}`,
+        name: meta.name || `Untitled Project ${new Date(now).toLocaleDateString()}`,
+        description: meta.description || 'Project created from chat artifacts.',
+        instructions: meta.instructions || 'Continue developing the files in this project.',
+        createdAt: now,
+        updatedAt: now,
+        files,
+      };
+
+      setProjects((prev) => [newProj, ...prev]);
+      // Rebind the active chat to the new project so it keeps its history.
+      if (activeChatId) {
+        setChats((prev) =>
+          prev.map((c) => (c.id === activeChatId ? { ...c, projectId: newProj.id, updatedAt: now } : c))
+        );
+      }
+      setActiveProjectId(newProj.id);
+      setSidebarTab('projects');
+      setRightPanelTab('files');
+      setIsRightPanelOpen(true);
+    } finally {
+      setIsSavingAsProject(false);
+    }
+  }, [allArtifacts, isSavingAsProject, settings, activeChatId]);
 
   // Handler: Create New Chat inside a Specific Project
   const handleNewChatInProject = (projectId: string) => {
@@ -1897,6 +2013,10 @@ When handling complex multi-step tasks:
         allArtifacts={allArtifacts}
         onSelectArtifact={(art) => setCurrentArtifact(art)}
         onCloseArtifact={() => setCurrentArtifact(null)}
+        onReportBug={(bugMessage) => handleSendMessage(bugMessage, false)}
+        isUniversalChat={!activeChat?.projectId}
+        onSaveAsProject={handleSaveArtifactsAsProject}
+        isSavingAsProject={isSavingAsProject}
         onCreateFile={(initialFolder) => {
           if (!activeProject) handleNewProject();
           setCreateFileFolder(initialFolder || '');
@@ -1939,6 +2059,7 @@ When handling complex multi-step tasks:
         <FileViewerModal
           file={selectedFileForModal}
           onClose={() => setSelectedFileForModal(null)}
+          onReportBug={(bugMessage) => handleSendMessage(bugMessage, false)}
           onToggleContext={(fileId) => {
             if (!activeProject) return;
             const updated = activeProject.files.map((f) =>

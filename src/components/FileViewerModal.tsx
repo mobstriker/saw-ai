@@ -22,12 +22,14 @@ import {
 import { ProjectFile } from '../types';
 import { ContextInjector } from '../utils/contextInjector';
 import { FlutterPhoneSimulator } from './FlutterPhoneSimulator';
+import { buildHtmlPreview, buildSvgPreview, buildReactPreview } from '../utils/previewBuilder';
 
 interface FileViewerModalProps {
   file: ProjectFile | null;
   onClose: () => void;
   onToggleContext?: (fileId: string) => void;
   onSaveContent?: (fileId: string, newContent: string) => void;
+  onReportBug?: (bugMessage: string) => void;
 }
 
 type ViewportMode = 'responsive' | 'desktop' | 'tablet' | 'mobile';
@@ -37,6 +39,7 @@ export const FileViewerModal: React.FC<FileViewerModalProps> = ({
   onClose,
   onToggleContext,
   onSaveContent,
+  onReportBug,
 }) => {
   const [activeTab, setActiveTab] = useState<'code' | 'preview'>('code');
   const [viewportMode, setViewportMode] = useState<ViewportMode>('responsive');
@@ -53,15 +56,32 @@ export const FileViewerModal: React.FC<FileViewerModalProps> = ({
     file?.content.includes('StatelessWidget') ||
     file?.content.includes('MaterialApp');
 
+  const isSwift =
+    file?.language.toLowerCase() === 'swift' ||
+    file?.name.endsWith('.swift') ||
+    file?.content.includes('import SwiftUI') ||
+    file?.content.includes('UIKit');
+
+  const isKotlin =
+    file?.language.toLowerCase() === 'kotlin' ||
+    file?.language.toLowerCase() === 'kt' ||
+    file?.name.endsWith('.kt') ||
+    file?.content.includes('androidx.compose');
+
+  const isNativeMobile = isSwift || isKotlin;
+  const nativePlatform: 'flutter' | 'swift' | 'kotlin' = isSwift ? 'swift' : isKotlin ? 'kotlin' : 'flutter';
+
   const isPreviewableWeb =
-    file?.language.toLowerCase() === 'html' ||
+    ['html', 'htm', 'svg', 'tsx', 'jsx', 'javascript', 'js', 'typescript', 'ts'].includes(file?.language.toLowerCase() || '') ||
     file?.name.endsWith('.html') ||
     file?.name.endsWith('.htm') ||
     file?.name.endsWith('.svg') ||
     file?.name.endsWith('.tsx') ||
-    file?.name.endsWith('.jsx');
+    file?.name.endsWith('.jsx') ||
+    file?.name.endsWith('.ts') ||
+    file?.name.endsWith('.js');
 
-  const hasPreview = isFlutterOrDart || isPreviewableWeb;
+  const hasPreview = isFlutterOrDart || isNativeMobile || isPreviewableWeb;
 
   // Keep content in sync if file changes
   useEffect(() => {
@@ -69,12 +89,21 @@ export const FileViewerModal: React.FC<FileViewerModalProps> = ({
       setEditedContent(file.content);
       setIsEditing(false);
       setIsSaved(false);
-      // Auto-preview HTML/SVG/Flutter files if preferred
-      if (file.name.endsWith('.html') || file.name.endsWith('.svg')) {
-        setActiveTab('preview');
-      } else {
-        setActiveTab('code');
-      }
+      // Auto-preview web/mobile files that support live preview
+      const langLower = file.language.toLowerCase();
+      const shouldPreview =
+        file.name.endsWith('.html') ||
+        file.name.endsWith('.htm') ||
+        file.name.endsWith('.svg') ||
+        file.name.endsWith('.tsx') ||
+        file.name.endsWith('.jsx') ||
+        file.name.endsWith('.ts') ||
+        file.name.endsWith('.js') ||
+        langLower === 'html' ||
+        langLower === 'svg' ||
+        langLower === 'tsx' ||
+        langLower === 'jsx';
+      setActiveTab(shouldPreview ? 'preview' : 'code');
     }
   }, [file?.id, file?.content]);
 
@@ -118,88 +147,16 @@ export const FileViewerModal: React.FC<FileViewerModalProps> = ({
   const generatePreviewHtml = (): string => {
     const code = currentContent;
     const lang = file.language.toLowerCase();
+    const filename = file.name || `artifact.${lang}`;
 
-    if (lang === 'html' || file.name.endsWith('.html')) {
-      if (!code.includes('<html') && !code.includes('<!DOCTYPE')) {
-        return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  <style>
-    body { font-family: 'Plus Jakarta Sans', system-ui, sans-serif; background-color: #FAF8F5; color: #2C2825; padding: 20px; margin: 0; min-height: 100vh; }
-  </style>
-</head>
-<body>
-  ${code}
-</body>
-</html>`;
-      }
-      return code;
+    if (lang === 'html' || file.name.endsWith('.html') || file.name.endsWith('.htm')) {
+      return buildHtmlPreview(code, filename);
     }
-
     if (lang === 'svg' || file.name.endsWith('.svg')) {
-      return `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <style>
-    body { margin: 0; display: flex; align-items: center; justify-content: center; min-height: 100vh; background: #FAF8F5; }
-    svg { max-width: 90%; max-height: 90vh; }
-  </style>
-</head>
-<body>
-  ${code}
-</body>
-</html>`;
+      return buildSvgPreview(code, filename);
     }
-
-    // Default Web sandbox (TSX/JSX/JS)
-    return `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
-  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-  <script src="https://unpkg.com/lucide@latest"></script>
-  <style>
-    body { font-family: 'Plus Jakarta Sans', system-ui, sans-serif; background-color: #FAF8F5; color: #2C2825; margin: 0; padding: 20px; min-height: 100vh; }
-  </style>
-</head>
-<body>
-  <div id="root"></div>
-  <script type="text/babel">
-    try {
-      const MockLucide = new Proxy({}, {
-        get: (target, prop) => (props) => (
-          <span style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: props.size || 16, height: props.size || 16, ...props.style }}>✦</span>
-        )
-      });
-      window.lucideReact = MockLucide;
-
-      ${code.replace(/import\s+.*?;/g, '')}
-
-      const componentToRender = typeof App !== 'undefined' ? App : 
-                                typeof Component !== 'undefined' ? Component :
-                                null;
-
-      if (componentToRender) {
-        ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(componentToRender));
-      } else {
-        document.getElementById('root').innerHTML = '<div style="padding: 20px; background: white; border-radius: 12px; border: 1px solid #E6DFD3;"><h3 style="margin: 0 0 8px 0; color: #C58B51; font-weight: bold;">Interactive Preview</h3><p style="margin: 0; font-size: 13px; color: #7C756E;">Component rendered successfully.</p></div>';
-      }
-    } catch (e) {
-      document.getElementById('root').innerHTML = '<div style="padding: 16px; background: #FFF5F5; border-radius: 12px; border: 1px solid #FED7D7; color: #C53030; font-size: 12px; font-family: monospace;">' + e.message + '</div>';
-    }
-  </script>
-</body>
-</html>`;
+    // TSX / JSX / TS / JS / React
+    return buildReactPreview(code, filename);
   };
 
   return (
@@ -209,13 +166,13 @@ export const FileViewerModal: React.FC<FileViewerModalProps> = ({
         <div className="flex items-center justify-between px-5 py-3 border-b border-[#E6DFD3] bg-[#FAF8F5]">
           <div className="flex items-center gap-3">
             <div className="w-8 h-8 rounded-lg bg-white border border-[#E6DFD3] flex items-center justify-center text-[#C58B51] shadow-2xs">
-              {isFlutterOrDart ? <Flame size={18} /> : <FileCode size={18} />}
+              {isFlutterOrDart || isNativeMobile ? <Flame size={18} /> : <FileCode size={18} />}
             </div>
             <div>
               <div className="flex items-center gap-2">
                 <span className="text-sm font-bold text-[#2C2825]">{file.name}</span>
                 <span className="text-[10px] px-2 py-0.5 rounded-full bg-white border border-[#E6DFD3] font-mono text-[#7C756E]">
-                  {isFlutterOrDart ? 'FLUTTER / DART' : file.language.toUpperCase()}
+                  {isFlutterOrDart ? 'FLUTTER / DART' : isSwift ? 'SWIFTUI / IOS' : isKotlin ? 'KOTLIN / ANDROID' : file.language.toUpperCase()}
                 </span>
                 {isEditing && (
                   <span className="text-[10px] px-2 py-0.5 rounded-full bg-[#FAF8F5] border border-[#C58B51] text-[#C58B51] font-bold">
@@ -257,8 +214,8 @@ export const FileViewerModal: React.FC<FileViewerModalProps> = ({
                       : 'text-[#7C756E] hover:text-[#2C2825]'
                   }`}
                 >
-                  {isFlutterOrDart ? <Smartphone size={13} /> : <Eye size={13} />}
-                  <span>{isFlutterOrDart ? 'Phone Preview' : 'Live Web Preview'}</span>
+                  {isFlutterOrDart || isNativeMobile ? <Smartphone size={13} /> : <Eye size={13} />}
+                  <span>{isFlutterOrDart || isNativeMobile ? 'Phone Preview' : 'Live Web Preview'}</span>
                 </button>
               </div>
             )}
@@ -384,7 +341,7 @@ export const FileViewerModal: React.FC<FileViewerModalProps> = ({
             </span>
           </div>
 
-          {activeTab === 'preview' && !isFlutterOrDart && (
+          {activeTab === 'preview' && !isFlutterOrDart && !isNativeMobile && (
             <div className="flex items-center gap-1 bg-[#FAF8F5] p-0.5 rounded-lg border border-[#E6DFD3]">
               <button
                 type="button"
@@ -446,8 +403,13 @@ export const FileViewerModal: React.FC<FileViewerModalProps> = ({
         {/* Main Body: Code or Live Preview */}
         <div className="flex-1 overflow-hidden bg-[#FAF8F5] relative">
           {activeTab === 'preview' ? (
-            isFlutterOrDart ? (
-              <FlutterPhoneSimulator code={currentContent} title={file.name} />
+            isFlutterOrDart || isNativeMobile ? (
+              <FlutterPhoneSimulator
+                code={currentContent}
+                title={file.name}
+                platform={nativePlatform}
+                onReportBug={onReportBug}
+              />
             ) : (
               <div className="w-full h-full flex flex-col items-center overflow-auto p-4">
                 <div
