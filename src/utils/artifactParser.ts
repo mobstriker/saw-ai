@@ -50,6 +50,32 @@ export const LANG_EXTENSION: Record<string, string> = {
 const PREVIEWABLE_LANGS = ['html', 'htm', 'svg', 'tsx', 'jsx', 'javascript', 'js', 'dart', 'flutter', 'swift', 'kotlin', 'kt'];
 
 /**
+ * Shell / CLI command languages. These are never treated as file artifacts:
+ * they render inline in the chat with a copy button (like other apps) and
+ * never appear in the Artifacts panel. Bash/PowerShell/cmd output is meant to
+ * be read and copied, not opened on a separate artifact page.
+ */
+export const SHELL_LANGS = [
+  'bash',
+  'sh',
+  'shell',
+  'zsh',
+  'fish',
+  'powershell',
+  'pwsh',
+  'cmd',
+  'doskey',
+  'bat',
+  'batch',
+  'console',
+  'terminal',
+];
+
+export function isShellLanguage(lang: string): boolean {
+  return SHELL_LANGS.includes(lang.toLowerCase().trim());
+}
+
+/**
  * Derives a Dart/Flutter filename from the source code when no explicit
  * filename comment was found. Prefers the main public widget class, falls
  * back to the MaterialApp/CupertinoApp title, then "main.dart".
@@ -212,6 +238,13 @@ export const ArtifactParser = {
 
       // Skip clarification request blocks
       if (lang === 'json' && (code.includes('"clarification_request"') || code.includes('"clarification_requests"'))) {
+        continue;
+      }
+
+      // Shell / CLI command blocks are never artifacts — they render inline in
+      // the chat with a copy button (handled by the markdown renderer) and must
+      // not appear in the Artifacts panel.
+      if (isShellLanguage(lang)) {
         continue;
       }
 

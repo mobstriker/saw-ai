@@ -43,6 +43,7 @@ import {
 import { PatchChunk } from '../utils/patchApplier';
 import { MessageItem } from './MessageItem';
 import { SandboxPanel } from './SandboxPanel';
+import type { SandboxStoreValue } from '../utils/sandboxStore';
 import { ContextInjector } from '../utils/contextInjector';
 import { FileSecurity } from '../utils/fileSecurity';
 import {
@@ -121,6 +122,7 @@ interface ChatWindowProps {
   onApplyPatch?: (patch: PatchChunk) => void;
   onRevertPatch?: (patch: PatchChunk) => void;
   onRestore?: (messageId: string) => void;
+  sandboxStore?: SandboxStoreValue;
   targetFile?: ProjectFile | null;
   targetArtifact?: Artifact | null;
   onGoToProject?: (projectId: string) => void;
@@ -172,6 +174,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   onApplyPatch,
   onRevertPatch,
   onRestore,
+  sandboxStore,
   targetFile,
   targetArtifact,
   onGoToProject,
@@ -755,12 +758,26 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
             className={`flex h-8 items-center gap-1.5 px-2.5 rounded-lg transition-all cursor-pointer border ${
               showSandbox
                 ? 'bg-[#FAF8F5] text-[#C58B51] border-[#C58B51]'
+                : sandboxStore?.accessGranted
+                ? 'bg-sky-50 text-sky-700 border-sky-400'
                 : 'text-[#7C756E] hover:text-[#2C2825] border-transparent hover:bg-[#FAF8F5] hover:border-[#E6DFD3]'
             }`}
-            title="Open the restricted in-app sandbox to run build commands (npm/flutter/cargo) and download artifacts"
+            title={
+              sandboxStore?.accessGranted
+                ? 'AI has sandbox access — commands run from chat (even with this panel closed). Click to open & revoke.'
+                : 'Open the restricted in-app sandbox to run build commands (npm/flutter/cargo) and download artifacts'
+            }
           >
             <Terminal size={15} />
             <span className="hidden sm:inline text-xs font-bold">Sandbox</span>
+            {sandboxStore?.accessGranted && (
+              <span className="flex items-center gap-0.5 ml-0.5 px-1 py-0.5 rounded bg-sky-500 text-white text-[9px] font-bold uppercase tracking-wide">
+                AI
+              </span>
+            )}
+            {sandboxStore?.running && (
+              <span className="ml-0.5 h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" title="A sandbox command is running" />
+            )}
           </button>
 
           {/* Clear Chat */}
@@ -905,7 +922,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
           Slides up from the bottom of the chat when toggled. */}
       {showSandbox && (
         <div className="h-[42vh] min-h-[280px] shrink-0 border-t-2 border-[#C58B51]/40 shadow-2xl animate-in slide-in-from-bottom-4 duration-300">
-          <SandboxPanel project={project || null} onClose={() => setShowSandbox(false)} />
+          <SandboxPanel project={project || null} onClose={() => setShowSandbox(false)} store={sandboxStore!} />
         </div>
       )}
 

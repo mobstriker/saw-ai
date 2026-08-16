@@ -22,49 +22,49 @@ owner's personal preferences — do not genericize the UX.
   Flutter, Swift/SwiftUI, Kotlin/Compose.
 - Flutter engine helpers: `src/utils/flutterEngine.ts`.
 
-## Flutter / Dart Preview (real engine)
+## Flutter / Dart Preview (structural)
 - Uses Google's public **dart-services** API at `https://stable.api.dartpad.dev`
   (CORS `*`, free, no subscription, no API key). Flutter 3.47 / Dart 3.13.
 - `analyzeDart(source)` → POST `/api/v3/analyze` → `{issues:[...]}`. Used to
-  drive the DEBUG button (red when issues.length > 0).
-- `compileDDC(source)` → POST `/api/v3/compileDDC` → `{result: JS module}`.
-- Live render: embeds `https://preview.dartpad.dev?embed=true&theme=dark&run=true`
-  in an iframe, injects source via
-  `postMessage({type:'sourceCode', sourceCode})`. The DartPad SPA initializes its
-  listener late, so `injectSourceIntoDartPad` **retries** the post every 2s over
-  a 20s window (not just once on `ready`).
-- **CRITICAL — embed host must be `preview.dartpad.dev`, NOT `dartpad.dev`.**
-  `preview.dartpad.dev` serves the DartPad SPA *with the embed message handler
-  registered* (dart-lang/dart-pad `pkgs/dartpad_ui/lib/app/embed/web.dart`): on
-  load it posts `{type:'ready'}` and listens for `{type:'sourceCode',...}`, then
-  compiles & renders the real Flutter canvas when `run=true`. `dartpad.dev` is
-  the marketing host whose bundle does NOT register the embed handler, so
-  injected source is silently ignored and the cropped iframe stays permanently
-  BLACK — this was the root cause of the "Flutter preview never pops up" bug.
-  The official embed demo (`dart-pad/web/embed_demo.html`) + handler source
-  confirm `preview.dartpad.dev` is the correct host.
-- `FlutterPhoneSimulator` also listens for `{type:'ready'|'requestSource'|
-  'stdout'|'stderr'}` messages from the iframe to confirm the engine is alive
-  (`renderConfirmed`). If no such message arrives within 18s of `running`, it
-  falls back to the structural Dart approximation so the user always sees
-  *something* render instead of a permanent black screen.
-- `ensureFlutterApp(source)` wraps a bare Widget in a `MaterialApp` so DartPad
-  can compile & render it.
-- **Sandbox limitation**: in this runtime's headless browser, DartPad's editor
-  loads but the live canvas can't be visually verified; the analyze API **does**
-  work (verified: returns real compile errors). In a real user browser DartPad
-  loads normally and the Flutter app renders in the cropped frame portion.
+  drive the DEBUG button (red when issues.length > 0). This is the ONLY
+  dart-services call still used.
+- The DartPad **embed SPA no longer responds to `sourceCode` postMessage**
+  (the embed handler was removed/changed upstream), so live-canvas rendering
+  via an iframe is dead. We therefore do NOT embed DartPad at all anymore;
+  `compileDDC`/`injectSourceIntoDartPad` were removed from `flutterEngine.ts`.
+- **Preview approach**: `FlutterPhoneSimulator` renders a **structural
+  widget-tree preview** directly in the phone screen (no iframe, no
+  postMessage, no fallback timer, no "engine unavailable" banner). The
+  `dartWidgetParser` produces a faithful approximation of the UI. If there's
+  nothing renderable, a friendly placeholder shows; if `analyzeDart` reports
+  issues, an error overlay shows the bug text (not the source code) and the
+  DEBUG button lets the user send it to the AI.
+- **Why no more "Flutter engine unavailable / showing structural
+  approximation"**: that message came from the old fallback timer waiting for
+  a `{type:'ready'}` message from the DartPad iframe that never arrives. With
+  the embed removed, the structural preview is the intended, always-on path —
+  no false alarm. (The user reported this as a bug; root cause = dead embed.)
+- `ensureFlutterApp(source)` wraps a bare Widget in a `MaterialApp` so the
+  analyzer gets compilable input.
+- **Sandbox limitation**: in this runtime's headless browser the structural
+  preview renders fine; the analyze API works (returns real compile errors).
 
 ## Restore Button (per-response undo)
 - `Message.projectSnapshotBefore?: {projectId: string|null; files: ProjectFile[]}`
-  captures the bound project's files *before* this assistant turn's changes were
-  applied by `WorkspaceAutopilot` (captured in `handleSendMessage`, attached to
-  the assistant message only when `didModifyProject` is true).
+  captures the bound project's files **after** this assistant turn's changes
+  were applied by `WorkspaceAutopilot` (a **post-change** snapshot, captured in
+  `handleSendMessage`, attached to the assistant message only when
+  `didModifyProject` is true). Restoring to message N replaces the bound
+  project's file array with that snapshot, so everything that existed at turn N
+  is kept and any files/artifacts created in *later* turns are dropped — the
+  user's intent: "only what was there at the step I clicked restore is kept."
 - `MessageItem` renders a **Restore** button (next to Retry/Copy, after Continue
   — Continue is intentionally never touched) only when `projectSnapshotBefore`
   exists and not currently generating. `handleRestore(messageId)` rolls the
-  project files back to the snapshot; when `projectId===null` (a universal chat
-  that auto-created its first project) it removes the created project.
+  project files back to the snapshot (full array replacement → later files
+  removed automatically), re-derives the Artifacts panel from messages up to and
+  including the restored one (drops later artifacts), and refreshes the open
+  file viewer. When `projectId===null` it removes the created project.
 - `restoredAt` timestamp flips the button to a green "Restored" badge and allows
   re-restoring. The memo comparator in `MessageItem` checks
   `Boolean(projectSnapshotBefore)` and `restoredAt` so the button
@@ -72,6 +72,30 @@ owner's personal preferences — do not genericize the UX.
   after the message is finalized).
 - Works in both universal chats and project-bound chats (single `ChatWindow`
   render path in `App.tsx`).
+
+## Shell/CLI blocks are never artifacts
+- `ArtifactParser.extractArtifacts` and the markdown renderer both call
+  `isShellLanguage(lang)` (`SHELL_LANGS`: bash/sh/shell/zsh/fish/powershell/
+  pwsh/cmd/doskey/bat/batch/console/terminal). Shell blocks are **skipped** as
+  artifacts and rendered inline in chat with only a **Copy** button (no
+  View-Artifact / Implement / "open in separate page") — exactly how other
+  apps show bash. This fixes the user's "bash commands should not be in the
+  artifacts folder" complaint. Real code files (html/tsx/dart/…) still become
+  artifacts.
+- The same `isShellLanguage` gate is what the sandbox agent uses to find
+  runnable commands in AI responses (see In-App Sandbox Runner).
+
+## Universal chat right panel
+- In a universal (no-project) chat the **Files tab is hidden** in `RightPanel`
+  (the Files button only renders when `currentProject` exists), and App
+  auto-switches the active tab from `files` → `artifacts` so the user never
+  sees an empty file tree. The panel still accepts file uploads (dropped into
+  the chat), but the Files-as-project view only appears once a project exists.
+- **Save as Project** (Feature 4): in a universal chat with **2+ artifacts**, a
+  "Save as Project" button appears in the `RightPanel` header. It asks the AI
+  for project metadata (name/description/instructions) then promotes the chat's
+  artifacts into a new `Project` (files from the artifacts), rebinds the active
+  chat to it, and switches the panel to the Files tab. `handleSaveArtifactsAsProject`.
 
 ## In-App Sandbox Runner (restricted command execution)
 - **Backend**: `src-tauri/src/sandbox.rs` exposes Tauri commands
@@ -86,6 +110,31 @@ owner's personal preferences — do not genericize the UX.
 - **Streaming**: stdout/stderr emitted live as `sandbox://stream` events
   (`{runId, stream, line}`); `runSandboxCommand` (TS) subscribes before
   invoking so no lines are missed.
+- **Shared store**: `useSandboxStore()` (in `src/utils/sandboxStore.tsx`) is a
+  plain hook created **at the App level** and passed down via props
+  (`sandboxStore` prop to ChatWindow → SandboxPanel). It is NOT React context
+  — App stays mounted, so AI-driven runs keep streaming into the log even when
+  the SandboxPanel is closed. State: `logs`, `running`, `exitCode`,
+  `artifacts`, `accessGranted`, `pendingApproval`. Methods: `runCommand`,
+  `seedProject`, `refreshArtifacts`, `requestApproval`/`resolveApproval`,
+  `toggleAccess`, `pushLog`. Log lines carry `source: 'manual'|'agent'` so the
+  panel can style AI-driven runs distinctly.
+- **"Give Access" (AI-driven loop)**: a `Give Access`/`Revoke Access` toggle in
+  the SandboxPanel header flips `accessGranted`. When granted and the chat's
+  automation mode ≠ `review`, App's `handleSendMessage` adds a
+  `# Sandbox Command Execution` block to the system prompt telling the AI to
+  emit runnable commands in ```bash/```sh (or `<sandbox_run>`) blocks and lists
+  the allowlist. After the assistant turn finishes, App scans the response with
+  `extractRunnableCommands` (`src/utils/sandboxAgent.ts`), runs them via
+  `runSandboxAgentStep` (per-command approval in `automatic`, auto-run in
+  `automatic_plus`), seeds the project's files first, then feeds the combined
+  stdout/stderr/exit-code back to the AI as a follow-up user turn
+  (`[Sandbox execution results — round N]`) by recursively calling
+  `handleSendMessage(..., isSandboxFollowup=true)`. The follow-up itself is
+  skipped from re-triggering (`!isSandboxFollowup`) and capped at
+  `SANDBOX_MAX_FOLLOWUPS` (6) rounds per manual prompt
+  (`sandboxFollowupRef`, reset on each real user send). The chat-header Sandbox
+  button shows an `AI` badge + pulsing dot when access is on / a command runs.
 - **Frontend**: `src/utils/sandboxRunner.ts` wraps the commands;
   `src/components/SandboxPanel.tsx` is the UI (command input, quick commands,
   live log, artifact list with Download via `convertFileSrc`). Toggled from a

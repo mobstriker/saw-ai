@@ -18,7 +18,7 @@ import { renderLatexMath } from './mathParser';
 import { Artifact, ProjectFile } from '../types';
 import { PatchApplier, PatchChunk } from './patchApplier';
 import { TargetedEditCard } from '../components/TargetedEditCard';
-import { deriveArtifactTitle } from './artifactParser';
+import { deriveArtifactTitle, isShellLanguage } from './artifactParser';
 
 interface MarkdownRendererProps {
   content: string;
@@ -336,8 +336,13 @@ function parseMarkdownBlocks(
 
       const hasPreview = isFlutter || isPreviewableWeb;
 
+      // Shell / CLI command blocks are never artifacts: they render as an inline
+      // copyable snippet (the "Generic Plain Code Snippet" path below), with no
+      // View-Artifact or Implement buttons — exactly how other apps show bash.
+      const isShell = isShellLanguage(lang);
+
       // An artifact is any block with an explicit filename, or an interactive file/component with > 4 lines, or any code with > 8 lines
-      const isArtifact = hasExplicitFilename || (hasPreview && codeLines.length > 4) || codeLines.length > 8;
+      const isArtifact = !isShell && (hasExplicitFilename || (hasPreview && codeLines.length > 4) || codeLines.length > 8);
 
       const artifactObj: Artifact = {
         id: `art-view-${blockKey}`,
@@ -769,17 +774,19 @@ const CodeBlockWithArtifactChip: React.FC<CodeBlockProps> = ({
     );
   }
 
-  // Generic Plain Code Snippet (short snippets, commands, curl, etc.)
+  // Generic Plain Code Snippet (short snippets, commands, curl, shell, etc.)
+  // Shell/CLI blocks reach this path with no Implement button — just copy.
+  const isShellSnippet = isShellLanguage(language);
   return (
     <div className="my-3 rounded-xl border border-[#E6DFD3] bg-white overflow-hidden shadow-2xs">
       <div className="flex items-center justify-between px-3 py-1.5 bg-[#FAF8F5] border-b border-[#E6DFD3] text-[11px]">
         <div className="flex items-center gap-2 text-[#7C756E] font-mono">
           <Code2 size={13} className="text-[#C58B51]" />
           <span className="font-bold text-[#2C2825]">{language.toUpperCase()}</span>
-          {suggestedPath && <span className="text-[10px] text-[#A09890]">({suggestedPath})</span>}
+          {!isShellSnippet && suggestedPath && <span className="text-[10px] text-[#A09890]">({suggestedPath})</span>}
         </div>
         <div className="flex items-center gap-1.5">
-          {onImplementCode && (
+          {onImplementCode && !isShellSnippet && (
             <button
               type="button"
               onClick={() => onImplementCode(code, language, suggestedPath)}
@@ -794,6 +801,7 @@ const CodeBlockWithArtifactChip: React.FC<CodeBlockProps> = ({
             type="button"
             onClick={handleCopy}
             className="flex items-center gap-1 text-[11px] font-semibold text-[#7C756E] hover:text-[#2C2825] px-2 py-0.5 rounded bg-white border border-[#E6DFD3] hover:border-[#C58B51] transition-colors cursor-pointer"
+            title="Copy to clipboard"
           >
             {copied ? (
               <>

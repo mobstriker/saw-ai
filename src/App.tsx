@@ -74,6 +74,9 @@ function parseClarificationRequest(content: string): { requests: Array<{ questio
 import { ArtifactParser } from './utils/artifactParser';
 import { PatchApplier, PatchChunk } from './utils/patchApplier';
 import { WorkspaceAutopilot } from './utils/workspaceAutopilot';
+import { useSandboxStore } from './utils/sandboxStore';
+import { extractRunnableCommands, runSandboxAgentStep } from './utils/sandboxAgent';
+import { ALLOWED_SANDBOX_COMMANDS } from './utils/sandboxRunner';
 import { IntentDetector } from './utils/intentDetector';
 import { ModelRouter } from './utils/modelRouter';
 import { ChatTitler } from './utils/chatTitler';
@@ -199,6 +202,14 @@ export default function App() {
   const [rightPanelTab, setRightPanelTab] = useState<RightPanelTab>('files');
   const [currentArtifact, setCurrentArtifact] = useState<Artifact | null>(null);
   const [allArtifacts, setAllArtifacts] = useState<Artifact[]>([]);
+
+  // 3b. Shared sandbox store (App-level so AI-driven runs survive closing the
+  // SandboxPanel). Passed to the panel and used by the sandbox agent loop.
+  const sandboxStore = useSandboxStore();
+  // Bounds AI→sandbox→AI follow-up rounds per manual user prompt to avoid
+  // runaway loops. Reset whenever the user sends a fresh message.
+  const sandboxFollowupRef = useRef(0);
+  const SANDBOX_MAX_FOLLOWUPS = 6;
 
   // 4. Modals
   const [selectedFileForModal, setSelectedFileForModal] = useState<ProjectFile | null>(null);
@@ -437,6 +448,15 @@ export default function App() {
       setCurrentArtifact(extracted[extracted.length - 1]);
     }
   }, [activeChatId, activeChat?.messages.length]);
+
+  // In a universal (no-project) chat the Files tab has no project to show, so
+  // it is hidden in the RightPanel header. Make sure the active tab lands on
+  // Artifacts in that case so the panel never renders an empty/no-op state.
+  useEffect(() => {
+    if (!activeChat?.projectId && rightPanelTab === 'files') {
+      setRightPanelTab('artifacts');
+    }
+  }, [activeChat?.projectId, rightPanelTab]);
 
   // Handler: Open Create New Project Modal
   const handleNewProject = () => {
@@ -774,15 +794,16 @@ export default function App() {
     handleApplyPatch(reversePatch);
   };
 
-  // Handler: Restore the project files to the snapshot captured before a given
-  // assistant message's changes were applied (Feature: per-response undo).
+  // Handler: Restore the project files to the snapshot captured for a given
+  // assistant message (per-response undo).
   //
-  // The snapshot lives on the assistant message (`projectSnapshotBefore`),
-  // captured in handleSendMessage right before WorkspaceAutopilot ran. Restore
-  // rolls the bound project's files back to that snapshot, undoing every
-  // create/update/delete/patch from that turn (and any later turns that touched
-  // the same project). When the snapshot's projectId is null, no project
-  // existed before that turn — so Restore removes the auto-created project.
+  // The snapshot lives on the assistant message (`projectSnapshotBefore`) and
+  // records the project's files *after* that turn's changes were applied
+  // (post-change). Restoring message N replaces the bound project's files with
+  // that snapshot, so everything that existed at turn N is kept and any files
+  // created in *later* turns are removed — exactly the user's intent: "only
+  // what was there at the step I clicked restore is kept." Because the project
+  // is retained (even the auto-created one), the workspace stays usable.
   const handleRestore = useCallback((messageId: string) => {
     if (!activeChat) return;
     const targetMsg = activeChat.messages.find((m) => m.id === messageId);
@@ -790,37 +811,50 @@ export default function App() {
     const snapshot = targetMsg.projectSnapshotBefore;
     if (!snapshot) return;
 
+    const snapshotFiles = snapshot.files.map((f) => ({ ...f }));
+
     if (snapshot.projectId === null) {
-      // No project existed before this turn auto-created one. Remove it so the
-      // workspace returns to the pre-turn (projectless) state.
-      setProjects((prev) => {
-        // Remove projects that were created during/after this turn. We can't
-        // know the exact created id, so remove any project bound to this chat
-        // plus the default "Workspace Project" auto-creation.
-        const chatProjId = activeChat.projectId;
-        return prev.filter(
-          (p) => p.id !== chatProjId && p.name !== 'Workspace Project'
-        );
-      });
+      // Defensive: a post-change snapshot should always carry a project id
+      // (the turn created one). If somehow null, keep the workspace projectless.
+      setProjects((prev) => prev.filter((p) => p.id !== activeChat.projectId && p.name !== 'Workspace Project'));
     } else {
-      // Roll the project's files back to the captured snapshot.
+      // Roll the project's files back to the post-turn snapshot. This is a
+      // full file-array replacement, so files created in later turns are
+      // dropped automatically.
       setProjects((prev) =>
         prev.map((p) =>
           p.id === snapshot.projectId
-            ? { ...p, files: snapshot.files.map((f) => ({ ...f })), updatedAt: Date.now() }
+            ? { ...p, files: snapshotFiles, updatedAt: Date.now() }
             : p
         )
       );
-      // If the file viewer is showing a file from this project, refresh it to
-      // the restored content (or close it if the file no longer exists).
+      // If the file viewer is showing a file, refresh it to the restored
+      // content (or close it if the file no longer exists in the snapshot).
       setSelectedFileForModal((prev) => {
         if (!prev) return prev;
-        const stillExists = snapshot.files.some((f) => f.id === prev.id);
+        const stillExists = snapshotFiles.some((f) => f.id === prev.id);
         if (!stillExists) return null;
-        const restored = snapshot.files.find((f) => f.id === prev.id);
+        const restored = snapshotFiles.find((f) => f.id === prev.id);
         return restored ? { ...restored } : null;
       });
     }
+
+    // Re-derive the Artifacts panel from messages up to and including the
+    // restored one, so artifacts produced in later turns are dropped too.
+    const restoreIndex = activeChat.messages.findIndex((m) => m.id === messageId);
+    const keptArtifacts: Artifact[] = [];
+    for (let i = 0; i <= restoreIndex; i++) {
+      const m = activeChat.messages[i];
+      if (m.role === 'assistant') {
+        keptArtifacts.push(...ArtifactParser.extractArtifacts(m.content));
+      }
+    }
+    setAllArtifacts(keptArtifacts);
+    setCurrentArtifact((prev) => {
+      if (!prev) return keptArtifacts[keptArtifacts.length - 1] ?? null;
+      const stillThere = keptArtifacts.some((a) => a.id === prev.id);
+      return stillThere ? prev : (keptArtifacts[keptArtifacts.length - 1] ?? null);
+    });
 
     // Mark the message as restored so the UI shows a "Restored" badge.
     setChats((prevChats) =>
@@ -1337,9 +1371,16 @@ export default function App() {
     userPrompt: string,
     useWebSearch: boolean,
     priorMessagesOverride?: Message[],
-    forcedChatId?: string
+    forcedChatId?: string,
+    isSandboxFollowup = false
   ) => {
     if (!userPrompt.trim() || isGenerating) return;
+
+    // A fresh manual user message starts a new agent turn — reset the
+    // sandbox follow-up round counter. Follow-up re-prompts keep it counting.
+    if (!isSandboxFollowup) {
+      sandboxFollowupRef.current = 0;
+    }
 
     let targetChat = forcedChatId ? chats.find(c => c.id === forcedChatId) || activeChat : activeChat;
     let currentChats = [...chats];
@@ -1484,6 +1525,12 @@ export default function App() {
     let rawAccumulatedThinking = '';
     let webSearchResults: SearchResult[] = [];
 
+    // Hoisted for the post-completion sandbox agent follow-up (which runs after
+    // the try/catch/finally). Filled in inside the try once known.
+    let completedAssistantText = '';
+    let completedChatId = chatTargetId;
+    let completedAutoMode: AutomationMode = 'automatic';
+
     try {
       // 2. Perform Web Search ONLY if IntentDetector verified it is genuinely required
       if (willSearchWeb) {
@@ -1515,6 +1562,12 @@ export default function App() {
       } else {
         setAiStatus('generating');
       }
+
+      // Resolve this chat's effective automation mode early — it's needed both
+      // for the system prompt (sandbox access instructions) and for the
+      // post-completion agent loop. Re-derived after completion but stable.
+      const effectiveAutoMode = (targetChat.automationMode || automationMode || settings.automationMode || 'automatic') as AutomationMode;
+      completedAutoMode = effectiveAutoMode;
 
       // 3. Prepare Pure Context Injection from Project Files, Skills, and Active MCP Servers
       let fullSystemPrompt = settings.systemPrompt || '';
@@ -1576,6 +1629,21 @@ When handling complex multi-step tasks:
 2. Execute each step quickly, cleanly, and decisively without slow delay or unnecessary padding.
 3. As steps are completed, mark them with - [x].
 4. For simple or single-step questions, answer directly without creating an unnecessary checklist.`;
+      }
+
+      // Sandbox access: when the user has granted the AI sandbox command
+      // execution and the automation mode permits it, tell the AI how to run
+      // commands. Each allowlisted command it emits in a bash/sh (or
+      // <sandbox_run>) block is executed in the restricted sandbox and the
+      // output is fed back automatically so it can read results and iterate.
+      if (sandboxStore.available && sandboxStore.accessGranted && effectiveAutoMode !== 'review') {
+        const allowList = ALLOWED_SANDBOX_COMMANDS.join(', ');
+        const approvalNote =
+          effectiveAutoMode === 'automatic'
+            ? 'Each command you emit will be shown to the user for approval before it runs.'
+            : 'Each command you emit runs automatically (the user chose Auto Planner).';
+        fullSystemPrompt += `\n\n# Sandbox Command Execution (granted by user)
+You have been granted access to run commands in the user's restricted in-app sandbox. When the task calls for building, installing, or running code, emit the command(s) in a fenced bash/sh code block (or <sandbox_run>...</sandbox_run>). ${approvalNote} Only the leading command per line is honored and it must be one of the allowlisted tools: ${allowList}. Each command runs in the project's sandbox workdir (its files are seeded first). The stdout/stderr and exit code are returned to you automatically — read them and continue. Do NOT emit commands you don't intend to run (e.g. as illustrative examples); if you only want to show a command without running it, use a plain (non-shell) code block or say so explicitly.`;
       }
 
       let parsedHeaders = {};
@@ -1774,21 +1842,26 @@ When handling complex multi-step tasks:
       const fullAssistantOutput = finalParsed.content || assistantMessageContent;
       const newArtifacts = ArtifactParser.extractArtifacts(fullAssistantOutput);
 
+      // Capture for the post-completion sandbox agent follow-up.
+      completedAssistantText = fullAssistantOutput;
+
       let targetProject = targetChat.projectId
         ? projects.find((p) => p.id === targetChat.projectId) || null
         : null;
-      const effectiveAutoMode = (targetChat.automationMode || automationMode || settings.automationMode || 'automatic') as AutomationMode;
+      // effectiveAutoMode was resolved at the top of the try (also used for the
+      // system prompt); reuse it here.
+      completedAutoMode = effectiveAutoMode;
 
-      // Capture the project's file state BEFORE autopilot applies this turn's
-      // changes, so the Restore button can revert to it. We deep-copy the files
-      // (not the project object) so later mutations don't corrupt the snapshot.
-      // `preChangeProjectId` lets Restore know which project to roll back; when
-      // null, no project existed yet and Restore will remove the created one.
-      const preChangeProjectId = targetProject?.id ?? null;
-      const preChangeFiles: ProjectFile[] = targetProject
-        ? targetProject.files.map((f) => ({ ...f }))
-        : [];
+      // Capture the project's file state so the Restore button can roll back.
+      // The snapshot records the files AFTER this turn's changes are applied
+      // (post-change), so restoring to message N keeps everything that existed
+      // at turn N and discards files created in *later* turns — the user's
+      // intent: "only what was there at the step I clicked restore is kept."
       let didModifyProject = false;
+      // postChangeFiles is filled in below after autopilot runs / the project
+      // is created, then attached to the assistant message as the snapshot.
+      let postChangeFiles: ProjectFile[] = [];
+      let postChangeProjectId: string | null = targetProject?.id ?? null;
 
       if (targetProject) {
         const autoResult = WorkspaceAutopilot.execute(targetProject, fullAssistantOutput, effectiveAutoMode);
@@ -1798,6 +1871,11 @@ When handling complex multi-step tasks:
             prev.map((p) => (p.id === targetProject!.id ? autoResult.updatedProject : p))
           );
         }
+        // Snapshot = the project's files *after* this turn's changes (whether
+        // applied by autopilot or left unchanged). Deep-copy so later turns
+        // can't mutate the captured state.
+        postChangeFiles = (didModifyProject ? autoResult.updatedProject.files : targetProject.files).map((f) => ({ ...f }));
+        postChangeProjectId = targetProject.id;
 
         if (effectiveAutoMode === 'automatic_plus' || effectiveAutoMode === 'automatic') {
           setChats((prevChats) =>
@@ -1811,11 +1889,11 @@ When handling complex multi-step tasks:
                         ...m,
                         artifactsState: 'auto_applied',
                         artifacts: newArtifacts,
-                        // Attach the pre-change snapshot only when this turn
+                        // Attach the post-change snapshot only when this turn
                         // actually changed the project, so the Restore button
                         // is meaningful (and hidden when nothing changed).
                         projectSnapshotBefore: didModifyProject
-                          ? { projectId: preChangeProjectId, files: preChangeFiles }
+                          ? { projectId: postChangeProjectId, files: postChangeFiles }
                           : m.projectSnapshotBefore,
                       }
                     : m
@@ -1869,9 +1947,11 @@ When handling complex multi-step tasks:
           setProjects([newProj]);
           setActiveProjectId(newProj.id);
           targetProject = newProj;
+          postChangeFiles = initialFiles.map((f) => ({ ...f }));
+          postChangeProjectId = newProj.id;
 
-          // Attach a snapshot recording that no project existed before this
-          // turn created one, so Restore can remove the auto-created project.
+          // Attach a post-change snapshot of the newly created project so
+          // Restore keeps this turn's files and only drops later additions.
           setChats((prevChats) =>
             prevChats.map((c) => {
               if (c.id !== targetChat.id) return c;
@@ -1881,7 +1961,7 @@ When handling complex multi-step tasks:
                   m.id === assistantMsgId
                     ? {
                         ...m,
-                        projectSnapshotBefore: { projectId: preChangeProjectId, files: preChangeFiles },
+                        projectSnapshotBefore: { projectId: postChangeProjectId, files: postChangeFiles },
                       }
                     : m
                 ),
@@ -2028,6 +2108,53 @@ When handling complex multi-step tasks:
       setAiStatus('idle');
       abortControllerRef.current = null;
     }
+
+    // 7. Sandbox agent follow-up (AI → sandbox → AI). Only when the user has
+    // granted sandbox access and the chat's automation mode is not "review".
+    // The AI's completed response is scanned for runnable shell/CLI commands;
+    // they run (auto-approve in Auto Planner, per-command approval in
+    // Automatic) and the output is fed back as a tool message so the AI can
+    // read it and continue. Runs stream into the shared sandbox log and keep
+    // going even if the SandboxPanel is closed.
+    if (
+      completedAssistantText &&
+      sandboxStore.available &&
+      sandboxStore.accessGranted &&
+      completedAutoMode !== 'review' &&
+      sandboxFollowupRef.current < SANDBOX_MAX_FOLLOWUPS &&
+      !isSandboxFollowup // only kick the loop from a real assistant turn
+    ) {
+      const commands = extractRunnableCommands(completedAssistantText);
+      if (commands.length > 0) {
+        sandboxFollowupRef.current += 1;
+        const round = sandboxFollowupRef.current;
+        sandboxStore.pushLog('status', `[agent] Sandbox follow-up round ${round}: ${commands.length} command(s) proposed by AI.`, 'agent');
+        const followChat = chats.find((c) => c.id === completedChatId);
+        const proj = followChat?.projectId ? projects.find((p) => p.id === followChat.projectId) || null : null;
+        try {
+          const result = await runSandboxAgentStep(commands, {
+            mode: completedAutoMode,
+            store: sandboxStore,
+            project: proj,
+          });
+          if (result.ranAny && result.outputText) {
+            // Feed the tool output back to the AI as a follow-up turn. This
+            // reuses the entire streaming path (no duplication) and surfaces a
+            // transparent "[Sandbox results]" user bubble showing what the AI
+            // received.
+            await handleSendMessage(
+              `[Sandbox execution results — round ${round}]\n\n${result.outputText}\n\nContinue the task using these results. If more commands are needed, emit them in bash/sh blocks. If the task is complete, summarize the outcome.`,
+              false,
+              undefined,
+              completedChatId,
+              true
+            );
+          }
+        } catch (e) {
+          sandboxStore.pushLog('error', `[agent] Sandbox follow-up failed: ${e instanceof Error ? e.message : String(e)}`, 'agent');
+        }
+      }
+    }
   };
 
   return (
@@ -2135,6 +2262,7 @@ When handling complex multi-step tasks:
           onApplyPatch={handleApplyPatch}
           onRevertPatch={handleRevertPatch}
           onRestore={handleRestore}
+          sandboxStore={sandboxStore}
           targetFile={selectedFileForModal || (currentChatProject?.files[0] || null)}
           targetArtifact={currentArtifact}
           onGoToProject={(projectId) => {
@@ -2153,7 +2281,7 @@ When handling complex multi-step tasks:
         onResize={setRightPanelWidth}
         activeTab={rightPanelTab}
         onSelectTab={setRightPanelTab}
-        currentProject={currentChatProject || activeProject}
+        currentProject={currentChatProject}
         onSelectFile={(file) => setSelectedFileForModal(file)}
         onUpdateProject={handleUpdateProject}
         currentArtifact={currentArtifact}

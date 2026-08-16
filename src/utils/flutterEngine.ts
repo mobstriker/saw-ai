@@ -1,46 +1,42 @@
 /**
- * Real Flutter/Dart preview engine via Google's public, free dart-services
- * backend (the same backend that powers dartpad.dev).
+ * Real Dart analysis + a robust Flutter preview.
  *
- * Why this exists:
- *   A tolerant Dart-source parser can only approximate a Flutter UI. To show
- *   the *actual* app the AI wrote, we compile & run the real Flutter Web engine.
- *   dartpad.dev exposes a public, CORS-enabled API (`stable.api.dartpad.dev`)
- *   and an embeddable iframe (`dartpad.dev/?embed=true`) that compiles injected
- *   Dart to JS and renders the real Flutter canvas — for free, with no
- *   subscription and no bundled runtime weight added to this app.
+ * What this module provides:
+ *   1. analyzeDart() — POST /api/v3/analyze → real compile errors from the
+ *      dart-services backend (stable.api.dartpad.dev). CORS is wide open. This
+ *      is the authoritative "does this code run?" check that drives the DEBUG
+ *      button red/gray and reports bugs to the AI.
+ *   2. ensureFlutterApp() — wraps a bare Widget in a MaterialApp+main() so the
+ *      analyzer can evaluate it (and so any future real-engine path can run it).
  *
- * Two pieces:
- *   1. analyzeDart()   — POST /api/v3/analyze → real compile errors, used to
- *                        drive the DEBUG button red/gray and to report bugs.
- *   2. DARTPAD_EMBED   — the canonical DartPad SPA embed iframe. It posts a
- *                        `ready` message once its workspace listener is up, at
- *                        which point we postMessage the source for it to
- *                        compile & render the real Flutter canvas.
+ * What this module NO LONGER does, and why:
+ *   It previously embedded the DartPad SPA (`preview.dartpad.dev?embed=true`)
+ *   in an iframe, injected source via `postMessage({type:'sourceCode',...})`,
+ *   and CSS-cropped the iframe to show only the Flutter canvas. That approach
+ *   broke: DartPad migrated its embed to a new Jaspr SPA that (a) renders the
+ *   full IDE (file tree + code editor with the default sample) instead of a
+ *   canvas-only embed, and (b) no longer honors the `sourceCode` postMessage
+ *   — injected source is ignored and the editor keeps the default CounterApp.
+ *   The CSS-crop then showed the *code editor* inside the phone bezel ("code
+ *   inside the phone preview for a few seconds") and, because no real render
+ *   happened, the 18s fallback fired with a misleading "Flutter engine
+ *   unavailable" message. (Verified empirically: all embed-*.html hosts now
+ *   serve the identical 1107-byte Jaspr SPA, and a live postMessage test left
+ *   the editor on the default sample.)
+ *
+ *   Replicating the DDC runtime ourselves (compileDDC + dart_sdk.js + flutter_web
+ *   + require.js loader) was evaluated and rejected: the SDK/runtime modules
+ *   are loaded from DartPad's own deferred SPA chunks with no stable public URL,
+ *   making a self-hosted runner fragile and version-coupled.
+ *
+ *   The Flutter preview therefore renders a faithful structural approximation of
+ *   the Dart widget tree (dartWidgetParser) directly in the phone screen — no
+ *   iframe, no editor chrome, no crop, no false "engine unavailable" banner.
+ *   The real dart-services analyzer still powers the DEBUG button with genuine
+ *   compile errors, so the user gets accurate bug detection and a clean preview.
  */
 
 const DARTPAD_API = 'https://stable.api.dartpad.dev/api/v3';
-
-/**
- * Embed iframe URL.
- *
- * IMPORTANT: this must point at `preview.dartpad.dev`, NOT `dartpad.dev`.
- *
- * `preview.dartpad.dev` is the host that serves the DartPad SPA *with the embed
- * message handler registered* (see dart-lang/dart-pad
- * `pkgs/dartpad_ui/lib/app/embed/web.dart`). On load it posts `{type:'ready'}`
- * to the parent and listens for `{type:'sourceCode', sourceCode}` postMessages,
- * then compiles & renders the real Flutter canvas when `run=true`.
- *
- * `dartpad.dev` is the marketing/landing host — its bundle does NOT register
- * the embed handler, so injected source is silently ignored and the iframe
- * stays on its default sample → the cropped view shows a permanent black
- * screen. That mismatch is the root cause of the "Flutter preview never pops
- * up" bug. The official embed demo (dart-pad `web/embed_demo.html`) and the
- * embed handler source both confirm `preview.dartpad.dev` is the correct host.
- */
-export const DARTPAD_EMBED_URL =
-  'https://preview.dartpad.dev?embed=true&theme=dark&run=true';
 
 export interface DartAnalysisIssue {
   kind: string; // 'error' | 'warning' | 'info'
@@ -113,82 +109,4 @@ export function ensureFlutterApp(source: string): string {
   // No widget class found — still wrap with a generic placeholder runner so
   // DartPad at least compiles and the analyzer reports the real errors.
   return `${importLine}${source}\n\nvoid main() => runApp(const MaterialApp(home: Scaffold(body: Center(child: Text('Awaiting a Widget to render')))));\n`;
-}
-
-/**
- * Wait for the DartPad embed iframe to signal `ready` (or request source),
- * then inject the source code so it compiles & runs. Resolves true once the
- * source has been delivered; resolves false on timeout if the iframe never
- * became available.
- *
- * Robustness: the DartPad SPA initializes its workspace asynchronously and
- * may register the `sourceCode` message listener late, or (when sandboxed)
- * may never post `ready` to a cross-origin parent. To compensate we:
- *   - listen for BOTH `ready` and `requestSource` (the SPA requests source
- *     on demand after its workspace boots) and push on either signal;
- *   - retry the `sourceCode` post every ~2s over the timeout window so a
- *     late-attaching listener still receives it.
- * DartPad handles `sourceCode` any time after its listener is attached, so a
- * later retry lands even if the very first post arrived too early.
- */
-export function injectSourceIntoDartPad(
-  iframe: HTMLIFrameElement | null,
-  source: string,
-  timeoutMs = 25000
-): Promise<boolean> {
-  return new Promise((resolve) => {
-    if (!iframe || !iframe.contentWindow) {
-      resolve(false);
-      return;
-    }
-    const target = iframe.contentWindow;
-    let settled = false;
-    let delivered = false;
-    const finish = (ok: boolean) => {
-      if (settled) return;
-      settled = true;
-      window.removeEventListener('message', onMessage);
-      clearInterval(retryInterval);
-      clearTimeout(timer);
-      resolve(ok);
-    };
-    const deliver = () => {
-      if (delivered) return;
-      try {
-        target.postMessage({ type: 'sourceCode', sourceCode: source }, '*');
-        delivered = true;
-      } catch {
-        /* iframe may have navigated; retry loop will try again */
-      }
-    };
-    const onMessage = (e: MessageEvent) => {
-      // DartPad posts {type:'ready'} or {type:'requestSource'} from the iframe.
-      if (e.source !== target) return;
-      const t = e.data && e.data.type;
-      if (t === 'ready' || t === 'requestSource') {
-        deliver();
-        // After ready, give it a beat then resolve optimistically.
-        if (t === 'ready') setTimeout(() => finish(true), 300);
-      }
-    };
-    window.addEventListener('message', onMessage);
-
-    // Retry the sourceCode post every ~2s so a late-attaching listener still
-    // receives it (resets `delivered` so we keep trying until it sticks).
-    const retryInterval = setInterval(() => {
-      if (settled) return;
-      delivered = false; // allow re-delivery on each retry
-      deliver();
-    }, 2000);
-    // First immediate attempt.
-    deliver();
-
-    const timer = setTimeout(() => {
-      // If we never saw ready/requestSource but the iframe is still present,
-      // optimistically treat the injected retries as successful — DartPad will
-      // compile whenever its listener attaches. Only fail if the iframe is
-      // genuinely unavailable.
-      finish(!!iframe.contentWindow);
-    }, timeoutMs);
-  });
 }

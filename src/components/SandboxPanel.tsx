@@ -1,28 +1,22 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { Terminal, Play, Loader2, X, FolderDown, ShieldCheck, AlertTriangle, ChevronDown } from 'lucide-react';
+import { Terminal, Play, Loader2, X, FolderDown, ShieldCheck, AlertTriangle, ChevronDown, ShieldAlert, Check } from 'lucide-react';
 import {
-  runSandboxCommand,
-  listSandboxArtifacts,
-  writeSandboxFiles,
   parseSandboxCommand,
-  isSandboxAvailable,
   ALLOWED_SANDBOX_COMMANDS,
-  type SandboxStreamLine,
   type SandboxArtifact,
 } from '../utils/sandboxRunner';
+import { type SandboxLogLine, type SandboxStoreValue } from '../utils/sandboxStore';
 import type { Project } from '../types';
 
 interface SandboxPanelProps {
   /** Project whose files are seeded into the sandbox workdir before a build. */
   project: Project | null;
   onClose: () => void;
+  /** Shared sandbox store (created at App level so runs survive panel close). */
+  store: SandboxStoreValue;
 }
 
-interface LogLine {
-  id: number;
-  stream: SandboxStreamLine['stream'];
-  text: string;
-}
+type LogLine = SandboxLogLine;
 
 const QUICK_COMMANDS: { label: string; cmd: string; desc: string }[] = [
   { label: 'npm install', cmd: 'npm install', desc: 'Install Node deps' },
@@ -32,24 +26,16 @@ const QUICK_COMMANDS: { label: string; cmd: string; desc: string }[] = [
   { label: 'cargo build', cmd: 'cargo build --release', desc: 'Rust release build → target/release' },
 ];
 
-export function SandboxPanel({ project, onClose }: SandboxPanelProps) {
+export function SandboxPanel({ project, onClose, store }: SandboxPanelProps) {
   const [command, setCommand] = useState('npm run build');
-  const [running, setRunning] = useState(false);
-  const [logs, setLogs] = useState<LogLine[]>([]);
-  const [exitCode, setExitCode] = useState<number | null>(null);
-  const [artifacts, setArtifacts] = useState<SandboxArtifact[]>([]);
-  const [error, setError] = useState<string | null>(null);
   const [autoSeed, setAutoSeed] = useState(true);
   const [showQuick, setShowQuick] = useState(false);
-  const logIdRef = useRef(0);
-  const logEndRef = useRef<HTMLDivElement | null>(null);
   const quickRef = useRef<HTMLDivElement | null>(null);
+  const logEndRef = useRef<HTMLDivElement | null>(null);
 
-  const available = isSandboxAvailable();
-
-  const pushLog = useCallback((stream: LogLine['stream'], text: string) => {
-    setLogs((prev) => [...prev, { id: ++logIdRef.current, stream, text }]);
-  }, []);
+  // The store is created at the App level (passed via props) so AI-driven runs
+  // survive closing this panel and the agent loop shares the same log.
+  const { available, running, logs, exitCode, artifacts, accessGranted, pendingApproval } = store;
 
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -66,60 +52,22 @@ export function SandboxPanel({ project, onClose }: SandboxPanelProps) {
   }, [showQuick]);
 
   const handleRun = useCallback(async () => {
-    setError(null);
     if (running) return;
-    setLogs([]);
-    setExitCode(null);
-    setArtifacts([]);
-
     let opts;
     try {
       opts = parseSandboxCommand(command);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      store.pushLog('error', e instanceof Error ? e.message : String(e));
       return;
     }
 
     const workdir = project ? `proj-${project.id}` : '';
-
-    setRunning(true);
-    try {
-      if (autoSeed && project && project.files.length > 0) {
-        pushLog('status', `Seeding ${project.files.length} project file(s) into the sandbox…`);
-        const files = project.files.map((f) => ({
-          path: f.path.startsWith('/') ? f.path.slice(1) : f.path,
-          content: f.content,
-        }));
-        const written = await writeSandboxFiles(workdir, files);
-        pushLog('status', `Seeded ${written} file(s).`);
-      }
-
-      pushLog('status', `$ ${opts.command} ${(opts.args ?? []).join(' ')}`);
-      const code = await runSandboxCommand(
-        { ...opts, workdir },
-        (line: SandboxStreamLine) => {
-          setLogs((prev) => [
-            ...prev,
-            { id: ++logIdRef.current, stream: line.stream, text: line.line },
-          ]);
-        },
-      );
-      setExitCode(code);
-      pushLog('status', code === 0 ? '✓ Completed successfully.' : `✗ Exited with code ${code}.`);
-
-      const found = await listSandboxArtifacts(workdir);
-      setArtifacts(found);
-      if (found.length > 0) {
-        pushLog('status', `Found ${found.length} build artifact(s) ready for download.`);
-      }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setError(msg);
-      pushLog('error', msg);
-    } finally {
-      setRunning(false);
+    if (autoSeed && project && project.files.length > 0) {
+      await store.seedProject(project);
     }
-  }, [command, running, project, autoSeed, pushLog]);
+    await store.runCommand({ ...opts, workdir }, 'manual');
+    await store.refreshArtifacts(workdir);
+  }, [command, running, project, autoSeed, store]);
 
   const downloadArtifact = useCallback((a: SandboxArtifact) => {
     // Use the Tauri FS plugin's readTextFile/binary read is overkill; instead
@@ -134,16 +82,20 @@ export function SandboxPanel({ project, onClose }: SandboxPanelProps) {
       link.click();
       document.body.removeChild(link);
     }).catch((e) => {
-      setError(`Could not start download: ${e}`);
+      store.pushLog('error', `Could not start download: ${e}`);
     });
-  }, []);
+  }, [store]);
 
-  const lineColor = (s: LogLine['stream']) =>
-    s === 'stderr' || s === 'error'
-      ? 'text-red-400'
-      : s === 'status'
+  const lineColor = (l: LogLine) =>
+    l.stream === 'stderr' || l.stream === 'error'
+      ? l.source === 'agent'
+        ? 'text-red-300'
+        : 'text-red-400'
+      : l.stream === 'status'
         ? 'text-[#C58B51] font-semibold'
-        : 'text-emerald-300/90';
+        : l.source === 'agent'
+          ? 'text-sky-300/90'
+          : 'text-emerald-300/90';
 
   return (
     <div className="flex flex-col h-full bg-[#1a1a1a] text-[#e8e8e8]">
@@ -156,15 +108,79 @@ export function SandboxPanel({ project, onClose }: SandboxPanelProps) {
             <ShieldCheck size={10} className="text-emerald-400" />
             Restricted
           </span>
+          {accessGranted && (
+            <span className="flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-sky-500/15 border border-sky-500/40 text-sky-300 font-semibold">
+              <ShieldAlert size={10} />
+              AI Access
+            </span>
+          )}
         </div>
-        <button
-          onClick={onClose}
-          className="flex h-7 w-7 items-center justify-center rounded-lg hover:bg-[#333] text-[#9a9a9a] hover:text-white transition-all cursor-pointer"
-          title="Close sandbox"
-        >
-          <X size={16} />
-        </button>
+        <div className="flex items-center gap-1.5">
+          {/* Give Access / Revoke — lets the AI run sandbox commands from chat */}
+          <button
+            onClick={() => store.toggleAccess()}
+            disabled={!available}
+            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-bold border transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
+              accessGranted
+                ? 'bg-sky-500/20 text-sky-300 border-sky-500/50 hover:bg-sky-500/30'
+                : 'bg-[#2a2a2a] text-[#C58B51] border-[#C58B51]/50 hover:bg-[#333]'
+            }`}
+            title={
+              accessGranted
+                ? 'The AI can run sandbox commands from chat. Click to revoke access.'
+                : 'Grant the AI access to run sandbox commands driven from chat (linked to the automation mode).'
+            }
+          >
+            {accessGranted ? <Check size={12} /> : <ShieldAlert size={12} />}
+            {accessGranted ? 'Revoke Access' : 'Give Access'}
+          </button>
+          <button
+            onClick={onClose}
+            className="flex h-7 w-7 items-center justify-center rounded-lg hover:bg-[#333] text-[#9a9a9a] hover:text-white transition-all cursor-pointer"
+            title="Close sandbox"
+          >
+            <X size={16} />
+          </button>
+        </div>
       </div>
+
+      {/* Access info banner */}
+      {accessGranted && available && (
+        <div className="px-4 py-2 bg-sky-900/25 border-b border-sky-700/40 text-sky-200 text-[11px] flex items-start gap-2">
+          <ShieldAlert size={13} className="mt-0.5 shrink-0" />
+          <span>
+            The AI can run sandbox commands from your chat prompts. Runs continue in the background even when this panel
+            is closed, and stream into this log. Behavior follows the automation mode: <strong>Automatic</strong> asks
+            you to approve each command; <strong>Auto Planner</strong> runs them on its own. Revoke access anytime.
+          </span>
+        </div>
+      )}
+
+      {/* Pending approval (automatic mode) */}
+      {pendingApproval && (
+        <div className="px-4 py-2.5 bg-amber-900/30 border-b border-amber-700/50 text-amber-100 text-xs flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 min-w-0">
+            <ShieldAlert size={14} className="shrink-0 text-amber-300" />
+            <span className="truncate">
+              AI wants to run: <code className="px-1 bg-black/40 rounded text-amber-200">{pendingApproval.command}</code>
+            </span>
+          </div>
+          <div className="flex items-center gap-1.5 shrink-0">
+            <button
+              onClick={() => store.resolveApproval(true)}
+              className="px-2.5 py-1 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-bold cursor-pointer"
+            >
+              Approve
+            </button>
+            <button
+              onClick={() => store.resolveApproval(false)}
+              className="px-2.5 py-1 rounded-md bg-[#444] hover:bg-[#555] text-[#eee] text-[11px] font-bold cursor-pointer"
+            >
+              Reject
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Unavailable notice */}
       {!available && (
@@ -252,15 +268,15 @@ export function SandboxPanel({ project, onClose }: SandboxPanelProps) {
 
       {/* Log output */}
       <div className="flex-1 overflow-y-auto px-4 py-3 font-mono text-xs space-y-0.5 bg-[#111]">
-        {logs.length === 0 && !error && (
-          <div className="text-[#555] italic">Output will stream here. Run a command to begin.</div>
+        {logs.length === 0 && (
+          <div className="text-[#555] italic">Output will stream here — both your manual runs and the AI's runs when access is granted.</div>
         )}
         {logs.map((l) => (
-          <div key={l.id} className={`whitespace-pre-wrap break-all ${lineColor(l.stream)}`}>
+          <div key={l.id} className={`whitespace-pre-wrap break-all ${lineColor(l)}`}>
+            {l.source === 'agent' && <span className="text-sky-500 mr-1">◆</span>}
             {l.text}
           </div>
         ))}
-        {error && <div className="text-red-400 whitespace-pre-wrap break-all">⚠ {error}</div>}
         {exitCode !== null && (
           <div className={`mt-2 pt-2 border-t border-[#333] ${exitCode === 0 ? 'text-emerald-400' : 'text-red-400'} font-bold`}>
             {exitCode === 0 ? '● Success (exit 0)' : `● Failed (exit ${exitCode})`}
