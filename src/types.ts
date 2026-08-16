@@ -23,6 +23,22 @@ export interface Message {
   isStopped?: boolean;
   modelUsed?: string;
   generationDurationMs?: number;
+  /**
+   * Snapshot of the bound project's files captured *before* this assistant
+   * response's changes were applied by WorkspaceAutopilot. The Restore button
+   * (Feature: per-response undo) reverts the project files back to this
+   * snapshot, undoing the creates/updates/deletes/patches from this turn.
+   * `projectId` is null when no project existed before this turn (a universal
+   * chat that auto-created its first project) — in that case Restore removes
+   * the auto-created project. Only present for assistant messages that actually
+   * modified a project.
+   */
+  projectSnapshotBefore?: { projectId: string | null; files: ProjectFile[] };
+  /**
+   * Timestamp the user clicked Restore on this message. Used to show a
+   * "Restored" state on the message and to allow re-restoring.
+   */
+  restoredAt?: number;
 }
 
 export interface SearchResult {
