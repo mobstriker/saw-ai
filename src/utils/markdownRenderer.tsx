@@ -18,6 +18,7 @@ import { renderLatexMath } from './mathParser';
 import { Artifact, ProjectFile } from '../types';
 import { PatchApplier, PatchChunk } from './patchApplier';
 import { TargetedEditCard } from '../components/TargetedEditCard';
+import { deriveArtifactTitle } from './artifactParser';
 
 interface MarkdownRendererProps {
   content: string;
@@ -309,7 +310,10 @@ function parseMarkdownBlocks(
         if (looseMatch && looseMatch[1] && looseMatch[1].length > 2) {
           title = looseMatch[1].trim();
         } else {
-          title = `${lang.toUpperCase()} Component`;
+          // Derive a real filename from the source (class/component name) so
+          // the inspector header shows the actual file, not a generic
+          // placeholder like "DART Component".
+          title = deriveArtifactTitle(fullCode, lang, blockKey);
         }
       }
 

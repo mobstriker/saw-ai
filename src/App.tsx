@@ -139,21 +139,50 @@ export default function App() {
   // Sync state to local storage. Uses debounced writers so a burst of
   // changes (e.g. every token during a streamed response) coalesces into a
   // single write rather than rewriting the whole table hundreds of times.
+  //
+  // CRITICAL: gate every writer on `isDataLoaded`. Before the async DB load
+  // completes, the in-memory state holds the synchronous fallback defaults
+  // (empty chats/projects, DEFAULT_SETTINGS). Writing those to disk would
+  // WIPE persisted data (the diff-based saver deletes any record not in the
+  // new list). The gate ensures we only persist real, post-load state.
   useEffect(() => {
+    if (!isDataLoaded) return;
     // Always save — even when the array is empty — so deleted chats are
     // actually persisted. The guard `chats.length > 0` caused deletions to
     // be skipped when the last chat was removed, so deleted chats reappeared
     // on restart.
     StorageService.saveChatsDebounced(chats);
-  }, [chats]);
+  }, [chats, isDataLoaded]);
 
   useEffect(() => {
+    if (!isDataLoaded) return;
     StorageService.saveProjectsDebounced(projects);
-  }, [projects]);
+  }, [projects, isDataLoaded]);
 
   useEffect(() => {
+    if (!isDataLoaded) return;
     StorageService.saveSettings(settings);
-  }, [settings]);
+  }, [settings, isDataLoaded]);
+
+  // Flush any pending debounced writes when the page is closed or hidden.
+  // Without this, the last change within a 600ms debounce window is lost on
+  // reload/tab-close — which is exactly why chats "weren't saved" and
+  // deletions "stayed around" on the next visit.
+  useEffect(() => {
+    const flush = () => StorageService.flushPending();
+    // pagehide/beforeunload fire on tab close, reload, and mobile app
+    // backgrounding. visibilitychange(hidden) catches mobile backgrounding
+    // and tab-switches where the page may be evicted before unload fires.
+    window.addEventListener('pagehide', flush);
+    window.addEventListener('beforeunload', flush);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') flush();
+    });
+    return () => {
+      window.removeEventListener('pagehide', flush);
+      window.removeEventListener('beforeunload', flush);
+    };
+  }, []);
 
   // 2. Selection & Panel Layout State
   const [isLeftSidebarOpen, setIsLeftSidebarOpen] = useState(true);
@@ -606,6 +635,8 @@ export default function App() {
   const handleDeleteProject = (projectId: string) => {
     const filtered = projects.filter((p) => p.id !== projectId);
     setProjects(filtered);
+    StorageService.saveProjects(filtered);
+    StorageService.flushPending();
     if (activeProjectId === projectId) {
       setActiveProjectId(filtered[0]?.id || null);
     }
@@ -615,6 +646,10 @@ export default function App() {
   const handleDeleteChat = (chatId: string) => {
     const filtered = chats.filter((c) => c.id !== chatId);
     setChats(filtered);
+    // Persist immediately so the deletion survives a reload within the
+    // debounce window (the diff-based saver deletes the removed record).
+    StorageService.saveChats(filtered);
+    StorageService.flushPending();
     if (activeChatId === chatId) {
       setActiveChatId(filtered[0]?.id || null);
     }
@@ -642,9 +677,10 @@ export default function App() {
   // Handler: Clear Chat
   const handleClearChat = () => {
     if (!activeChat) return;
-    setChats(
-      chats.map((c) => (c.id === activeChat.id ? { ...c, messages: [], updatedAt: Date.now() } : c))
-    );
+    const updatedChats = chats.map((c) => (c.id === activeChat.id ? { ...c, messages: [], updatedAt: Date.now() } : c));
+    setChats(updatedChats);
+    StorageService.saveChats(updatedChats);
+    StorageService.flushPending();
     setCurrentArtifact(null);
     setAllArtifacts([]);
   };
@@ -1621,9 +1657,11 @@ When handling complex multi-step tasks:
         }
       }
 
-      // Finalize thinking state on message
-      setChats((prevChats) =>
-        prevChats.map((c) => {
+      // Finalize thinking state on message. Persist immediately (not just
+      // via the debounced effect) so the completed assistant message survives
+      // a reload even if it happens within the debounce window.
+      setChats((prevChats) => {
+        const updated = prevChats.map((c) => {
           if (c.id !== targetChat.id) return c;
           const parsedStream = parseThinkingFromStream(rawAccumulatedStream);
           const combinedThinking = (rawAccumulatedThinking + (parsedStream.thinking ? (rawAccumulatedThinking ? '\n' : '') + parsedStream.thinking : '')).trim();
@@ -1657,9 +1695,12 @@ When handling complex multi-step tasks:
                   }
                 : m
             ),
+            updatedAt: Date.now(),
           };
-        })
-      );
+        });
+        StorageService.saveChats(updated);
+        return updated;
+      });
 
       // Commit complete: clear the live-stream overlay so the message now
       // renders from the committed chats state (single source of truth).

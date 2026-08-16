@@ -73,8 +73,14 @@ export const StorageService = {
   // changes on every token — none of those intermediate states need to hit
   // disk. Only the settled state does. These debounce the writer so we
   // coalesce a burst of changes into a single write.
+  //
+  // We also stash the latest pending value so `flushPending()` can commit it
+  // immediately (e.g. on tab close) instead of just cancelling the timer —
+  // cancelling without persisting was losing the last in-flight change.
   _saveChatsTimer: null as ReturnType<typeof setTimeout> | null,
   _saveProjectsTimer: null as ReturnType<typeof setTimeout> | null,
+  _pendingChats: null as ChatSession[] | null,
+  _pendingProjects: null as Project[] | null,
   _lastChatsSignature: '' as string,
   _lastProjectsSignature: '' as string,
 
@@ -83,10 +89,13 @@ export const StorageService = {
     const sig = chats.map((c) => `${c.id}:${c.updatedAt ?? 0}`).join('|');
     if (sig === this._lastChatsSignature) return;
     this._lastChatsSignature = sig;
+    this._pendingChats = chats;
     if (this._saveChatsTimer) clearTimeout(this._saveChatsTimer);
     this._saveChatsTimer = setTimeout(() => {
-      this._saveChatsNow(chats);
       this._saveChatsTimer = null;
+      const pending = this._pendingChats;
+      this._pendingChats = null;
+      if (pending) this._saveChatsNow(pending);
     }, delay);
   },
 
@@ -94,16 +103,20 @@ export const StorageService = {
     const sig = projects.map((p) => `${p.id}:${p.updatedAt ?? 0}`).join('|');
     if (sig === this._lastProjectsSignature) return;
     this._lastProjectsSignature = sig;
+    this._pendingProjects = projects;
     if (this._saveProjectsTimer) clearTimeout(this._saveProjectsTimer);
     this._saveProjectsTimer = setTimeout(() => {
-      this._saveProjectsNow(projects);
       this._saveProjectsTimer = null;
+      const pending = this._pendingProjects;
+      this._pendingProjects = null;
+      if (pending) this._saveProjectsNow(pending);
     }, delay);
   },
 
-  // Force-flush any pending debounced writes immediately (e.g. on completion
-  // of a stream so the final message is persisted without waiting for the
-  // trailing debounce).
+  // Force-commit any pending debounced writes immediately (e.g. on tab close,
+  // reload, or after a stream completes) so the last in-flight change is not
+  // lost. Previously this only cleared the timer, which silently DROPPED the
+  // pending write — the root cause of chats "not saving" on reload.
   flushPending(): void {
     if (this._saveChatsTimer) {
       clearTimeout(this._saveChatsTimer);
@@ -112,6 +125,16 @@ export const StorageService = {
     if (this._saveProjectsTimer) {
       clearTimeout(this._saveProjectsTimer);
       this._saveProjectsTimer = null;
+    }
+    if (this._pendingChats) {
+      const pending = this._pendingChats;
+      this._pendingChats = null;
+      void this._saveChatsNow(pending);
+    }
+    if (this._pendingProjects) {
+      const pending = this._pendingProjects;
+      this._pendingProjects = null;
+      void this._saveProjectsNow(pending);
     }
   },
 

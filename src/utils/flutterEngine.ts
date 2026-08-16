@@ -6,22 +6,33 @@
  *   A tolerant Dart-source parser can only approximate a Flutter UI. To show
  *   the *actual* app the AI wrote, we compile & run the real Flutter Web engine.
  *   dartpad.dev exposes a public, CORS-enabled API (`stable.api.dartpad.dev`)
- *   and an embeddable iframe (`preview.dartpad.dev?embed=true`) that compiles
- *   injected Dart to JS and renders the real Flutter canvas — for free, with
- *   no subscription and no bundled runtime weight added to this app.
+ *   and an embeddable iframe (`dartpad.dev/?embed=true`) that compiles injected
+ *   Dart to JS and renders the real Flutter canvas — for free, with no
+ *   subscription and no bundled runtime weight added to this app.
  *
  * Two pieces:
  *   1. analyzeDart()   — POST /api/v3/analyze → real compile errors, used to
  *                        drive the DEBUG button red/gray and to report bugs.
- *   2. DARTPAD_EMBED   — iframe URL that runs Flutter. We postMessage the
- *                        source into it once it signals `ready`.
+ *   2. DARTPAD_EMBED   — the canonical DartPad SPA embed iframe. It posts a
+ *                        `ready` message once its workspace listener is up, at
+ *                        which point we postMessage the source for it to
+ *                        compile & render the real Flutter canvas.
  */
 
 const DARTPAD_API = 'https://stable.api.dartpad.dev/api/v3';
 
-/** Embed iframe: dark theme, auto-run injected source. */
+/**
+ * Embed iframe URL.
+ *
+ * IMPORTANT: this must point at `dartpad.dev` (the SPA host), NOT
+ * `preview.dartpad.dev`. `preview.dartpad.dev` is the internal runtime host
+ * the SPA talks to — loading it directly produces a blank/grey workspace that
+ * never initializes. The SPA at `dartpad.dev/?embed=true` boots the editor,
+ * compiles injected source, and renders the real Flutter canvas. `run=true`
+ * auto-runs after injection.
+ */
 export const DARTPAD_EMBED_URL =
-  'https://preview.dartpad.dev?embed=true&theme=dark&run=true';
+  'https://dartpad.dev/?embed=true&theme=dark&run=true';
 
 export interface DartAnalysisIssue {
   kind: string; // 'error' | 'warning' | 'info'
@@ -97,21 +108,25 @@ export function ensureFlutterApp(source: string): string {
 }
 
 /**
- * Wait for the DartPad embed iframe to signal `ready`, then inject the source
- * code so it compiles & runs. Resolves true once `ready` was received and the
- * source posted; resolves false on timeout.
+ * Wait for the DartPad embed iframe to signal `ready` (or request source),
+ * then inject the source code so it compiles & runs. Resolves true once the
+ * source has been delivered; resolves false on timeout if the iframe never
+ * became available.
  *
- * Robustness: the new DartPad SPA initializes its workspace asynchronously and
+ * Robustness: the DartPad SPA initializes its workspace asynchronously and
  * may register the `sourceCode` message listener late, or (when sandboxed)
- * may never post `ready` to a cross-origin parent. To compensate we retry the
- * `sourceCode` post several times over the timeout window — DartPad handles
- * `sourceCode` any time after its listener is attached, so a later retry lands
- * even if the very first post arrived too early.
+ * may never post `ready` to a cross-origin parent. To compensate we:
+ *   - listen for BOTH `ready` and `requestSource` (the SPA requests source
+ *     on demand after its workspace boots) and push on either signal;
+ *   - retry the `sourceCode` post every ~2s over the timeout window so a
+ *     late-attaching listener still receives it.
+ * DartPad handles `sourceCode` any time after its listener is attached, so a
+ * later retry lands even if the very first post arrived too early.
  */
 export function injectSourceIntoDartPad(
   iframe: HTMLIFrameElement | null,
   source: string,
-  timeoutMs = 20000
+  timeoutMs = 25000
 ): Promise<boolean> {
   return new Promise((resolve) => {
     if (!iframe || !iframe.contentWindow) {
@@ -120,7 +135,7 @@ export function injectSourceIntoDartPad(
     }
     const target = iframe.contentWindow;
     let settled = false;
-    let readySeen = false;
+    let delivered = false;
     const finish = (ok: boolean) => {
       if (settled) return;
       settled = true;
@@ -129,32 +144,43 @@ export function injectSourceIntoDartPad(
       clearTimeout(timer);
       resolve(ok);
     };
-    const onMessage = (e: MessageEvent) => {
-      // DartPad posts {sender, type:'ready'} from window.parent (the iframe).
-      if (e.source !== target) return;
-      if (e.data && e.data.type === 'ready') {
-        readySeen = true;
+    const deliver = () => {
+      if (delivered) return;
+      try {
         target.postMessage({ type: 'sourceCode', sourceCode: source }, '*');
-        // Give it a beat, then resolve optimistically.
-        setTimeout(() => finish(true), 300);
+        delivered = true;
+      } catch {
+        /* iframe may have navigated; retry loop will try again */
+      }
+    };
+    const onMessage = (e: MessageEvent) => {
+      // DartPad posts {type:'ready'} or {type:'requestSource'} from the iframe.
+      if (e.source !== target) return;
+      const t = e.data && e.data.type;
+      if (t === 'ready' || t === 'requestSource') {
+        deliver();
+        // After ready, give it a beat then resolve optimistically.
+        if (t === 'ready') setTimeout(() => finish(true), 300);
       }
     };
     window.addEventListener('message', onMessage);
 
-    // Retry the sourceCode post every 2s so a late-attaching listener still
-    // receives it. Stop once we've seen `ready` (already posted above) or timed out.
+    // Retry the sourceCode post every ~2s so a late-attaching listener still
+    // receives it (resets `delivered` so we keep trying until it sticks).
     const retryInterval = setInterval(() => {
       if (settled) return;
-      target.postMessage({ type: 'sourceCode', sourceCode: source }, '*');
+      delivered = false; // allow re-delivery on each retry
+      deliver();
     }, 2000);
     // First immediate attempt.
-    target.postMessage({ type: 'sourceCode', sourceCode: source }, '*');
+    deliver();
 
     const timer = setTimeout(() => {
-      // If we never saw `ready` but the iframe is loaded, optimistically treat
-      // the injected retries as successful — DartPad will compile whenever its
-      // listener attaches. Only fail if the iframe looks genuinely unavailable.
-      finish(readySeen || !!iframe.contentWindow);
+      // If we never saw ready/requestSource but the iframe is still present,
+      // optimistically treat the injected retries as successful — DartPad will
+      // compile whenever its listener attaches. Only fail if the iframe is
+      // genuinely unavailable.
+      finish(!!iframe.contentWindow);
     }, timeoutMs);
   });
 }

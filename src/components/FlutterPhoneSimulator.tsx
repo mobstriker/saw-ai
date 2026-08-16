@@ -337,17 +337,26 @@ export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
                     title="Flutter Preview"
                     className="absolute origin-top-left"
                     style={{
-                      // DartPad embed layout: editor (left ~58%) + output canvas
-                      // (right ~42%). Scale the iframe up so the canvas quadrant
-                      // fills the phone screen, and translate left to crop out
-                      // the editor chrome.
-                      width: '240%',
-                      height: '240%',
-                      transform: 'translateX(-58.4%)',
+                      // The DartPad SPA embed (`dartpad.dev/?embed=true`)
+                      // renders a split layout: code editor on the left and the
+                      // live Flutter canvas on the right. We scale the iframe up
+                      // and translate it left so the right-hand canvas quadrant
+                      // fills the phone screen, cropping out the editor chrome.
+                      width: '236%',
+                      height: '236%',
+                      transform: 'translateX(-57.7%)',
                       border: 'none',
                       background: '#fff',
                     }}
                     sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox allow-same-origin"
+                    onLoad={() => {
+                      // Kick off injection as soon as the iframe document
+                      // loads — we don't rely solely on the `ready` postMessage
+                      // since some embed setups never emit it cross-origin.
+                      if (platform !== 'flutter') return;
+                      const wrapped = ensureFlutterApp(code);
+                      injectSourceIntoDartPad(iframeRef.current, wrapped);
+                    }}
                   />
                   {/* Compile-error overlay (analyzer reported errors) */}
                   {hasBug && (

@@ -5,7 +5,7 @@ import { Artifact } from '../types';
  * Used as the final fallback so artifacts always carry a real filename
  * (e.g. "main.dart") instead of the old "Snippet N (DART)" placeholder.
  */
-const LANG_EXTENSION: Record<string, string> = {
+export const LANG_EXTENSION: Record<string, string> = {
   html: 'html',
   htm: 'html',
   svg: 'svg',
@@ -54,7 +54,7 @@ const PREVIEWABLE_LANGS = ['html', 'htm', 'svg', 'tsx', 'jsx', 'javascript', 'js
  * filename comment was found. Prefers the main public widget class, falls
  * back to the MaterialApp/CupertinoApp title, then "main.dart".
  */
-function deriveDartFilename(code: string): string {
+export function deriveDartFilename(code: string): string {
   // First public top-level class declaration, e.g. "class MyHomePage extends ..."
   const classMatch = code.match(/\bclass\s+([A-Z][A-Za-z0-9_]*)\s+extends\s+/);
   if (classMatch) {
@@ -82,7 +82,7 @@ function deriveDartFilename(code: string): string {
 /**
  * Derives a Swift filename from SwiftUI source.
  */
-function deriveSwiftFilename(code: string): string {
+export function deriveSwiftFilename(code: string): string {
   const structMatch = code.match(/\bstruct\s+([A-Z][A-Za-z0-9_]*)\s*:\s*View\b/);
   if (structMatch) {
     const name = structMatch[1];
@@ -98,7 +98,7 @@ function deriveSwiftFilename(code: string): string {
 /**
  * Derives a Kotlin filename from Jetpack Compose source.
  */
-function deriveKotlinFilename(code: string): string {
+export function deriveKotlinFilename(code: string): string {
   const fnMatch = code.match(/\bfun\s+([A-Z][A-Za-z0-9_]*)\s*\(/);
   if (fnMatch) {
     const name = fnMatch[1];
@@ -109,6 +109,55 @@ function deriveKotlinFilename(code: string): string {
     return `${snake}.kt`;
   }
   return 'MainActivity.kt';
+}
+
+/**
+ * Derives a TSX/JSX/React filename from the source. Prefers the default
+ * export name, then the first component function/class, then "App".
+ */
+function deriveReactFilename(code: string, ext: 'tsx' | 'jsx'): string {
+  const defaultExport = code.match(/export\s+default\s+(?:function\s+)?([A-Z][A-Za-z0-9_]*)/);
+  if (defaultExport) {
+    return `${toKebab(defaultExport[1])}.${ext}`;
+  }
+  const namedFn = code.match(/(?:function|const)\s+([A-Z][A-Za-z0-9_]*)\s*(?:\(|=)/);
+  if (namedFn) {
+    return `${toKebab(namedFn[1])}.${ext}`;
+  }
+  return `App.${ext}`;
+}
+
+function toKebab(name: string): string {
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1-$2')
+    .toLowerCase();
+}
+
+/**
+ * Unified title derivation for a code block with no explicit filename.
+ * Returns a real, language-appropriate filename (e.g. "my_home_page.dart",
+ * "login-form.tsx") so the inspector/simulator header shows the file the AI
+ * actually wrote, instead of a generic "Component" placeholder.
+ */
+export function deriveArtifactTitle(code: string, lang: string, index = 1): string {
+  const l = lang.toLowerCase().trim();
+  if (l === 'dart' || l === 'flutter' || code.includes('package:flutter')) return deriveDartFilename(code);
+  if (l === 'swift' || code.includes('import SwiftUI')) return deriveSwiftFilename(code);
+  if (l === 'kotlin' || l === 'kt' || code.includes('androidx.compose')) return deriveKotlinFilename(code);
+  if (l === 'tsx') return deriveReactFilename(code, 'tsx');
+  if (l === 'jsx') return deriveReactFilename(code, 'jsx');
+  if (l === 'html' || l === 'htm') {
+    const titleMatch = code.match(/<title>\s*([^<]+?)\s*<\/title>/i);
+    if (titleMatch) {
+      const slug = titleMatch[1].toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+      if (slug) return `${slug}.html`;
+    }
+    return 'index.html';
+  }
+  if (l === 'svg') return `illustration${index}.svg`;
+  const ext = LANG_EXTENSION[l] || l || 'txt';
+  return l ? `${toKebab(l)}_${index}.${ext}` : `file_${index}.${ext}`;
 }
 
 /**
@@ -174,19 +223,8 @@ export const ArtifactParser = {
       if (found) {
         title = found.name;
         commentLineIndex = found.lineIndex;
-      } else if (lang === 'dart' || lang === 'flutter' || code.includes('package:flutter')) {
-        title = deriveDartFilename(code);
-      } else if (lang === 'swift' || code.includes('import SwiftUI')) {
-        title = deriveSwiftFilename(code);
-      } else if (lang === 'kotlin' || lang === 'kt' || code.includes('androidx.compose')) {
-        title = deriveKotlinFilename(code);
-      } else if (lang === 'html') {
-        title = 'index.html';
-      } else if (lang === 'svg') {
-        title = `illustration${index}.svg`;
       } else {
-        const ext = LANG_EXTENSION[lang] || lang || 'txt';
-        title = lang ? `${lang}_${index}.${ext}` : `file_${index}.${ext}`;
+        title = deriveArtifactTitle(code, lang, index);
       }
 
       // Strip the leading filename-comment line from the stored code so the
