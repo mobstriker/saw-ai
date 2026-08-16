@@ -1,30 +1,24 @@
-import React, { useState, useMemo, useCallback } from 'react';
+import React, { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import {
   Smartphone,
-  Tablet,
   RotateCw,
   Moon,
   Sun,
   Flame,
-  Layers,
-  ChevronRight,
-  Plus,
-  Search,
-  Settings,
-  User,
-  Bell,
-  Heart,
-  Share2,
-  Home,
-  MessageSquare,
   Sparkles,
-  Check,
-  CheckCircle2,
-  Play,
   Bug,
+  Loader2,
+  WifiOff,
 } from 'lucide-react';
 import { parseDart } from '../utils/dartWidgetParser';
 import { renderDartNode, parseSwift, renderSwift, parseKotlin, renderKotlin } from '../utils/mobilePreview';
+import {
+  analyzeDart,
+  ensureFlutterApp,
+  injectSourceIntoDartPad,
+  DARTPAD_EMBED_URL,
+  type DartAnalysisResult,
+} from '../utils/flutterEngine';
 
 interface FlutterPhoneSimulatorProps {
   code: string;
@@ -35,6 +29,8 @@ interface FlutterPhoneSimulatorProps {
 
 type DeviceType = 'pixel8' | 'iphone15' | 'galaxy';
 
+type FlutterStatus = 'idle' | 'analyzing' | 'running' | 'error' | 'offline';
+
 export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
   code,
   title,
@@ -44,67 +40,131 @@ export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
   const [deviceType, setDeviceType] = useState<DeviceType>('pixel8');
   const [isDarkMode, setIsDarkMode] = useState(false);
   const [showDebugBanner, setShowDebugBanner] = useState(true);
-  const [counter, setCounter] = useState(0);
   const [isHotReloading, setIsHotReloading] = useState(false);
 
-  const platformLabel = platform === 'swift' ? 'SwiftUI' : platform === 'kotlin' ? 'Jetpack Compose' : 'Flutter Engine';
-  const platformVersion = platform === 'swift' ? 'iOS 17' : platform === 'kotlin' ? 'Compose 1.6' : 'v3.22';
-
-  // Parse the source according to platform and capture any errors for the
-  // debug button (Feature 3). Red when an error exists, gray when clean.
-  const { renderedApp, errors, appTitle, appBarTitle } = useMemo(() => {
+  // ---- Native (Swift/Kotlin) parser-based preview + structural errors ----
+  const nativePreview = useMemo(() => {
     if (platform === 'swift') {
       const parsed = parseSwift(code);
       return {
-        renderedApp: renderSwift(parsed, isDarkMode),
+        rendered: renderSwift(parsed, isDarkMode),
         errors: parsed.errors,
         appTitle: parsed.navigationTitle,
-        appBarTitle: parsed.navigationTitle,
       };
     }
     if (platform === 'kotlin') {
       const parsed = parseKotlin(code);
       return {
-        renderedApp: renderKotlin(parsed, isDarkMode),
+        rendered: renderKotlin(parsed, isDarkMode),
         errors: parsed.errors,
         appTitle: parsed.appTitle,
-        appBarTitle: parsed.appTitle,
       };
     }
-    // Flutter / Dart
+    return null;
+  }, [code, platform, isDarkMode]);
+
+  // ---- Dart fallback preview (used if DartPad can't load) ----
+  const dartFallback = useMemo(() => {
+    if (platform !== 'flutter') return null;
     const parsed = parseDart(code);
-    const root = parsed.root;
-    const rendered = root ? renderDartNode(root, isDarkMode) : null;
     return {
-      renderedApp: rendered,
+      rendered: parsed.root ? renderDartNode(parsed.root, isDarkMode) : null,
       errors: parsed.errors,
       appTitle: parsed.appTitle,
       appBarTitle: parsed.appBarTitle,
     };
-  }, [code, title, platform, isDarkMode]);
+  }, [code, platform, isDarkMode]);
 
-  const hasBug = errors.length > 0;
-  const bugText = hasBug ? errors.join('; ') : '';
+  // ---- Real Flutter engine state ----
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const [flutterStatus, setFlutterStatus] = useState<FlutterStatus>('idle');
+  const [analysis, setAnalysis] = useState<DartAnalysisResult | null>(null);
+  const [useFallback, setUseFallback] = useState(false);
+  const [injectFailed, setInjectFailed] = useState(false);
+  const injectTokenRef = useRef(0);
 
-  const handleHotReload = () => {
+  // Debounced analyze + inject for real Flutter preview.
+  useEffect(() => {
+    if (platform !== 'flutter') return;
+    const wrapped = ensureFlutterApp(code);
+    setFlutterStatus('analyzing');
+    let cancelled = false;
+    const handle = setTimeout(async () => {
+      const result = await analyzeDart(wrapped);
+      if (cancelled) return;
+      setAnalysis(result);
+      setFlutterStatus(result.ok ? 'running' : 'error');
+    }, 500);
+    return () => {
+      cancelled = true;
+      clearTimeout(handle);
+    };
+  }, [code, platform]);
+
+  // Inject source into the DartPad embed iframe whenever code or status changes.
+  useEffect(() => {
+    if (platform !== 'flutter') return;
+    if (flutterStatus !== 'running' && flutterStatus !== 'error') return;
+    const wrapped = ensureFlutterApp(code);
+    const token = ++injectTokenRef.current;
+    injectSourceIntoDartPad(iframeRef.current, wrapped).then((ok) => {
+      if (token !== injectTokenRef.current) return;
+      setInjectFailed(!ok);
+      if (!ok) setUseFallback(true);
+    });
+  }, [code, flutterStatus, platform]);
+
+  const platformLabel =
+    platform === 'swift' ? 'SwiftUI' : platform === 'kotlin' ? 'Jetpack Compose' : 'Flutter Engine';
+  const platformVersion =
+    platform === 'swift' ? 'iOS 17' : platform === 'kotlin' ? 'Compose 1.6' : 'Real · v3.47';
+
+  // ---- Unified bug state across platforms ----
+  const bugErrors: string[] = useMemo(() => {
+    if (platform === 'swift' || platform === 'kotlin') return nativePreview?.errors ?? [];
+    if (platform === 'flutter') {
+      // Prefer the real analyzer; fall back to the structural parser only if
+      // the analyzer couldn't run.
+      if (analysis && analysis.errors.length > 0) {
+        return analysis.errors.map(
+          (e) => `${e.message}${e.line ? ` (line ${e.line}${e.column ? `:${e.column}` : ''})` : ''}`
+        );
+      }
+      if (analysis && analysis.ok) return [];
+      return dartFallback?.errors ?? [];
+    }
+    return [];
+  }, [platform, nativePreview, analysis, dartFallback]);
+
+  const hasBug = bugErrors.length > 0;
+  const bugText = bugErrors.join('; ');
+
+  const handleHotReload = useCallback(() => {
     setIsHotReloading(true);
-    setTimeout(() => setIsHotReloading(false), 500);
-  };
+    // Re-inject source to force a fresh compile/run in the embed.
+    if (platform === 'flutter') {
+      const wrapped = ensureFlutterApp(code);
+      injectSourceIntoDartPad(iframeRef.current, wrapped);
+    }
+    setTimeout(() => setIsHotReloading(false), 600);
+  }, [platform, code]);
 
   /**
-   * Debug button behavior (Feature 3):
-   * - Gray (no bugs): clicking does nothing (no-op), per the user's request.
-   * - Red (bug detected): clicking sends the bug message to the AI via
-   *   onReportBug so it can auto-fix the code.
+   * DEBUG button (Feature 3): gray = no-op (no bugs); red = send bug to AI.
    */
   const handleDebugClick = useCallback(() => {
-    if (!hasBug || !onReportBug) return; // gray = no-op
+    if (!hasBug || !onReportBug) return;
     onReportBug(
       `🐛 ${platformLabel} preview bug in ${title || 'app'}:\n${bugText}\n\nPlease fix the code so the app previews correctly without errors.`
     );
   }, [hasBug, bugText, onReportBug, platformLabel, title]);
 
   const currentTime = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+  const isFlutter = platform === 'flutter';
+  const showRealFlutter = isFlutter && !useFallback;
+  const flutterRendering = showRealFlutter && flutterStatus !== 'analyzing';
+  const flutterAnalyzing = isFlutter && flutterStatus === 'analyzing';
 
   return (
     <div className="flex flex-col h-full bg-[#FAF8F5] text-[#2C2825] select-none overflow-hidden">
@@ -160,6 +220,13 @@ export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
         </div>
 
         <div className="flex items-center gap-1.5">
+          {isFlutter && flutterAnalyzing && (
+            <span className="flex items-center gap-1 text-[10px] font-semibold text-[#7C756E]">
+              <Loader2 size={11} className="animate-spin text-[#C58B51]" />
+              Compiling…
+            </span>
+          )}
+
           {/* Hot Reload Button */}
           <button
             type="button"
@@ -181,7 +248,7 @@ export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
             {isDarkMode ? <Sun size={13} className="text-amber-500" /> : <Moon size={13} />}
           </button>
 
-          {/* Debug Banner Visibility Toggle (separate from the bug-report button) */}
+          {/* Debug banner visibility toggle (separate from the bug-report button) */}
           <button
             type="button"
             onClick={() => setShowDebugBanner(!showDebugBanner)}
@@ -195,9 +262,7 @@ export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
             BANNER
           </button>
 
-          {/* DEBUG button — the live bug indicator + AI report action.
-              Gray when there are no bugs (clicking is a no-op).
-              Red when a bug is detected (clicking sends the bug to the AI). */}
+          {/* DEBUG button — gray=no-op, red=send bug to AI */}
           <button
             type="button"
             onClick={handleDebugClick}
@@ -217,7 +282,6 @@ export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
 
       {/* Simulator Device Frame Area */}
       <div className="flex-1 overflow-auto flex items-center justify-center p-4 md:p-6 bg-[#FAF8F5]">
-        {/* Smartphone Hardware Frame */}
         <div
           className={`relative transition-all duration-300 shadow-2xl flex flex-col overflow-hidden ${
             deviceType === 'iphone15'
@@ -240,14 +304,11 @@ export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
               }`}
             >
               <span>{currentTime}</span>
-
-              {/* Dynamic Notch / Android Punchhole */}
               {deviceType === 'iphone15' ? (
                 <div className="w-20 h-4 bg-black rounded-full mx-auto" />
               ) : (
                 <div className="w-3.5 h-3.5 bg-black rounded-full mx-auto ring-1 ring-white/20" />
               )}
-
               <div className="flex items-center gap-1 text-[10px]">
                 <span>5G</span>
                 <span>📶</span>
@@ -264,23 +325,88 @@ export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
               </div>
             )}
 
-            {/* Rendered App Body — the real widget tree from the source code.
-                For Flutter/Dart this is the parsed Scaffold tree; for Swift and
-                Kotlin it is the platform-native render. The app's own AppBar /
-                navigation title is rendered inside this tree, so we do not
-                inject a separate mock AppBar. */}
-            <div className="flex-1 overflow-y-auto flex flex-col relative">
-              {renderedApp ?? (
+            {/* Rendered App Body */}
+            <div className="flex-1 overflow-hidden flex flex-col relative bg-white">
+              {/* REAL Flutter engine: DartPad embed iframe, CSS-cropped to the
+                  Flutter canvas so only the app shows inside the phone screen. */}
+              {flutterRendering ? (
+                <div className="absolute inset-0 overflow-hidden bg-white">
+                  <iframe
+                    ref={iframeRef}
+                    src={DARTPAD_EMBED_URL}
+                    title="Flutter Preview"
+                    className="absolute origin-top-left"
+                    style={{
+                      // DartPad embed layout: editor (left ~58%) + output canvas
+                      // (right ~42%). Scale the iframe up so the canvas quadrant
+                      // fills the phone screen, and translate left to crop out
+                      // the editor chrome.
+                      width: '240%',
+                      height: '240%',
+                      transform: 'translateX(-58.4%)',
+                      border: 'none',
+                      background: '#fff',
+                    }}
+                    sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox allow-same-origin"
+                  />
+                  {/* Compile-error overlay (analyzer reported errors) */}
+                  {hasBug && (
+                    <div className="absolute inset-0 bg-white/95 flex flex-col items-center justify-center text-center p-6 z-10">
+                      <div className="w-12 h-12 rounded-2xl bg-red-50 flex items-center justify-center text-red-500 mb-3">
+                        <Bug size={22} />
+                      </div>
+                      <p className="text-xs font-bold text-red-700 mb-1">Compile error in Flutter code</p>
+                      <p className="text-[11px] text-red-600 font-mono max-h-32 overflow-auto mb-3">{bugText}</p>
+                      <p className="text-[10px] text-gray-400">Tap the red DEBUG button to send this to the AI for fixing.</p>
+                    </div>
+                  )}
+                </div>
+              ) : flutterAnalyzing ? (
+                <div className="flex-1 flex flex-col items-center justify-center text-center p-6 bg-white">
+                  <Loader2 size={28} className="animate-spin text-[#C58B51] mb-3" />
+                  <p className="text-xs font-bold text-[#2C2825] mb-1">Compiling Flutter…</p>
+                  <p className="text-[11px] text-gray-400">Running the real Dart compiler via DartPad</p>
+                </div>
+              ) : isFlutter && useFallback ? (
+                // DartPad couldn't load — show the parser approximation + notice.
+                <div className="flex-1 flex flex-col relative overflow-y-auto">
+                  <div className="flex-1 overflow-y-auto">{dartFallback?.rendered}</div>
+                  <div className="shrink-0 px-3 py-1.5 bg-amber-50 border-t border-amber-200 flex items-center gap-1.5 text-[10px] text-amber-700">
+                    <WifiOff size={11} />
+                    <span>Flutter engine unavailable — showing structural approximation.</span>
+                  </div>
+                </div>
+              ) : isFlutter ? (
                 <div className="flex-1 flex flex-col items-center justify-center text-center p-6">
                   <div className="w-16 h-16 rounded-3xl bg-[#C58B51]/15 flex items-center justify-center text-[#C58B51] mb-4 shadow-sm">
                     <Sparkles size={28} />
                   </div>
-                  <p className="text-xs font-bold text-[#2C2825] mb-1">{appTitle || 'App'}</p>
+                  <p className="text-xs font-bold text-[#2C2825] mb-1">{dartFallback?.appTitle || 'App'}</p>
                   <p className="text-[11px] text-gray-400">
                     {hasBug
-                      ? 'The app could not be rendered. Tap the red DEBUG button to send the error to the AI for fixing.'
-                      : 'No renderable widget tree found in this file.'}
+                      ? 'Compile error — tap the red DEBUG button to send it to the AI.'
+                      : 'Preparing Flutter preview…'}
                   </p>
+                </div>
+              ) : (
+                /* Swift / Kotlin faithful translator preview */
+                <div className="flex-1 overflow-y-auto flex flex-col relative">
+                  {nativePreview?.rendered ?? (
+                    <div className="flex-1 flex flex-col items-center justify-center text-center p-6">
+                      <div className="w-16 h-16 rounded-3xl bg-[#C58B51]/15 flex items-center justify-center text-[#C58B51] mb-4 shadow-sm">
+                        <Smartphone size={28} />
+                      </div>
+                      <p className="text-xs font-bold text-[#2C2825] mb-1">{nativePreview?.appTitle || 'App'}</p>
+                      <p className="text-[11px] text-gray-400">
+                        {hasBug
+                          ? 'The app could not be rendered. Tap the red DEBUG button to send the error to the AI.'
+                          : 'No renderable view found in this file.'}
+                      </p>
+                      <p className="text-[10px] text-gray-300 mt-2 italic">
+                        {platform === 'swift' ? 'SwiftUI' : 'Jetpack Compose'} native approximation preview
+                      </p>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -296,10 +422,6 @@ export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
           </div>
         </div>
       </div>
-
-      {/* Hidden counter state kept for compatibility — FAB increments handled
-          inside the rendered tree now. */}
-      <span className="hidden">{counter}</span>
     </div>
   );
 };

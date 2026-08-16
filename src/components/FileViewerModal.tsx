@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   X,
   Copy,
@@ -18,11 +18,12 @@ import {
   Tablet,
   Smartphone,
   Flame,
+  Bug,
 } from 'lucide-react';
 import { ProjectFile } from '../types';
 import { ContextInjector } from '../utils/contextInjector';
 import { FlutterPhoneSimulator } from './FlutterPhoneSimulator';
-import { buildHtmlPreview, buildSvgPreview, buildReactPreview } from '../utils/previewBuilder';
+import { buildHtmlPreview, buildSvgPreview, buildReactPreview, isPreviewErrorReport } from '../utils/previewBuilder';
 
 interface FileViewerModalProps {
   file: ProjectFile | null;
@@ -47,6 +48,8 @@ export const FileViewerModal: React.FC<FileViewerModalProps> = ({
   const [isEditing, setIsEditing] = useState(false);
   const [editedContent, setEditedContent] = useState(() => file?.content || '');
   const [isSaved, setIsSaved] = useState(false);
+  const [webError, setWebError] = useState<string | null>(null);
+  const [previewKey, setPreviewKey] = useState(0);
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
 
   const isFlutterOrDart =
@@ -104,8 +107,34 @@ export const FileViewerModal: React.FC<FileViewerModalProps> = ({
         langLower === 'tsx' ||
         langLower === 'jsx';
       setActiveTab(shouldPreview ? 'preview' : 'code');
+      setWebError(null);
     }
   }, [file?.id, file?.content]);
+
+  // Capture runtime errors posted from the sandboxed web preview iframe so the
+  // DEBUG button can light up and report the bug to the AI.
+  useEffect(() => {
+    const handler = (e: MessageEvent) => {
+      if (e.source !== iframeRef.current?.contentWindow) return;
+      if (isPreviewErrorReport(e.data)) {
+        setWebError(e.data.message || 'Unknown preview error');
+      }
+    };
+    window.addEventListener('message', handler);
+    return () => window.removeEventListener('message', handler);
+  }, []);
+
+  // Reset captured errors when the preview is reloaded or the file changes.
+  useEffect(() => {
+    setWebError(null);
+  }, [file?.id, previewKey]);
+
+  const handleReportWebBug = useCallback(() => {
+    if (!webError || !onReportBug) return;
+    onReportBug(
+      `🐛 Preview bug in ${file?.name || 'web file'}:\n${webError}\n\nPlease fix the code so it previews correctly without errors.`
+    );
+  }, [webError, onReportBug, file?.name]);
 
   if (!file) return null;
 
@@ -235,6 +264,34 @@ export const FileViewerModal: React.FC<FileViewerModalProps> = ({
                 <Edit3 size={13} />
                 <span>{isEditing ? 'Editing' : 'Edit File'}</span>
               </button>
+            )}
+
+            {/* DEBUG button for web previews — gray=no-op, red=send runtime bug to AI */}
+            {activeTab === 'preview' && !isFlutterOrDart && !isNativeMobile && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => setPreviewKey((k) => k + 1)}
+                  className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-white border border-[#E6DFD3] hover:border-[#C58B51] text-xs font-medium text-[#7C756E] transition-all cursor-pointer"
+                  title="Reload preview"
+                >
+                  <RotateCcw size={13} />
+                </button>
+                <button
+                  type="button"
+                  onClick={handleReportWebBug}
+                  disabled={!webError}
+                  className={`flex items-center gap-1 px-2.5 py-1.5 rounded-xl text-xs font-bold border transition-all ${
+                    webError
+                      ? 'bg-red-50 text-red-700 border-red-200 hover:bg-red-100 cursor-pointer animate-pulse'
+                      : 'bg-gray-50 text-gray-400 border-gray-200 cursor-default'
+                  }`}
+                  title={webError ? `Bug detected — click to send to AI: ${webError}` : 'No bugs detected'}
+                >
+                  <Bug size={13} />
+                  <span>DEBUG</span>
+                </button>
+              </>
             )}
 
             {/* Save Button when in Edit Mode */}
@@ -439,6 +496,7 @@ export const FileViewerModal: React.FC<FileViewerModalProps> = ({
                     </div>
                   </div>
                   <iframe
+                    key={previewKey}
                     ref={iframeRef}
                     title="Live Web Preview"
                     sandbox="allow-scripts allow-modals allow-forms"
