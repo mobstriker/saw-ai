@@ -6,12 +6,21 @@ authors = ["you"]
 edition = "2021"
 
 [build-dependencies]
-tauri-build = { version = "2.0.0", features = [] }
+tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2.0.0", features = [] }
-tauri-plugin-fs = "2.0.0"
-tauri-plugin-http = { version = "2", features = ["unsafe-headers"] }
+# Tauri Rust crates. The exact resolved versions are pinned in Cargo.lock
+# (tauri 2.11.1, tauri-plugin-fs 2.5.1, tauri-plugin-http 2.5.9) and MUST stay
+# in major.minor lockstep with the npm packages in package.json
+# (@tauri-apps/api ^2.11.1, plugin-fs ^2.5.1, plugin-http ^2.5.9) — Tauri v2
+# aborts `tauri build` with a version-mismatch error if they drift.
+# tauri-plugin-http ^2.5 requires tauri ^2.10, so the whole set is on
+# 2.10+/2.5.x together. The npm ranges all resolve to exactly the locked Rust
+# versions (each is the current latest in its minor line), which keeps the
+# match stable even when CI reinstalls without the lockfile.
+tauri = { version = "2", features = [] }
+tauri-plugin-fs = "2"
+tauri-plugin-http = { version = "2.5", features = ["unsafe-headers"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Sandbox command runner (Feature 3): scoped process execution with a live

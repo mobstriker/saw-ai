@@ -116,6 +116,30 @@ owner's personal preferences — do not genericize the UX.
   preview, debug button, Save-as-Project) were already committed before this
   Flutter-engine work.
 
+## Tauri version alignment (CRITICAL for the "Build Windows App" CI)
+- `.github/workflows/main.yml` builds for `x86_64-pc-windows-msvc` on every push
+  to `main` via `tauri-apps/tauri-action@v0`. `tauri build` runs a
+  version-consistency check and **aborts** if the Rust crate and npm package
+  for a Tauri module aren't on the same major.minor.
+- The coherent set (must stay matched):
+  | Rust crate (Cargo.lock) | npm package (package.json) |
+  |---|---|
+  | `tauri` 2.11.1 | `@tauri-apps/api` `^2.11.1` |
+  | `tauri-plugin-fs` 2.5.1 | `@tauri-apps/plugin-fs` `^2.5.1` |
+  | `tauri-plugin-http` 2.5.9 | `@tauri-apps/plugin-http` `^2.5.9` |
+- `tauri-plugin-http ^2.5` requires `tauri ^2.10`, so the whole set lives on
+  2.10+/2.5.x — do NOT downgrade npm `@tauri-apps/api`/`plugin-fs` back to 2.0.0
+  (it's unsatisfiable alongside plugin-http 2.5.x and breaks the build).
+- `Cargo.toml` uses caret reqs (`"2"`/`"2.5"`); `Cargo.lock` pins the exact
+  versions. **Cargo.lock IS committed** (binary app) so cargo uses the matched
+  versions. CI's "Fix Windows Optional Dependencies" step deletes
+  `package-lock.json` and reinstalls from ranges — the ranges above each
+  resolve to exactly the locked Rust version (each is the current latest in its
+  minor line), so the match survives a lockfile-less reinstall.
+- If CI ever fails with "Found version mismatched Tauri packages", re-align by
+  pinning Cargo.lock to the npm-resolved version (or vice-versa) and confirm
+  `cargo check` + `npx tsc --noEmit` + `npm run build` before pushing.
+
 ## Vite Config
 - `vite.config.ts`: manual vendor chunks (react, markdown/katex, tauri,
   data/dexie+jszip+motion+lucide). HMR disabled when `DISABLE_HMR=true`.
