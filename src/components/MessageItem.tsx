@@ -22,6 +22,7 @@ import {
   RotateCw,
   Play,
   Clock,
+  Undo2,
 } from 'lucide-react';
 import { Message, Artifact, ProjectFile } from '../types';
 import { formatDuration } from '../utils/reasoning';
@@ -44,6 +45,7 @@ interface MessageItemProps {
   onOpenSettings?: () => void;
   onApplyPatch?: (patch: PatchChunk) => void;
   onRevertPatch?: (patch: PatchChunk) => void;
+  onRestore?: (messageId: string) => void;
   targetFile?: ProjectFile | null;
   targetArtifact?: Artifact | null;
 }
@@ -67,6 +69,7 @@ export const MessageItem: React.FC<MessageItemProps> = React.memo(({
   onOpenSettings,
   onApplyPatch,
   onRevertPatch,
+  onRestore,
   targetFile,
   targetArtifact,
 }) => {
@@ -486,6 +489,30 @@ export const MessageItem: React.FC<MessageItemProps> = React.memo(({
               </button>
             )}
 
+            {/* Restore Button — reverts project files to the snapshot captured
+                before this response's changes were applied (per-response undo).
+                Only shown on assistant messages that actually modified a
+                project. The Continue button above is intentionally untouched. */}
+            {onRestore && !isGenerating && message.projectSnapshotBefore && (
+              <button
+                type="button"
+                onClick={() => onRestore(message.id)}
+                className={`flex items-center gap-1 px-2 py-1 rounded-lg border transition-all cursor-pointer ${
+                  message.restoredAt
+                    ? 'text-emerald-600 border-emerald-200 bg-emerald-50'
+                    : 'text-[#7C756E] hover:text-[#2C2825] border-transparent hover:bg-[#FAF8F5] hover:border-[#E6DFD3]'
+                }`}
+                title={
+                  message.restoredAt
+                    ? 'Project restored to before this response. Click again to re-restore.'
+                    : 'Restore project files to how they were before this response'
+                }
+              >
+                <Undo2 size={11} />
+                <span>{message.restoredAt ? 'Restored' : 'Restore'}</span>
+              </button>
+            )}
+
             {/* Copy Button */}
             <button
               type="button"
@@ -527,6 +554,11 @@ export const MessageItem: React.FC<MessageItemProps> = React.memo(({
   if (pm.searchResults !== nm.searchResults) return false;
   if (pm.modelUsed !== nm.modelUsed) return false;
   if (pm.generationDurationMs !== nm.generationDurationMs) return false;
+  if (pm.restoredAt !== nm.restoredAt) return false;
+  // Restore button visibility depends on whether a snapshot exists; re-render
+  // when that presence flips (the snapshot is attached in a separate update
+  // after the message is finalized, so the comparator must catch the change).
+  if (Boolean(pm.projectSnapshotBefore) !== Boolean(nm.projectSnapshotBefore)) return false;
   if (prev.userPrompt !== next.userPrompt) return false;
   if (prev.isLastMessage !== next.isLastMessage) return false;
   if (prev.isGenerating !== next.isGenerating) return false;

@@ -24,15 +24,23 @@ const DARTPAD_API = 'https://stable.api.dartpad.dev/api/v3';
 /**
  * Embed iframe URL.
  *
- * IMPORTANT: this must point at `dartpad.dev` (the SPA host), NOT
- * `preview.dartpad.dev`. `preview.dartpad.dev` is the internal runtime host
- * the SPA talks to — loading it directly produces a blank/grey workspace that
- * never initializes. The SPA at `dartpad.dev/?embed=true` boots the editor,
- * compiles injected source, and renders the real Flutter canvas. `run=true`
- * auto-runs after injection.
+ * IMPORTANT: this must point at `preview.dartpad.dev`, NOT `dartpad.dev`.
+ *
+ * `preview.dartpad.dev` is the host that serves the DartPad SPA *with the embed
+ * message handler registered* (see dart-lang/dart-pad
+ * `pkgs/dartpad_ui/lib/app/embed/web.dart`). On load it posts `{type:'ready'}`
+ * to the parent and listens for `{type:'sourceCode', sourceCode}` postMessages,
+ * then compiles & renders the real Flutter canvas when `run=true`.
+ *
+ * `dartpad.dev` is the marketing/landing host — its bundle does NOT register
+ * the embed handler, so injected source is silently ignored and the iframe
+ * stays on its default sample → the cropped view shows a permanent black
+ * screen. That mismatch is the root cause of the "Flutter preview never pops
+ * up" bug. The official embed demo (dart-pad `web/embed_demo.html`) and the
+ * embed handler source both confirm `preview.dartpad.dev` is the correct host.
  */
 export const DARTPAD_EMBED_URL =
-  'https://dartpad.dev/?embed=true&theme=dark&run=true';
+  'https://preview.dartpad.dev?embed=true&theme=dark&run=true';
 
 export interface DartAnalysisIssue {
   kind: string; // 'error' | 'warning' | 'info'

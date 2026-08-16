@@ -81,6 +81,7 @@ export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
   const [analysis, setAnalysis] = useState<DartAnalysisResult | null>(null);
   const [useFallback, setUseFallback] = useState(false);
   const [injectFailed, setInjectFailed] = useState(false);
+  const [renderConfirmed, setRenderConfirmed] = useState(false);
   const injectTokenRef = useRef(0);
 
   // Debounced analyze + inject for real Flutter preview.
@@ -88,6 +89,7 @@ export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
     if (platform !== 'flutter') return;
     const wrapped = ensureFlutterApp(code);
     setFlutterStatus('analyzing');
+    setRenderConfirmed(false);
     let cancelled = false;
     const handle = setTimeout(async () => {
       const result = await analyzeDart(wrapped);
@@ -101,6 +103,24 @@ export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
     };
   }, [code, platform]);
 
+  // Listen for messages from the DartPad embed iframe. The embed host posts
+  // {type:'ready'} once its listener is attached and emits {type:'stdout'}/
+  // {type:'stderr'} while compiling/running. Any such message proves the real
+  // engine is alive and rendering, so we confirm the render and cancel the
+  // fallback timer — the user sees the live canvas instead of black.
+  useEffect(() => {
+    if (platform !== 'flutter') return;
+    const onMessage = (e: MessageEvent) => {
+      if (!iframeRef.current || e.source !== iframeRef.current.contentWindow) return;
+      const t = e.data && e.data.type;
+      if (t === 'ready' || t === 'requestSource' || t === 'stdout' || t === 'stderr') {
+        setRenderConfirmed(true);
+      }
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, [platform]);
+
   // Inject source into the DartPad embed iframe whenever code or status changes.
   useEffect(() => {
     if (platform !== 'flutter') return;
@@ -113,6 +133,19 @@ export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
       if (!ok) setUseFallback(true);
     });
   }, [code, flutterStatus, platform]);
+
+  // Render-timeout fallback: if the real engine hasn't confirmed it is alive
+  // within 18s of entering the running state, fall back to the structural Dart
+  // approximation so the user always sees *something* render instead of a
+  // permanent black screen. Cleared the moment a ready/stdout message arrives.
+  useEffect(() => {
+    if (platform !== 'flutter') return;
+    if (flutterStatus !== 'running' || renderConfirmed) return;
+    const timer = setTimeout(() => {
+      if (!renderConfirmed) setUseFallback(true);
+    }, 18000);
+    return () => clearTimeout(timer);
+  }, [platform, flutterStatus, renderConfirmed]);
 
   const platformLabel =
     platform === 'swift' ? 'SwiftUI' : platform === 'kotlin' ? 'Jetpack Compose' : 'Flutter Engine';

@@ -42,6 +42,7 @@ import {
 } from '../types';
 import { PatchChunk } from '../utils/patchApplier';
 import { MessageItem } from './MessageItem';
+import { SandboxPanel } from './SandboxPanel';
 import { ContextInjector } from '../utils/contextInjector';
 import { FileSecurity } from '../utils/fileSecurity';
 import {
@@ -119,6 +120,7 @@ interface ChatWindowProps {
   onRejectArtifacts?: (messageId: string) => void;
   onApplyPatch?: (patch: PatchChunk) => void;
   onRevertPatch?: (patch: PatchChunk) => void;
+  onRestore?: (messageId: string) => void;
   targetFile?: ProjectFile | null;
   targetArtifact?: Artifact | null;
   onGoToProject?: (projectId: string) => void;
@@ -169,6 +171,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   onRejectArtifacts,
   onApplyPatch,
   onRevertPatch,
+  onRestore,
   targetFile,
   targetArtifact,
   onGoToProject,
@@ -188,6 +191,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   const [showMcpPopover, setShowMcpPopover] = useState(false);
   const [showReasoningPopover, setShowReasoningPopover] = useState(false);
   const [showSkillsPopover, setShowSkillsPopover] = useState(false);
+  const [showSandbox, setShowSandbox] = useState(false);
   const [showAutomationPopover, setShowAutomationPopover] = useState(false);
   const mcpPopoverRef = useRef<HTMLDivElement | null>(null);
   const reasoningPopoverRef = useRef<HTMLDivElement | null>(null);
@@ -745,6 +749,20 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
             <Download size={15} />
           </button>
 
+          {/* Sandbox Runner — restricted in-app command execution (Feature 3) */}
+          <button
+            onClick={() => setShowSandbox((v) => !v)}
+            className={`flex h-8 items-center gap-1.5 px-2.5 rounded-lg transition-all cursor-pointer border ${
+              showSandbox
+                ? 'bg-[#FAF8F5] text-[#C58B51] border-[#C58B51]'
+                : 'text-[#7C756E] hover:text-[#2C2825] border-transparent hover:bg-[#FAF8F5] hover:border-[#E6DFD3]'
+            }`}
+            title="Open the restricted in-app sandbox to run build commands (npm/flutter/cargo) and download artifacts"
+          >
+            <Terminal size={15} />
+            <span className="hidden sm:inline text-xs font-bold">Sandbox</span>
+          </button>
+
           {/* Clear Chat */}
           <button
             onClick={onClearChat}
@@ -871,6 +889,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
                   onOpenSettings={onOpenSettings}
                   onApplyPatch={onApplyPatch}
                   onRevertPatch={onRevertPatch}
+                  onRestore={onRestore}
                   targetFile={targetFile}
                   targetArtifact={targetArtifact}
                 />
@@ -881,6 +900,14 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
           <div ref={messagesEndRef} />
         </div>
       </div>
+
+      {/* Sandbox Runner Dock — restricted in-app command execution (Feature 3).
+          Slides up from the bottom of the chat when toggled. */}
+      {showSandbox && (
+        <div className="h-[42vh] min-h-[280px] shrink-0 border-t-2 border-[#C58B51]/40 shadow-2xl animate-in slide-in-from-bottom-4 duration-300">
+          <SandboxPanel project={project || null} onClose={() => setShowSandbox(false)} />
+        </div>
+      )}
 
       {/* Message Input Bottom Area */}
       <div className="p-4 sm:p-6 bg-transparent shrink-0">

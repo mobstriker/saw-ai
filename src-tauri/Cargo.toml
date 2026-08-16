@@ -14,3 +14,9 @@ tauri-plugin-fs = "2.0.0"
 tauri-plugin-http = { version = "2", features = ["unsafe-headers"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Sandbox command runner (Feature 3): scoped process execution with a live
+# stdout/stderr stream back to the webview. tokio drives the async process and
+# the per-line reader; globlite is a tiny zero-dep glob helper used to collect
+# build artifacts (dist/**, *.exe, *.apk, build/app/outputs/**).
+tokio = { version = "1", features = ["process", "io-util", "rt", "sync", "macros", "time"] }
+glob = "0.3"

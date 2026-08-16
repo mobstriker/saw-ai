@@ -774,6 +774,69 @@ export default function App() {
     handleApplyPatch(reversePatch);
   };
 
+  // Handler: Restore the project files to the snapshot captured before a given
+  // assistant message's changes were applied (Feature: per-response undo).
+  //
+  // The snapshot lives on the assistant message (`projectSnapshotBefore`),
+  // captured in handleSendMessage right before WorkspaceAutopilot ran. Restore
+  // rolls the bound project's files back to that snapshot, undoing every
+  // create/update/delete/patch from that turn (and any later turns that touched
+  // the same project). When the snapshot's projectId is null, no project
+  // existed before that turn — so Restore removes the auto-created project.
+  const handleRestore = useCallback((messageId: string) => {
+    if (!activeChat) return;
+    const targetMsg = activeChat.messages.find((m) => m.id === messageId);
+    if (!targetMsg || targetMsg.role !== 'assistant') return;
+    const snapshot = targetMsg.projectSnapshotBefore;
+    if (!snapshot) return;
+
+    if (snapshot.projectId === null) {
+      // No project existed before this turn auto-created one. Remove it so the
+      // workspace returns to the pre-turn (projectless) state.
+      setProjects((prev) => {
+        // Remove projects that were created during/after this turn. We can't
+        // know the exact created id, so remove any project bound to this chat
+        // plus the default "Workspace Project" auto-creation.
+        const chatProjId = activeChat.projectId;
+        return prev.filter(
+          (p) => p.id !== chatProjId && p.name !== 'Workspace Project'
+        );
+      });
+    } else {
+      // Roll the project's files back to the captured snapshot.
+      setProjects((prev) =>
+        prev.map((p) =>
+          p.id === snapshot.projectId
+            ? { ...p, files: snapshot.files.map((f) => ({ ...f })), updatedAt: Date.now() }
+            : p
+        )
+      );
+      // If the file viewer is showing a file from this project, refresh it to
+      // the restored content (or close it if the file no longer exists).
+      setSelectedFileForModal((prev) => {
+        if (!prev) return prev;
+        const stillExists = snapshot.files.some((f) => f.id === prev.id);
+        if (!stillExists) return null;
+        const restored = snapshot.files.find((f) => f.id === prev.id);
+        return restored ? { ...restored } : null;
+      });
+    }
+
+    // Mark the message as restored so the UI shows a "Restored" badge.
+    setChats((prevChats) =>
+      prevChats.map((c) => {
+        if (c.id !== activeChat.id) return c;
+        return {
+          ...c,
+          messages: c.messages.map((m) =>
+            m.id === messageId ? { ...m, restoredAt: Date.now() } : m
+          ),
+          updatedAt: Date.now(),
+        };
+      })
+    );
+  }, [activeChat]);
+
   // Handler: Stop streaming generation
   const handleStopGeneration = () => {
     if (abortControllerRef.current) {
@@ -1716,9 +1779,21 @@ When handling complex multi-step tasks:
         : null;
       const effectiveAutoMode = (targetChat.automationMode || automationMode || settings.automationMode || 'automatic') as AutomationMode;
 
+      // Capture the project's file state BEFORE autopilot applies this turn's
+      // changes, so the Restore button can revert to it. We deep-copy the files
+      // (not the project object) so later mutations don't corrupt the snapshot.
+      // `preChangeProjectId` lets Restore know which project to roll back; when
+      // null, no project existed yet and Restore will remove the created one.
+      const preChangeProjectId = targetProject?.id ?? null;
+      const preChangeFiles: ProjectFile[] = targetProject
+        ? targetProject.files.map((f) => ({ ...f }))
+        : [];
+      let didModifyProject = false;
+
       if (targetProject) {
         const autoResult = WorkspaceAutopilot.execute(targetProject, fullAssistantOutput, effectiveAutoMode);
         if (autoResult.hasChanges) {
+          didModifyProject = true;
           setProjects((prev) =>
             prev.map((p) => (p.id === targetProject!.id ? autoResult.updatedProject : p))
           );
@@ -1732,7 +1807,17 @@ When handling complex multi-step tasks:
                 ...c,
                 messages: c.messages.map((m) =>
                   m.id === assistantMsgId
-                    ? { ...m, artifactsState: 'auto_applied', artifacts: newArtifacts }
+                    ? {
+                        ...m,
+                        artifactsState: 'auto_applied',
+                        artifacts: newArtifacts,
+                        // Attach the pre-change snapshot only when this turn
+                        // actually changed the project, so the Restore button
+                        // is meaningful (and hidden when nothing changed).
+                        projectSnapshotBefore: didModifyProject
+                          ? { projectId: preChangeProjectId, files: preChangeFiles }
+                          : m.projectSnapshotBefore,
+                      }
                     : m
                 ),
               };
@@ -1760,6 +1845,7 @@ When handling complex multi-step tasks:
         // If no project exists yet in workspace, create an initial Project with generated files
         const ops = WorkspaceAutopilot.parseOperations(fullAssistantOutput);
         if (ops.codeFiles.length > 0 || newArtifacts.length > 0) {
+          didModifyProject = true;
           const initialFiles: ProjectFile[] = ops.codeFiles.map((cf) => ({
             id: `file-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
             name: cf.path.split('/').pop() || cf.path,
@@ -1783,6 +1869,25 @@ When handling complex multi-step tasks:
           setProjects([newProj]);
           setActiveProjectId(newProj.id);
           targetProject = newProj;
+
+          // Attach a snapshot recording that no project existed before this
+          // turn created one, so Restore can remove the auto-created project.
+          setChats((prevChats) =>
+            prevChats.map((c) => {
+              if (c.id !== targetChat.id) return c;
+              return {
+                ...c,
+                messages: c.messages.map((m) =>
+                  m.id === assistantMsgId
+                    ? {
+                        ...m,
+                        projectSnapshotBefore: { projectId: preChangeProjectId, files: preChangeFiles },
+                      }
+                    : m
+                ),
+              };
+            })
+          );
         }
       }
 
@@ -2029,6 +2134,7 @@ When handling complex multi-step tasks:
           onRejectArtifacts={handleRejectArtifacts}
           onApplyPatch={handleApplyPatch}
           onRevertPatch={handleRevertPatch}
+          onRestore={handleRestore}
           targetFile={selectedFileForModal || (currentChatProject?.files[0] || null)}
           targetArtifact={currentArtifact}
           onGoToProject={(projectId) => {
