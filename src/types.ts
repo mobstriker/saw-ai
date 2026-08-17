@@ -172,6 +172,11 @@ export interface BYOKSettings {
   maxTokens?: number;
   temperature?: number;
   topP?: number;
+  /** GitHub token with `gist` scope. When set, Flutter previews embed a REAL
+   *  DartPad canvas (the AI's Dart is pushed to an anonymous gist and loaded
+   *  via dartpad.dev/embed-flutter.html?id=…). Optional — without it we fall
+   *  back to the structural widget-tree preview. */
+  gistToken?: string;
 }
 
 export interface MCPServer {

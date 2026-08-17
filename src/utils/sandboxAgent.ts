@@ -86,6 +86,10 @@ export interface AgentStepOptions {
   mode: 'review' | 'automatic' | 'automatic_plus';
   store: SandboxStoreValue;
   project: Project | null;
+  /** The chat whose sandbox the agent runs in (per-chat isolation). */
+  chatId: string;
+  /** Latest AI code artifact to seed for Python runs. */
+  seedFiles?: { path: string; content: string }[];
   onCommandRunning?: (cmd: RunnableCommand) => void;
 }
 
@@ -97,14 +101,14 @@ export interface AgentStepResult {
 /**
  * Run one agent step: execute every extracted command (with approval in
  * `automatic` mode, immediately in `automatic_plus`), streaming into the
- * shared sandbox log, and return a tool-results text block. The caller feeds
- * `outputText` back into the conversation and re-prompts the AI.
+ * chat's active sandbox tab, and return a tool-results text block. The caller
+ * feeds `outputText` back into the conversation and re-prompts the AI.
  */
 export async function runSandboxAgentStep(
   commands: RunnableCommand[],
   opts: AgentStepOptions
 ): Promise<AgentStepResult> {
-  const { mode, store, project } = opts;
+  const { mode, store, project, chatId, seedFiles } = opts;
   const workdir = project ? `proj-${project.id}` : '';
   const sections: string[] = [];
 
@@ -113,6 +117,12 @@ export async function runSandboxAgentStep(
   // Seed the project files once at the start of the step so the AI's builds
   // operate on the latest sources.
   await store.seedProject(project);
+  store.ensureChat(chatId);
+  // Snapshot the active tab's log length so we can collect only this step's
+  // lines for the tool-result block.
+  const cs0 = store.states[chatId];
+  const activeTab0 = cs0?.tabs.find((t) => t.id === cs0.activeTabId) || cs0?.tabs[0];
+  const logStartLen = activeTab0 ? activeTab0.logs.length : 0;
 
   let ranAny = false;
   for (const cmd of commands) {
@@ -127,19 +137,31 @@ export async function runSandboxAgentStep(
 
     opts.onCommandRunning?.(cmd);
     ranAny = true;
-    const code = await store.runCommand({ command: cmd.command, args: cmd.args, workdir }, 'agent');
-    // Capture the lines emitted during this run (everything after the run's
-    // header) from the shared log to build the tool-result block.
+    const code = await store.runCommand(
+      { command: cmd.command, args: cmd.args, workdir },
+      'agent',
+      chatId,
+      seedFiles,
+    );
     sections.push(`$ ${cmd.raw}\n[exit code: ${code}]`);
   }
 
   await store.refreshArtifacts(workdir);
 
-  // Build the tool-result text: the live log is the source of truth for
-  // stdout/stderr. We hand the AI a compact transcript of this step.
-  const recent = store.logs
+  // Collect only the lines emitted during this step (after logStartLen) from
+  // the active tab so the tool-result block reflects just this round's output.
+  const cs = store.states[chatId];
+  const activeTab = cs?.tabs.find((t) => t.id === cs.activeTabId) || cs?.tabs[0];
+  const stepLogs = activeTab ? activeTab.logs.slice(logStartLen) : [];
+  const recent = stepLogs
     .filter((l) => l.source === 'agent')
-    .map((l) => (l.stream === 'stderr' || l.stream === 'error' ? `[stderr] ${l.text}` : l.stream === 'status' ? `# ${l.text}` : l.text))
+    .map((l) =>
+      l.stream === 'stderr' || l.stream === 'error'
+        ? `[stderr] ${l.text}`
+        : l.stream === 'status'
+          ? `# ${l.text}`
+          : l.text,
+    )
     .join('\n');
 
   const outputText = [

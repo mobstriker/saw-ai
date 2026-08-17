@@ -23,6 +23,7 @@ import {
 import { ProjectFile } from '../types';
 import { ContextInjector } from '../utils/contextInjector';
 import { FlutterPhoneSimulator } from './FlutterPhoneSimulator';
+import { SandpackTsxPreview } from './SandpackTsxPreview';
 import { buildHtmlPreview, buildSvgPreview, buildReactPreview, isPreviewErrorReport } from '../utils/previewBuilder';
 
 interface FileViewerModalProps {
@@ -31,6 +32,7 @@ interface FileViewerModalProps {
   onToggleContext?: (fileId: string) => void;
   onSaveContent?: (fileId: string, newContent: string) => void;
   onReportBug?: (bugMessage: string) => void;
+  gistToken?: string;
 }
 
 type ViewportMode = 'responsive' | 'desktop' | 'tablet' | 'mobile';
@@ -41,6 +43,7 @@ export const FileViewerModal: React.FC<FileViewerModalProps> = ({
   onToggleContext,
   onSaveContent,
   onReportBug,
+  gistToken,
 }) => {
   const [activeTab, setActiveTab] = useState<'code' | 'preview'>('code');
   const [viewportMode, setViewportMode] = useState<ViewportMode>('responsive');
@@ -58,6 +61,11 @@ export const FileViewerModal: React.FC<FileViewerModalProps> = ({
     file?.content.includes('package:flutter') ||
     file?.content.includes('StatelessWidget') ||
     file?.content.includes('MaterialApp');
+
+  const isTsxOrJsx =
+    ['tsx', 'jsx'].includes(file?.language.toLowerCase() || '') ||
+    file?.name.endsWith('.tsx') ||
+    file?.name.endsWith('.jsx');
 
   const isSwift =
     file?.language.toLowerCase() === 'swift' ||
@@ -466,7 +474,15 @@ export const FileViewerModal: React.FC<FileViewerModalProps> = ({
                 title={file.name}
                 platform={nativePlatform}
                 onReportBug={onReportBug}
+                gistToken={gistToken}
               />
+            ) : isTsxOrJsx ? (
+              /* TSX/JSX live preview via CodeSandbox Sandpack (real bundler +
+                 npm imports). Falls back to the iframe path below for plain
+                 HTML/SVG/.ts/.js. */
+              <div className="w-full h-full flex flex-col overflow-hidden p-2">
+                <SandpackTsxPreview code={currentContent} filename={file.name} />
+              </div>
             ) : (
               <div className="w-full h-full flex flex-col items-center overflow-auto p-4">
                 <div

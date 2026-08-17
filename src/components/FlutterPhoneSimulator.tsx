@@ -8,6 +8,7 @@ import {
   Sparkles,
   Bug,
   Loader2,
+  ExternalLink,
 } from 'lucide-react';
 import { parseDart } from '../utils/dartWidgetParser';
 import { renderDartNode, parseSwift, renderSwift, parseKotlin, renderKotlin } from '../utils/mobilePreview';
@@ -16,12 +17,16 @@ import {
   ensureFlutterApp,
   type DartAnalysisResult,
 } from '../utils/flutterEngine';
+import { buildDartpadEmbedUrl, dartpadEditorUrl } from '../utils/dartpadEmbed';
 
 interface FlutterPhoneSimulatorProps {
   code: string;
   title?: string;
   platform?: 'flutter' | 'swift' | 'kotlin';
   onReportBug?: (bugMessage: string) => void;
+  /** Optional GitHub gist token. When provided (and Flutter), a REAL DartPad
+   *  canvas is embedded via a gist instead of the structural approximation. */
+  gistToken?: string;
 }
 
 type DeviceType = 'pixel8' | 'iphone15' | 'galaxy';
@@ -33,6 +38,7 @@ export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
   title,
   platform = 'flutter',
   onReportBug,
+  gistToken,
 }) => {
   const [deviceType, setDeviceType] = useState<DeviceType>('pixel8');
   const [isDarkMode, setIsDarkMode] = useState(false);
@@ -75,6 +81,50 @@ export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
   // ---- Real Dart analyzer state (drives the DEBUG button) ----
   const [flutterStatus, setFlutterStatus] = useState<FlutterStatus>('idle');
   const [analysis, setAnalysis] = useState<DartAnalysisResult | null>(null);
+
+  // ---- Real DartPad embed (gist-based) ----
+  // When a GitHub gist token is configured, push the AI's Dart to an anonymous
+  // gist and embed dartpad.dev/embed-flutter.html?id=… so the phone bezel shows
+  // the REAL Flutter canvas. Falls back to the structural preview on any error
+  // (no token, network failure, gist creation rejected). This is the only
+  // public, free way to render custom Dart in DartPad — Google deprecated the
+  // old source-injection (embed-*.html?sourceCode=… / postMessage).
+  const [dartpadUrl, setDartpadUrl] = useState<string | null>(null);
+  const [dartpadError, setDartpadError] = useState<string | null>(null);
+  useEffect(() => {
+    if (platform !== 'flutter') {
+      setDartpadUrl(null);
+      return;
+    }
+    if (!gistToken) {
+      setDartpadUrl(null);
+      setDartpadError(null);
+      return;
+    }
+    let cancelled = false;
+    const wrapped = ensureFlutterApp(code);
+    const handle = setTimeout(async () => {
+      try {
+        const result = await buildDartpadEmbedUrl(wrapped, gistToken, {
+          run: true,
+          dark: isDarkMode,
+        });
+        if (!cancelled) {
+          setDartpadUrl(result.url);
+          setDartpadError(null);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setDartpadUrl(null);
+          setDartpadError(err instanceof Error ? err.message : String(err));
+        }
+      }
+    }, 600);
+    return () => {
+      cancelled = true;
+      clearTimeout(handle);
+    };
+  }, [code, platform, gistToken, isDarkMode]);
 
   // Debounced analysis of the Dart source via the dart-services backend. This
   // is the authoritative compile-error check that turns the DEBUG button red.
@@ -248,6 +298,20 @@ export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
             BANNER
           </button>
 
+          {/* Open the current Flutter source in DartPad (new tab). The free
+              public embed no longer accepts custom source, so this is the
+              escape hatch when no gist token is configured. */}
+          <a
+            href={dartpadEditorUrl()}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-1 px-2 py-1 rounded-lg bg-[#FAF8F5] border border-[#E6DFD3] hover:border-[#C58B51] text-xs font-semibold text-[#7C756E] hover:text-[#2C2825] cursor-pointer transition-all"
+            title="Open DartPad in a new tab (paste your code there to run it)"
+          >
+            <ExternalLink size={12} />
+            <span>DartPad</span>
+          </a>
+
           {/* DEBUG button — gray=no-op, red=send bug to AI */}
           <button
             type="button"
@@ -313,12 +377,22 @@ export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
 
             {/* Rendered App Body */}
             <div className="flex-1 overflow-hidden flex flex-col relative bg-white">
-              {/* Flutter: structural widget-tree preview rendered directly in the
-                  phone screen (no external iframe). The dart-services analyzer
-                  still validates the code and powers the DEBUG button. */}
+              {/* Flutter preview. Priority: (1) REAL DartPad canvas via gist
+                  embed when a gist token is configured, (2) compile-error
+                  overlay when the analyzer reports bugs, (3) structural
+                  widget-tree approximation, (4) empty placeholder. */}
               {isFlutter ? (
                 <div className="flex-1 flex flex-col relative overflow-y-auto">
-                  {dartFallback?.rendered ? (
+                  {dartpadUrl ? (
+                    <iframe
+                      key={dartpadUrl}
+                      src={dartpadUrl}
+                      title="DartPad live preview"
+                      className="flex-1 w-full border-0 bg-white"
+                      sandbox="allow-scripts allow-same-origin allow-popups allow-forms"
+                      allow="autoplay; clipboard-read; clipboard-write"
+                    />
+                  ) : dartFallback?.rendered ? (
                     <div className="flex-1 overflow-y-auto">{dartFallback.rendered}</div>
                   ) : (
                     <div className="flex-1 flex flex-col items-center justify-center text-center p-6">
@@ -346,7 +420,13 @@ export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
                   <div className="shrink-0 px-3 py-1.5 bg-[#FAF8F5] border-t border-[#E6DFD3] flex items-center gap-1.5 text-[10px] text-[#7C756E]">
                     <Flame size={11} className="text-[#C58B51]" />
                     <span>
-                      {flutterAnalyzing
+                      {dartpadUrl
+                        ? 'Live DartPad canvas (real Flutter renderer via gist).'
+                        : dartpadError
+                        ? `DartPad unavailable — ${dartpadError}. Showing structural preview.`
+                        : !gistToken
+                        ? 'Structural preview. Add a GitHub gist token in Settings for a live DartPad canvas.'
+                        : flutterAnalyzing
                         ? 'Analyzing with the Dart compiler…'
                         : hasBug
                         ? 'Compile error detected — DEBUG to fix.'

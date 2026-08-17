@@ -25,6 +25,7 @@ import {
   Code,
   ChevronDown,
   ChevronRight,
+  Flame,
 } from 'lucide-react';
 import { BYOKSettings, Skill, AIProfile, SubModelConfig } from '../types';
 import { MCPTab } from './MCPTab';
@@ -1613,6 +1614,30 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     {importStatus}
                   </div>
                 )}
+
+                {/* Live Flutter preview via real DartPad (gist-based embed) */}
+                <div className="p-4 rounded-2xl bg-[#FAF8F5] border border-[#E6DFD3]">
+                  <div className="flex items-center gap-2 mb-1">
+                    <Flame size={16} className="text-[#C58B51]" />
+                    <h4 className="text-xs font-bold text-[#2C2825]">Live Flutter Preview (DartPad)</h4>
+                  </div>
+                  <p className="text-xs text-[#7C756E] leading-relaxed mb-3">
+                    Google deprecated DartPad's free source-injection, so to render the AI's Flutter
+                    code in a real DartPad canvas we push it to an anonymous GitHub gist and embed
+                    the gist. Paste a GitHub token with the <code className="font-mono">gist</code> scope
+                    to enable live previews. Without it, a faithful structural widget-tree preview is used.
+                  </p>
+                  <label className="block text-[10px] font-bold text-[#2C2825] mb-1">
+                    GitHub Gist Token (optional)
+                  </label>
+                  <input
+                    type="password"
+                    value={formData.gistToken || ''}
+                    onChange={(e) => setFormData({ ...formData, gistToken: e.target.value })}
+                    placeholder="github_pat… or ghp_… (needs gist scope)"
+                    className="w-full px-3 py-2 rounded-xl border border-[#E6DFD3] bg-white text-xs font-mono text-[#2C2825] focus:outline-none focus:border-[#C58B51]"
+                  />
+                </div>
               </div>
             )}
           </div>

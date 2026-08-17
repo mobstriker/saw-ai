@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import { Artifact } from '../types';
 import { FlutterPhoneSimulator } from './FlutterPhoneSimulator';
+import { SandpackTsxPreview } from './SandpackTsxPreview';
 import { buildHtmlPreview, buildSvgPreview, buildReactPreview, isPreviewErrorReport } from '../utils/previewBuilder';
 
 interface ArtifactViewerProps {
@@ -28,6 +29,7 @@ interface ArtifactViewerProps {
   onClose: () => void;
   onSelectArtifact?: (artifact: Artifact) => void;
   onReportBug?: (bugMessage: string) => void;
+  gistToken?: string;
 }
 
 type ViewportMode = 'responsive' | 'desktop' | 'tablet' | 'mobile';
@@ -38,6 +40,7 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
   onClose,
   onSelectArtifact,
   onReportBug,
+  gistToken,
 }) => {
   const [activeTab, setActiveTab] = useState<'preview' | 'code'>('preview');
   const [viewportMode, setViewportMode] = useState<ViewportMode>('responsive');
@@ -79,6 +82,11 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
     artifact?.title.endsWith('.jsx') ||
     artifact?.title.endsWith('.ts') ||
     artifact?.title.endsWith('.js');
+
+  const isTsxOrJsx =
+    ['tsx', 'jsx'].includes(artifact?.language.toLowerCase() || '') ||
+    artifact?.title.endsWith('.tsx') ||
+    artifact?.title.endsWith('.jsx');
 
   const hasPreview = isFlutterOrDart || isNativeMobile || isPreviewableWeb;
 
@@ -125,9 +133,9 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
         <div className="w-12 h-12 rounded-2xl bg-[#FAF8F5] border border-[#E6DFD3] flex items-center justify-center text-[#C58B51] mb-3">
           <Sparkles size={22} />
         </div>
-        <h4 className="text-sm font-bold text-[#2C2825] mb-1">No Active Artifact</h4>
+        <h4 className="text-sm font-bold text-[#2C2825] mb-1">No Active Artifact for This Chat</h4>
         <p className="text-xs text-[#7C756E] max-w-xs leading-relaxed">
-          When the AI generates code (HTML pages, Flutter apps, React components, SVGs), click &quot;View Artifact&quot; to preview it live.
+          This chat has no artifacts yet. When the AI generates code (HTML pages, Flutter apps, React components, SVGs), it will appear here. Artifacts are isolated per chat.
         </p>
       </div>
     );
@@ -388,7 +396,15 @@ export const ArtifactViewer: React.FC<ArtifactViewerProps> = ({
               title={artifact.title}
               platform={isSwift ? 'swift' : isKotlin ? 'kotlin' : 'flutter'}
               onReportBug={onReportBug}
+              gistToken={gistToken}
             />
+          ) : isTsxOrJsx ? (
+            /* TSX/JSX live preview via CodeSandbox Sandpack (real bundler +
+               npm imports). Falls back to the iframe path below for plain
+               HTML/SVG/.ts/.js. */
+            <div className="w-full h-full flex flex-col overflow-hidden p-2 sm:p-4">
+              <SandpackTsxPreview code={artifact.code} filename={artifact.title} />
+            </div>
           ) : (
             /* Live Webpage Preview (with optional Browser Chrome & Viewport Sizing) */
             <div className="w-full h-full flex flex-col items-center overflow-auto p-2 sm:p-4">

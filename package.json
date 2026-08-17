@@ -13,6 +13,7 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@codesandbox/sandpack-react": "^2.20.0",
     "@google/genai": "^2.4.0",
     "@tailwindcss/vite": "^4.1.14",
     "@tauri-apps/api": "^2.11.1",
@@ -23,6 +24,7 @@
     "dexie": "^4.4.4",
     "dexie-react-hooks": "^4.4.0",
     "dotenv": "^17.2.3",
+    "gpt-tokenizer": "^4.0.0",
     "jszip": "^3.10.1",
     "katex": "^0.18.1",
     "lucide-react": "^0.546.0",
