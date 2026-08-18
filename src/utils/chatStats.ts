@@ -1,4 +1,5 @@
 import { ChatSession, Project } from '../types';
+import { deriveArtifactTitle } from './artifactParser';
 
 export interface ChatModelTokenStat {
   model: string;
@@ -92,9 +93,11 @@ export function deriveChatStats(chat: ChatSession, projects: Project[]): ChatSta
     // Files the AI produced this turn.
     if (m.artifacts && m.artifacts.length > 0) {
       for (const a of m.artifacts) {
-        // a.title is the smart filename the markdown renderer derived; fall back
-        // to a language-based label only when no title was set.
-        const name = a.title || `${a.language || 'code'} Component`;
+        // a.title is the smart filename the markdown renderer/artifact parser
+        // derived. It is always set to a real filename (e.g. "main.dart",
+        // "calculator.py") by ArtifactParser.extractArtifacts, so we use it
+        // directly — never the old generic "<lang> Component" placeholder.
+        const name = a.title || deriveArtifactTitle(a.code, a.language, a.version || 1);
         touchedSet.add(name);
         createdSet.add(name);
       }
@@ -140,11 +143,14 @@ export function deriveChatStats(chat: ChatSession, projects: Project[]): ChatSta
 
 /** Pull filenames out of fenced code blocks in raw markdown. Matches the smart
  *  filename heuristic: a `// path/file.ext` comment on the first line, the
- *  info-string title, or falls back to `${lang} Component`. */
+ *  info-string title, or falls back to the SAME deriveArtifactTitle logic the
+ *  artifact parser uses — so the files-listed card shows the real filename
+ *  (e.g. "calculator.py"), never a generic "<lang> Component" placeholder. */
 function extractFilenamesFromContent(content: string): string[] {
   const names: string[] = [];
   const fence = /```([^\n]*)\n([\s\S]*?)```/g;
   let m: RegExpExecArray | null;
+  let idx = 1;
   while ((m = fence.exec(content)) !== null) {
     const info = (m[1] || '').trim();
     const body = m[2] || '';
@@ -155,16 +161,21 @@ function extractFilenamesFromContent(content: string): string[] {
     const pathComment = firstLine.match(/(?:\/\/|#|<!--)\s*([^\s]+\/[^\s]+)/);
     if (pathComment) {
       names.push(pathComment[1]);
+      idx++;
       continue;
     }
     // Info string with a slash looks like a path/title.
     if (info.includes('/')) {
       names.push(info);
+      idx++;
       continue;
     }
     const lang = info.split(' ')[0] || 'code';
     if (lang && !SHELL.test(lang)) {
-      names.push(`${lang} Component`);
+      // Mirror ArtifactParser.extractArtifacts exactly so the listed filename
+      // is the same real filename the file viewer / sandbox will use.
+      names.push(deriveArtifactTitle(body, lang, idx));
+      idx++;
     }
   }
   return names;

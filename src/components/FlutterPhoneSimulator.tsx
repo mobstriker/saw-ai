@@ -44,6 +44,12 @@ export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
   const [isDarkMode, setIsDarkMode] = useState(false);
   const [showDebugBanner, setShowDebugBanner] = useState(true);
   const [isHotReloading, setIsHotReloading] = useState(false);
+  // Immersive (app-only) mode for the live DartPad canvas: when ON, the
+  // DartPad embed is cropped so only the Flutter canvas shows (DartPad's own
+  // Code/Output/Console tabs are clipped out) and the app's bottom status
+  // footer is hidden — leaving just the phone + the running app. When OFF,
+  // the full DartPad IDE (code/output/console) is visible for debugging.
+  const [immersive, setImmersive] = useState(true);
 
   // ---- Native (Swift/Kotlin) parser-based preview + structural errors ----
   const nativePreview = useMemo(() => {
@@ -312,6 +318,43 @@ export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
             <span>DartPad</span>
           </a>
 
+          {/* Immersive (app-only) toggle — top-right, outside the phone.
+              Only shown when a live DartPad canvas is available (gist token
+              configured). ON = crop DartPad's code/output/console tabs and the
+              app footer so only the running app is visible inside the phone.
+              OFF = full DartPad IDE view for debugging. */}
+          {dartpadUrl && (
+            <button
+              type="button"
+              onClick={() => setImmersive((v) => !v)}
+              className="flex items-center gap-1.5 px-2 py-1 rounded-lg border transition-all cursor-pointer shrink-0"
+              style={{
+                background: immersive ? '#C58B51' : '#FAF8F5',
+                borderColor: immersive ? '#C58B51' : '#E6DFD3',
+                color: immersive ? '#fff' : '#7C756E',
+              }}
+              title={
+                immersive
+                  ? 'Immersive mode ON — showing only the app. Click to show DartPad code/output/console for debugging.'
+                  : 'Immersive mode OFF — full DartPad view (code/output/console). Click for app-only view.'
+              }
+            >
+              <span
+                className="relative inline-flex h-3 w-5 items-center rounded-full transition-colors"
+                style={{ background: immersive ? '#fff' : '#E6DFD3' }}
+              >
+                <span
+                  className="inline-block h-2.5 w-2.5 transform rounded-full bg-white shadow transition-transform"
+                  style={{
+                    transform: immersive ? 'translateX(9px)' : 'translateX(1px)',
+                    background: immersive ? '#C58B51' : '#A09890',
+                  }}
+                />
+              </span>
+              <span className="text-[10px] font-bold">App Only</span>
+            </button>
+          )}
+
           {/* DEBUG button — gray=no-op, red=send bug to AI */}
           <button
             type="button"
@@ -382,16 +425,52 @@ export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
                   overlay when the analyzer reports bugs, (3) structural
                   widget-tree approximation, (4) empty placeholder. */}
               {isFlutter ? (
-                <div className="flex-1 flex flex-col relative overflow-y-auto">
+                <div className="flex-1 flex flex-col relative overflow-hidden">
                   {dartpadUrl ? (
-                    <iframe
-                      key={dartpadUrl}
-                      src={dartpadUrl}
-                      title="DartPad live preview"
-                      className="flex-1 w-full border-0 bg-white"
-                      sandbox="allow-scripts allow-same-origin allow-popups allow-forms"
-                      allow="autoplay; clipboard-read; clipboard-write"
-                    />
+                    /*
+                      DartPad's embed-flutter.html renders its OWN tab bar
+                      (UI/Code/Output/Console) at the top of the iframe, plus a
+                      console at the bottom. We can't inject CSS (cross-origin),
+                      but the phone screen is `overflow-hidden`, so:
+                        - Immersive ON  → crop: render the iframe taller than the
+                          visible area and translate it upward so DartPad's top
+                          tab bar (~44px) is clipped off the top edge, and the
+                          bottom console area is clipped off the bottom. Only
+                          the Flutter canvas remains inside the phone bezel. The
+                          app's own status footer is hidden too → phone + app
+                          only.
+                        - Immersive OFF → show the full DartPad IDE (code/output/
+                          console) inside the phone for debugging, plus the app
+                          footer.
+                    */
+                    immersive ? (
+                      <div className="flex-1 relative overflow-hidden bg-white">
+                        <iframe
+                          key={dartpadUrl}
+                          src={dartpadUrl}
+                          title="DartPad live preview"
+                          // Taller than the viewport and shifted up so DartPad's
+                          // top tab bar is clipped; bottom is clipped by the
+                          // container. Empirically the embed tab bar is ~44px.
+                          className="absolute left-0 right-0 top-0 w-full border-0 bg-white"
+                          style={{
+                            height: 'calc(100% + 44px)',
+                            marginTop: '-44px',
+                          }}
+                          sandbox="allow-scripts allow-same-origin allow-popups allow-forms"
+                          allow="autoplay; clipboard-read; clipboard-write"
+                        />
+                      </div>
+                    ) : (
+                      <iframe
+                        key={dartpadUrl}
+                        src={dartpadUrl}
+                        title="DartPad live preview (debug)"
+                        className="flex-1 w-full border-0 bg-white"
+                        sandbox="allow-scripts allow-same-origin allow-popups allow-forms"
+                        allow="autoplay; clipboard-read; clipboard-write"
+                      />
+                    )
                   ) : dartFallback?.rendered ? (
                     <div className="flex-1 overflow-y-auto">{dartFallback.rendered}</div>
                   ) : (
@@ -417,22 +496,26 @@ export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
                       <p className="text-[10px] text-gray-400">Tap the red DEBUG button to send this to the AI for fixing.</p>
                     </div>
                   )}
-                  <div className="shrink-0 px-3 py-1.5 bg-[#FAF8F5] border-t border-[#E6DFD3] flex items-center gap-1.5 text-[10px] text-[#7C756E]">
-                    <Flame size={11} className="text-[#C58B51]" />
-                    <span>
-                      {dartpadUrl
-                        ? 'Live DartPad canvas (real Flutter renderer via gist).'
-                        : dartpadError
-                        ? `DartPad unavailable — ${dartpadError}. Showing structural preview.`
-                        : !gistToken
-                        ? 'Structural preview. Add a GitHub gist token in Settings for a live DartPad canvas.'
-                        : flutterAnalyzing
-                        ? 'Analyzing with the Dart compiler…'
-                        : hasBug
-                        ? 'Compile error detected — DEBUG to fix.'
-                        : 'Live Dart analysis passed · structural Flutter preview.'}
-                    </span>
-                  </div>
+                  {/* Status footer — hidden in immersive mode so only the app
+                      shows inside the phone. */}
+                  {!immersive && (
+                    <div className="shrink-0 px-3 py-1.5 bg-[#FAF8F5] border-t border-[#E6DFD3] flex items-center gap-1.5 text-[10px] text-[#7C756E]">
+                      <Flame size={11} className="text-[#C58B51]" />
+                      <span>
+                        {dartpadUrl
+                          ? 'Live DartPad canvas (real Flutter renderer via gist).'
+                          : dartpadError
+                          ? `DartPad unavailable — ${dartpadError}. Showing structural preview.`
+                          : !gistToken
+                          ? 'Structural preview. Add a GitHub gist token in Settings for a live DartPad canvas.'
+                          : flutterAnalyzing
+                          ? 'Analyzing with the Dart compiler…'
+                          : hasBug
+                          ? 'Compile error detected — DEBUG to fix.'
+                          : 'Live Dart analysis passed · structural Flutter preview.'}
+                      </span>
+                    </div>
+                  )}
                 </div>
               ) : (
                 /* Swift / Kotlin faithful translator preview */

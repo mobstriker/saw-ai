@@ -1535,16 +1535,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 <div>
                   <label className="text-xs font-bold text-[#2C2825] mb-1.5 block">Search Provider</label>
                   <select
-                    value={formData.webSearchProvider || 'duckduckgo'}
-                    onChange={(e) => setFormData({ ...formData, webSearchProvider: e.target.value as 'duckduckgo' | 'tavily' })}
+                    value={formData.webSearchProvider || 'duckduckgo_wikipedia'}
+                    onChange={(e) => setFormData({ ...formData, webSearchProvider: e.target.value as 'duckduckgo' | 'wikipedia' | 'duckduckgo_wikipedia' | 'tavily' })}
                     className="w-full px-3 py-2 rounded-lg border border-[#E6DFD3] bg-white text-xs text-[#2C2825] focus:outline-none focus:ring-2 focus:ring-[#C58B51]/40"
                   >
-                    <option value="duckduckgo">DuckDuckGo (free, no key — works for weather/news/live data)</option>
+                    <option value="duckduckgo_wikipedia">DuckDuckGo + Wikipedia (free, no key — best free coverage)</option>
+                    <option value="duckduckgo">DuckDuckGo (free, no key — weather/news/live data)</option>
+                    <option value="wikipedia">Wikipedia (free, no key — encyclopedic lookups)</option>
                     <option value="tavily">Tavily (best quality — needs API key below)</option>
                   </select>
                 </div>
 
-                {(formData.webSearchProvider || 'duckduckgo') === 'tavily' && (
+                {(formData.webSearchProvider || 'duckduckgo_wikipedia') === 'tavily' && (
                   <div>
                     <label className="text-xs font-bold text-[#2C2825] mb-1.5 block">Tavily API Key</label>
                     <input

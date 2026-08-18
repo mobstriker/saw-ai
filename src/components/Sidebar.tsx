@@ -534,25 +534,41 @@ export const Sidebar: React.FC<SidebarProps> = ({
                                   </div>
                                 </div>
                               </div>
-                              {/* Per-model breakdown */}
+                              {/* Per-model breakdown — Input / Output / Total for each model */}
                               {stats.perModel.length > 0 ? (
                                 <div className="space-y-1.5">
-                                  <div className="text-[9px] font-bold text-[#A09890] uppercase tracking-wide">Per model</div>
+                                  <div className="flex items-center justify-between">
+                                    <div className="text-[9px] font-bold text-[#A09890] uppercase tracking-wide">Per model</div>
+                                    {/* inline column legend */}
+                                    <div className="flex items-center gap-2 text-[8px] font-bold text-[#A09890] uppercase tracking-wide">
+                                      <span className="flex items-center gap-0.5"><ArrowDownRight size={9} />In</span>
+                                      <span className="flex items-center gap-0.5"><ArrowUpRight size={9} />Out</span>
+                                      <span>Total</span>
+                                    </div>
+                                  </div>
                                   {stats.perModel.map((s) => {
                                     const pct = stats.totalTokens > 0 ? (s.tokens / stats.totalTokens) * 100 : 0;
                                     return (
                                       <div key={s.model} className="rounded-lg bg-white border border-[#E6DFD3] px-2.5 py-1.5">
-                                        <div className="flex items-center justify-between mb-1">
-                                          <span className="text-[11px] font-mono text-[#2C2825] truncate max-w-[200px]">{s.model}</span>
-                                          <span className="text-[11px] font-mono font-bold text-[#C58B51]">
-                                            {s.tokens.toLocaleString()}
-                                            <span className="text-[#A09890] font-normal"> ({s.responses}x)</span>
-                                          </span>
+                                        {/* model name + response count + share bar */}
+                                        <div className="flex items-center justify-between mb-1.5">
+                                          <span className="text-[11px] font-mono text-[#2C2825] truncate max-w-[180px]">{s.model}</span>
+                                          <span className="text-[9px] text-[#A09890] font-mono shrink-0">{s.responses}× · {pct.toFixed(0)}%</span>
                                         </div>
-                                        <div className="flex items-center gap-1.5 text-[9px] text-[#7C756E] font-mono mb-1">
-                                          <span>↓{s.inputTokens.toLocaleString()}</span>
-                                          <span className="text-[#E6DFD3]">·</span>
-                                          <span>↑{s.outputTokens.toLocaleString()}</span>
+                                        {/* Input / Output / Total row per model */}
+                                        <div className="grid grid-cols-3 gap-1.5 mb-1">
+                                          <div className="rounded-md bg-[#FAF8F5] border border-[#E6DFD3] px-1.5 py-1 text-center">
+                                            <div className="text-[8px] font-bold text-[#A09890] uppercase tracking-wide mb-0.5">Input</div>
+                                            <div className="text-[11px] font-mono font-bold text-[#2C2825]">{s.inputTokens.toLocaleString()}</div>
+                                          </div>
+                                          <div className="rounded-md bg-[#FAF8F5] border border-[#E6DFD3] px-1.5 py-1 text-center">
+                                            <div className="text-[8px] font-bold text-[#A09890] uppercase tracking-wide mb-0.5">Output</div>
+                                            <div className="text-[11px] font-mono font-bold text-[#2C2825]">{s.outputTokens.toLocaleString()}</div>
+                                          </div>
+                                          <div className="rounded-md bg-[#F5E6D3] border border-[#C58B51]/30 px-1.5 py-1 text-center">
+                                            <div className="text-[8px] font-bold text-[#C58B51] uppercase tracking-wide mb-0.5">Total</div>
+                                            <div className="text-[11px] font-mono font-bold text-[#C58B51]">{s.tokens.toLocaleString()}</div>
+                                          </div>
                                         </div>
                                         <div className="h-1 rounded-full bg-[#F5E6D3] overflow-hidden">
                                           <div className="h-full bg-[#C58B51]" style={{ width: `${pct}%` }} />
@@ -560,6 +576,21 @@ export const Sidebar: React.FC<SidebarProps> = ({
                                       </div>
                                     );
                                   })}
+                                  {/* All-models total row */}
+                                  <div className="rounded-lg bg-[#F5E6D3] border border-[#C58B51]/30 px-2.5 py-1.5">
+                                    <div className="flex items-center justify-between mb-1">
+                                      <span className="text-[10px] font-bold text-[#C58B51] uppercase tracking-wide">All models</span>
+                                      <span className="text-[11px] font-mono font-bold text-[#C58B51]">{stats.totalTokens.toLocaleString()}</span>
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-1.5">
+                                      <div className="flex items-center gap-1 text-[9px] text-[#7C756E] font-mono">
+                                        <ArrowDownRight size={9} /> {stats.totalInputTokens.toLocaleString()}
+                                      </div>
+                                      <div className="flex items-center gap-1 text-[9px] text-[#7C756E] font-mono justify-end">
+                                        <ArrowUpRight size={9} /> {stats.totalOutputTokens.toLocaleString()}
+                                      </div>
+                                    </div>
+                                  </div>
                                 </div>
                               ) : (
                                 <div className="text-[10px] text-[#A09890] text-center py-1">No responses yet</div>

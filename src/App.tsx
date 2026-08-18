@@ -90,6 +90,30 @@ function isHttpProviderError(e: any): e is HttpProviderError {
   return e && typeof e.status === 'number';
 }
 
+/** Extract the human-readable error message from a provider error JSON body.
+ *  Providers nest the message in many shapes:
+ *    OpenAI:   { error: { message: "...", type, code } }
+ *    Anthropic:{ error: { type, message: "..." } }
+ *    Gemini:   { error: { code, message: "...", status } }
+ *    DeepSeek/Together/custom: { message: "..." } or { error: "..." }
+ *  Fall back to the raw body string, then to the HTTP status. This guarantees
+ *  the REAL cause (e.g. "model_not_found", "unknown parameter") is surfaced
+ *  in the error card instead of a generic "HTTP 400" that reads like a quota
+ *  issue. */
+function extractProviderErrorMessage(json: any, status: number, rawText?: string): string {
+  if (!json) return rawText?.trim() || `HTTP ${status}`;
+  if (typeof json === 'string') return json;
+  if (typeof json.message === 'string') return json.message;
+  if (typeof json.error === 'string') return json.error;
+  if (json.error && typeof json.error === 'object') {
+    if (typeof json.error.message === 'string') return json.error.message;
+    if (typeof json.error.type === 'string') return `${json.error.type}: ${json.error.message || ''}`.trim();
+  }
+  if (json.detail && typeof json.detail === 'string') return json.detail;
+  if (rawText && rawText.length < 500) return rawText.trim();
+  return `HTTP ${status}`;
+}
+
 /**
  * Accumulate streamed OpenAI-style tool_call deltas into a map keyed by the
  * tool_call index. The first delta for a given index carries `id` + `name`;
@@ -1192,9 +1216,11 @@ Only produce code, code files, or artifacts when the user's current message expl
       });
 
       if (!response.ok) {
-        const errJson = await response.json().catch(() => ({}));
+        const errRawText = await response.text().catch(() => '');
+        let errJson: any = {};
+        try { errJson = JSON.parse(errRawText); } catch { errJson = {}; }
         throw new HttpProviderError(
-          errJson.message || errJson.error || `HTTP ${response.status}`,
+          extractProviderErrorMessage(errJson, response.status, errRawText),
           response.status,
         );
       }
@@ -1588,8 +1614,19 @@ Only produce code, code files, or artifacts when the user's current message expl
       ? priorMessagesOverride
       : (targetChat ? targetChat.messages : []);
 
-    // Check if web search is genuinely needed for this query (incorporating chat history for follow-ups)
-    const willSearchWeb = IntentDetector.shouldSearchWeb(userPrompt, useWebSearch, baseHistory);
+    // Check if web search is genuinely needed for this query (incorporating chat history for follow-ups).
+    //
+    // IMPORTANT (fixes "connected but not truly connected"): when the user has
+    // EXPLICITLY enabled web search (the chat-bar toggle or the default-on
+    // setting → useWebSearch === true), we ALWAYS run a search. The intent
+    // detector is only used to REFINE the query (resolve pronouns/context) — it
+    // must never suppress a search the user explicitly turned on. Previously,
+    // the detector returned false for queries that didn't match its keyword/
+    // pattern rules, so an enabled search silently did nothing and the AI never
+    // received web context. Now: enabled ⇒ search (the detector's role is only
+    // to shape the query, gated below). The detector can still ADD a search for
+    // real-time/factual queries when the toggle is off.
+    const willSearchWeb = useWebSearch || IntentDetector.shouldSearchWeb(userPrompt, useWebSearch, baseHistory);
 
     // Contextually resolve the exact search query (e.g. resolving pronouns, locations from prior turns)
     const resolvedSearchQuery = willSearchWeb
@@ -1722,7 +1759,9 @@ Only produce code, code files, or artifacts when the user's current message expl
     let completedNativeToolCalls: Array<{ id: string; name: string; arguments: string }> = [];
 
     try {
-      // 2. Perform Web Search ONLY if IntentDetector verified it is genuinely required
+      // 2. Perform Web Search when enabled or when the intent detector flagged
+      // a real-time/factual query. (See willSearchWeb above: an explicitly enabled
+      // toggle always searches, so the AI genuinely receives web context.)
       if (willSearchWeb) {
         setAiStatus('searching_web');
         try {
@@ -1732,7 +1771,7 @@ Only produce code, code files, or artifacts when the user's current message expl
             body: JSON.stringify({
               query: resolvedSearchQuery || userPrompt,
               maxResults: settings.webSearchMaxResults || 5,
-              provider: settings.webSearchProvider || 'duckduckgo',
+              provider: settings.webSearchProvider || 'duckduckgo_wikipedia',
               apiKey: settings.webSearchApiKey || '',
             }),
             signal: controller.signal,
@@ -1746,6 +1785,27 @@ Only produce code, code files, or artifacts when the user's current message expl
         } catch (sErr) {
           console.warn('Web search fetch error:', sErr);
         }
+      }
+
+      // Attach the grounded search results to the USER message so the
+      // "Web Search Grounding (N sources)" pill renders and the user can see
+      // the search actually communicated (fixes "connected but not truly
+      // connected" — now there's a visible indicator + the AI receives the
+      // injected context).
+      if (webSearchResults.length > 0) {
+        const umId = userMessage.id;
+        setChats((prev) =>
+          prev.map((c) =>
+            c.id === chatTargetId
+              ? {
+                  ...c,
+                  messages: c.messages.map((m) =>
+                    m.id === umId ? { ...m, searchResults: webSearchResults } : m
+                  ),
+                }
+              : c
+          )
+        );
       }
 
       // If reasoning mode is active, set status to thinking
@@ -1861,7 +1921,21 @@ When handling complex multi-step tasks:
             ? 'Each command you emit will be shown to the user for approval before it runs.'
             : 'Each command you emit runs automatically (the user chose Auto Planner).';
         fullSystemPrompt += `\n\n# Sandbox Command Execution (granted by user)
-You have been granted access to run commands in the user's restricted in-app sandbox — a real jailed shell (NOT just an allowlist). When the task calls for building, installing, or running code, emit the command(s) in a fenced bash/sh code block (or <sandbox_run>...</sandbox_run>). ${approvalNote} The sandbox runs a real shell, so you may use cd, &&, pipes, redirects, and quoted arguments; the available toolchain includes: ${allowList}. Each command runs in the project's sandbox workdir, whose files (including the code you produced this turn) are seeded first — so \`python <file>.py\`, \`npm run dev\`, \`flutter build apk\`, etc. work by name. The stdout/stderr and exit code are returned to you automatically — read them and continue. The sandbox is jailed: it cannot read or write outside the app's sandbox folder, so do not try to access the host filesystem. Do NOT emit commands you don't intend to run (e.g. as illustrative examples); if you only want to show a command without running it, use a plain (non-shell) code block or say so explicitly.`;
+You have been granted access to run commands in the user's restricted in-app sandbox — a real jailed shell (NOT just an allowlist). When the task calls for building, installing, or running code, emit the command(s) in a fenced bash/sh code block (or <sandbox_run>...</sandbox_run>). ${approvalNote} The sandbox runs a real shell, so you may use cd, &&, pipes, redirects, and quoted arguments; the available toolchain includes: ${allowList}. Each command runs in the project's sandbox workdir, whose files (including the code you produced this turn) are seeded first — so \`python <file>.py\`, \`npm run dev\`, \`flutter build apk\`, etc. work by name. The stdout/stderr and exit code are returned to you automatically — read them and continue. The sandbox is jailed: it cannot read or write outside the app's sandbox folder, so do not try to access the host filesystem. Do NOT emit commands you don't intend to run (e.g. as illustrative examples); if you only want to show a command without running it, use a plain (non-shell) code block or say so explicitly.
+
+## CRITICAL — Naming files you create (filename consistency)
+Every code artifact you produce in this chat becomes a REAL file in the sandbox workdir, named from the FIRST line of the code block. You MUST begin EVERY code block with an explicit filename comment naming the file you intend to create, in the form:
+  // path/to/file.ext   (or for non-C-like langs: # file.ext, <!-- file.html -->)
+Examples:
+  \`\`\`python
+  // calculator.py
+  def main(): ...
+  \`\`\`
+  \`\`\`tsx
+  // src/components/Counter.tsx
+  export default function Counter() { ... }
+  \`\`\`
+Then reference that EXACT name when you emit a run command (\`python calculator.py\`, not a guessed name). The sandbox seeds files under these names, so the name in the comment and the name in your run command MUST match — otherwise the run fails with "file not found". Never let the app auto-derive a placeholder name; always state the filename yourself. When editing an existing file, reuse its existing path/name as the comment.`;
       }
 
       let parsedHeaders = {};
@@ -1894,9 +1968,11 @@ You have been granted access to run commands in the user's restricted in-app san
       });
 
       if (!response.ok) {
-        const errJson = await response.json().catch(() => ({}));
+        const errRawText = await response.text().catch(() => '');
+        let errJson: any = {};
+        try { errJson = JSON.parse(errRawText); } catch { errJson = {}; }
         throw new HttpProviderError(
-          errJson.message || errJson.error || `HTTP ${response.status}`,
+          extractProviderErrorMessage(errJson, response.status, errRawText),
           response.status,
         );
       }
@@ -2395,11 +2471,27 @@ You have been granted access to run commands in the user's restricted in-app san
               err.message?.includes('exceeded your current quota')
             ));
 
+          // Provider-side 4xx (not 401/429): a REAL HTTP response with a real
+          // error body — e.g. 400 "unknown parameter reasoning_effort", 404
+          // "model not found", 403 forbidden. These are NOT quota errors and
+          // NOT transport interruptions; they must surface the true cause so a
+          // fresh API key + a wrong model name isn't misread as "quota". Show
+          // the real HTTP status + provider message.
+          const isProvider4xx =
+            httpStatus >= 400 && httpStatus < 500 && httpStatus !== 401 && httpStatus !== 429;
+
           let errorContent = '';
           if (isApiKeyError) {
             errorContent = `⚠️ **API Key Configuration Required**\n\nTo connect to your configured model, please enter your API key in **Settings** (⚙️).\n\n*Click the "Open Settings" button in the top header or sidebar to configure your key.*`;
           } else if (isQuotaError) {
             errorContent = `⚠️ **API Rate Limit / Quota Exceeded**\n\nYour model provider reported a quota limit (\`RESOURCE_EXHAUSTED\` / \`429\`):\n\n> *${err.message}*\n\n**Recommended Solutions:**\n- ⏳ **Wait 30–60 seconds** for the model provider's rate limit window to reset.\n- ⚙️ **Switch Model/Profile:** Open **Settings (⚙️)** to switch to a different model (e.g., Claude 3.5 Sonnet, GPT-4o, DeepSeek R1, or another Gemini tier).\n- 🔑 **Custom Key:** If using your own API key, check your quota and billing tier in your provider's developer console.`;
+          } else if (isProvider4xx) {
+            // Surface the REAL provider error with its HTTP status so the user
+            // sees the actual cause (e.g. "400 model_not_found", "400 unknown
+            // parameter reasoning_effort") instead of a misleading generic
+            // banner. This is the common cause of "fresh key but it errors"
+            // complaints — the key is fine; the model/param is wrong.
+            errorContent = `⚠️ **Provider Error (HTTP ${httpStatus})**\n\n${err.message || 'The model provider rejected the request.'}\n\n**What to check:**\n- Verify the **Base URL** and **Model name** in Settings (⚙️) match your provider exactly (e.g. a typo'd model name returns 404).\n- If the message mentions an unknown parameter, it usually means your provider doesn't support that option (e.g. reasoning_effort) — try switching Reasoning Mode to **Off**.\n- A fresh API key does NOT cause this; it's a request-shape problem. Open Settings (⚙️) to adjust.`;
           } else if (existingPartialContent) {
             // Transport interruption with partial content: NOT a hard error.
             // Keep what the model produced and offer Continue/Retry. Do not
@@ -2568,20 +2660,34 @@ You have been granted access to run commands in the user's restricted in-app san
         sandboxStore.pushLog('status', `[agent] Sandbox follow-up round ${round}: ${commands.length} command(s) proposed by AI.`, 'agent');
         const followChat = chats.find((c) => c.id === completedChatId);
         const proj = followChat?.projectId ? projects.find((p) => p.id === followChat.projectId) || null : null;
-        // Seed the latest Python artifact for any `python <file>` command so the
-        // agent loop runs the AI's actual code.
+        // Seed ALL code artifacts from the AI's latest response into the run
+        // workdir by their REAL title (the same filename the artifact parser
+        // / file viewer / files-list uses), so `python <file>.py`, `node
+        // <file>.js`, and multi-file imports all resolve by name. This fixes
+        // the inconsistency where the app named a file "python_1.py" but the
+        // AI referenced "calculator.py" — now every artifact the AI produced
+        // this turn is written under its real title, and the AI is told (via
+        // the system prompt) to name files explicitly so they match.
         const seedFiles = (() => {
           if (!followChat) return undefined;
+          const byPath = new Map<string, { path: string; content: string }>();
+          // Walk from the most recent assistant turn backwards; collect every
+          // code artifact (dedup by path). This catches the file the AI just
+          // wrote plus any companions from earlier turns in the same chat.
           for (let i = followChat.messages.length - 1; i >= 0; i--) {
             const m = followChat.messages[i];
             if (m.role !== 'assistant' || !m.content) continue;
             const arts = ArtifactParser.extractArtifacts(m.content);
-            const py = arts.find(
-              (a) => a.language.toLowerCase() === 'python' || a.title.endsWith('.py'),
-            );
-            if (py) return [{ path: py.title || 'main.py', content: py.code }];
+            for (const a of arts) {
+              // a.title is the real filename the parser derived (e.g.
+              // "calculator.py"); it's what the file viewer & sandbox should
+              // both reference. Skip markdown/empty.
+              if (!a.title || !a.code) continue;
+              const p = a.title.startsWith('/') ? a.title.slice(1) : a.title;
+              if (!byPath.has(p)) byPath.set(p, { path: p, content: a.code });
+            }
           }
-          return undefined;
+          return byPath.size > 0 ? Array.from(byPath.values()) : undefined;
         })();
         try {
           const result = await runSandboxAgentStep(commands, {

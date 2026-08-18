@@ -438,12 +438,37 @@ export const MessageItem: React.FC<MessageItemProps> = React.memo(({
           </div>
         )}
 
-        {/* Connection Error Notification Card with Retry */}
+        {/* Connection Error Notification Card with Retry.
+            Shows the REAL provider error (HTTP status + message) so the user
+            can see the true cause (e.g. "400 model not found", "unknown
+            parameter reasoning_effort") instead of a generic line — which made
+            real 400s look like a confusing quota issue. The error text is
+            stored on message.content by the App's error classifier. */}
         {message.isError && !message.isStopped && onRetry && (
-          <div className="mt-3 p-3 rounded-xl bg-[#FAF8F5] border border-rose-200 flex items-center justify-between gap-3">
-            <span className="text-xs font-medium text-rose-800">
-              An error occurred during generation.
-            </span>
+          <div className="mt-3 p-3 rounded-xl bg-[#FAF8F5] border border-rose-200 flex items-start justify-between gap-3">
+            <div className="flex-1 min-w-0">
+              <div className="text-xs font-semibold text-rose-800 mb-1">
+                An error occurred during generation.
+              </div>
+              {(() => {
+                // Surface the real provider error text if present.
+                const raw = (message.content || '').trim();
+                if (!raw) return null;
+                // Strip the leading "⚠️ **...**" markdown header line if the
+                // content is one of the styled error banners; show the detail.
+                const lines = raw.split('\n').filter(Boolean);
+                const detail = lines
+                  .filter((l) => !/^>\s*\*?/.test(l) && !/^\s*\*\*/.test(l))
+                  .join(' ')
+                  .trim();
+                const shown = detail || raw;
+                return (
+                  <div className="text-[11px] font-mono text-rose-700/90 break-words max-h-24 overflow-auto">
+                    {shown.length > 400 ? shown.slice(0, 400) + '…' : shown}
+                  </div>
+                );
+              })()}
+            </div>
             <button
               type="button"
               onClick={() => onRetry(message.id)}

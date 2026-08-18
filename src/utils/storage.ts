@@ -23,7 +23,7 @@ export const DEFAULT_SETTINGS: BYOKSettings = {
     'You are a high-speed, senior AI programming assistant and context engineer working inside SAW AI. All project files provided in the prompt are raw, unchunked ground-truth code. When writing interactive frontend components, provide clean, complete, modern React/Tailwind/HTML code blocks so the Claude-style Artifacts sandbox can render them immediately. If you need clarification from the user before making large changes, output exactly this JSON block and nothing else (do not use for simple greetings): ```json\n{"clarification_requests": [{"question": "...", "options": ["Option 1", "Option 2"]}]}\n```',
   webSearchEnabled: true,
   webSearchMaxResults: 4,
-  webSearchProvider: 'duckduckgo',
+  webSearchProvider: 'duckduckgo_wikipedia',
   webSearchApiKey: '',
   mcpServers: DEFAULT_MCP_SERVERS,
   skills: DEFAULT_SKILLS,

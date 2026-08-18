@@ -139,7 +139,6 @@ export async function universalFetch(
 
 export async function performChatRequest(payloadObj: any) {
   const { baseUrl: targetUrl, apiKey, model, messages, stream, system_prompt, custom_headers, max_tokens, reasoning_effort, web_search_context, mcp_tools } = payloadObj.body ? JSON.parse(payloadObj.body) : payloadObj;
-
   // --- Transparency guards: fail loudly instead of silently falling back ---
   if (!targetUrl || !targetUrl.trim()) {
     throw new Error('No API endpoint configured. Add an AI profile in Settings (⚙️) and enter a Base URL.');
@@ -220,6 +219,16 @@ export async function performChatRequest(payloadObj: any) {
     fetchPayload.max_tokens = max_tokens;
   }
 
+  // Reasoning effort: only send when explicitly enabled (not 'off'). Many
+  // OpenAI-compatible providers reject the unknown `reasoning_effort` field (or
+  // an unsupported value) with a 400 "unknown parameter", which the old code
+  // triggered on EVERY request — even for plain chat — because it always sent
+  // the field. Omitting it when 'off' keeps the request clean for providers
+  // that don't support extended thinking.
+  if (reasoning_effort && reasoning_effort !== 'off') {
+    fetchPayload.reasoning_effort = reasoning_effort;
+  }
+
   // MCP tools: advertise them to the provider as native function-calling
   // tools so models that support tool_calls invoke them directly. Each tool is
   // namespaced as "<serverName>/<toolName>" so the app can route the returned
@@ -258,17 +267,27 @@ export async function performChatRequest(payloadObj: any) {
 
 /**
  * Key-free, CORS-friendly web search.
- * Combines the DuckDuckGo Instant Answer API (instant answers / abstracts)
- * with the Wikipedia search API (full result lists). Neither requires an API
- * key and both send `Access-Control-Allow-Origin: *`, so they work directly
- * from the Tauri webview / browser with no backend proxy.
+ *
+ * The provider selected in Settings decides which backends run:
+ *   - 'duckduckgo'         → DuckDuckGo HTML results + Instant Answer API
+ *   - 'wikipedia'          → Wikipedia search API only
+ *   - 'duckduckgo_wikipedia' (default) → DuckDuckGo + Wikipedia (best free mix)
+ *   - 'tavily'             → Tavily API (needs a key); falls back to DDG on failure
+ *
+ * DuckDuckGo and Wikipedia require no API key and both send permissive CORS
+ * headers (or work through the Tauri http plugin on desktop, which bypasses
+ * CORS), so they work directly from the webview/browser with no backend proxy.
  */
 export async function performSearchRequest(payloadObj: any) {
   const parsed = payloadObj.body ? JSON.parse(payloadObj.body) : payloadObj;
   const { query, maxResults, provider, apiKey } = parsed;
   const q = (query || '').trim();
   const limit = Math.max(1, Math.min(maxResults || 5, 8));
-  const backend = provider || 'duckduckgo';
+  const backend = provider || 'duckduckgo_wikipedia';
+
+  const results: any[] = [];
+  // Track whether the AI will actually receive search context; the caller can
+  // read this to show a "grounded N results" indicator.
 
   // Tavily — highest quality, needs a key. Returns clean answer + sources.
   if (backend === 'tavily' && apiKey) {
@@ -286,7 +305,6 @@ export async function performSearchRequest(payloadObj: any) {
       });
       if (tvRes.ok) {
         const tv = await tvRes.json();
-        const results: any[] = [];
         if (tv.answer) {
           results.push({ title: 'Tavily answer', snippet: tv.answer, url: '' });
         }
@@ -296,96 +314,101 @@ export async function performSearchRequest(payloadObj: any) {
           }
         }
         if (results.length > 0) {
-          return { ok: true, json: async () => ({ results: results.slice(0, limit) }) };
+          return { ok: true, json: async () => ({ results: results.slice(0, limit), grounded: true }) };
         }
       }
     } catch {
-      // fall through to DuckDuckGo
+      // fall through to free backends
     }
   }
 
-  const results: any[] = [];
+  // DuckDuckGo HTML results — the KEY free path. The old code used the Instant
+  // Answer API, which returns an abstract ONLY for encyclopedic/dictionary
+  // queries and NOTHING for weather/news/live prices/current events. The HTML
+  // results page returns real ranked web results for EVERY query type. We fetch
+  // it through universalFetch (the Tauri http plugin in the desktop build
+  // bypasses CORS, so this works there; in the pure-web build it may be
+  // CORS-blocked and we fall back to the IA API + Wikipedia below).
+  const useDdg = backend === 'duckduckgo' || backend === 'duckduckgo_wikipedia' || (backend === 'tavily' && results.length === 0);
+  if (useDdg) {
+    try {
+      const ddgHtmlUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`;
+      const ddgHtmlRes = await universalFetch(ddgHtmlUrl, {
+        headers: { Accept: 'text/html,application/xhtml+xml' },
+        signal: payloadObj.signal,
+      });
+      if (ddgHtmlRes.ok) {
+        const html = await ddgHtmlRes.text();
+        // Each organic result lives in a `.result` block with `.result__a` (title+url)
+        // and `.result__snippet` (text). Parse defensively.
+        const resultBlocks = html.split(/class="result\s/);
+        for (const block of resultBlocks.slice(1)) {
+          if (results.length >= limit) break;
+          const titleMatch = block.match(/class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i);
+          const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/(?:a|td|div|span)>/i);
+          if (titleMatch) {
+            let url = titleMatch[1] || '';
+            // DDG wraps URLs in a redirect (//duckduckgo.com/l/?uddg=<encoded>); unwrap.
+            const uddg = url.match(/uddg=([^&]+)/);
+            if (uddg) url = decodeURIComponent(uddg[1]);
+            const title = decodeHtml(titleMatch[2].replace(/<[^>]+>/g, '').trim());
+            const snippet = snippetMatch ? decodeHtml(snippetMatch[1].replace(/<[^>]+>/g, '').trim()) : '';
+            if (title && !results.some((r) => r.title === title)) {
+              results.push({ title, snippet, url });
+            }
+          }
+        }
+      }
+    } catch {
+      // CORS/network — fall through to IA API + Wikipedia
+    }
 
-  // DuckDuckGo HTML results — the KEY fix. The old code used the Instant Answer
-  // API, which returns an abstract ONLY for encyclopedic/dictionary queries and
-  // NOTHING for weather/news/live prices/current events. The HTML results page
-  // returns real ranked web results for EVERY query type. We fetch it through
-  // universalFetch (the Tauri http plugin in the desktop build bypasses CORS, so
-  // this works there; in the pure-web build it may be CORS-blocked and we fall
-  // back to the IA API + Wikipedia below).
-  try {
-    const ddgHtmlUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`;
-    const ddgHtmlRes = await universalFetch(ddgHtmlUrl, {
-      headers: { Accept: 'text/html,application/xhtml+xml' },
-      signal: payloadObj.signal,
-    });
-    if (ddgHtmlRes.ok) {
-      const html = await ddgHtmlRes.text();
-      // Each organic result lives in a `.result` block with `.result__a` (title+url)
-      // and `.result__snippet` (text). Parse defensively.
-      const resultBlocks = html.split(/class="result\s/);
-      for (const block of resultBlocks.slice(1)) {
-        if (results.length >= limit) break;
-        const titleMatch = block.match(/class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i);
-        const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/(?:a|td|div|span)>/i);
-        if (titleMatch) {
-          let url = titleMatch[1] || '';
-          // DDG wraps URLs in a redirect (//duckduckgo.com/l/?uddg=<encoded>); unwrap.
-          const uddg = url.match(/uddg=([^&]+)/);
-          if (uddg) url = decodeURIComponent(uddg[1]);
-          const title = decodeHtml(titleMatch[2].replace(/<[^>]+>/g, '').trim());
-          const snippet = snippetMatch ? decodeHtml(snippetMatch[1].replace(/<[^>]+>/g, '').trim()) : '';
-          if (title && !results.some((r) => r.title === title)) {
+    // DuckDuckGo Instant Answer API — supplement (good for definitions/abstracts).
+    try {
+      const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(q)}&format=json&no_redirect=1&no_html=1&skip_disambig=1`;
+      const ddgRes = await universalFetch(ddgUrl, { signal: payloadObj.signal });
+      if (ddgRes.ok) {
+        const ddg = await ddgRes.json();
+        const abstractText = (ddg.AbstractText || '').trim();
+        const abstractUrl = (ddg.AbstractURL || '').trim();
+        const heading = (ddg.Heading || '').trim();
+        if (abstractText && !results.some((r) => r.snippet === abstractText)) {
+          results.unshift({ title: heading || q, snippet: abstractText, url: abstractUrl || '' });
+        }
+      }
+    } catch {
+      // best-effort
+    }
+  }
+
+  // Wikipedia — encyclopedic context. Runs for the 'wikipedia' and combined
+  // backends, and as a free supplement when DDG returned nothing.
+  const useWiki = backend === 'wikipedia' || backend === 'duckduckgo_wikipedia' || results.length === 0;
+  if (useWiki) {
+    try {
+      const wikiUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(q)}&format=json&origin=*&srlimit=${Math.min(limit, 3)}`;
+      const wikiRes = await universalFetch(wikiUrl, { signal: payloadObj.signal });
+      if (wikiRes.ok) {
+        const wiki = await wikiRes.json();
+        const hits = wiki?.query?.search || [];
+        for (const hit of hits) {
+          if (results.length >= limit) break;
+          const title = hit.title || '';
+          const snippet = (hit.snippet || '').replace(/<[^>]+>/g, '');
+          const url = `https://en.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g, '_'))}`;
+          if (!results.some((r) => r.title === title)) {
             results.push({ title, snippet, url });
           }
         }
       }
+    } catch {
+      // best-effort
     }
-  } catch {
-    // CORS/network — fall through to IA API + Wikipedia
-  }
-
-  // DuckDuckGo Instant Answer API — supplement (good for definitions/abstracts).
-  try {
-    const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(q)}&format=json&no_redirect=1&no_html=1&skip_disambig=1`;
-    const ddgRes = await universalFetch(ddgUrl, { signal: payloadObj.signal });
-    if (ddgRes.ok) {
-      const ddg = await ddgRes.json();
-      const abstractText = (ddg.AbstractText || '').trim();
-      const abstractUrl = (ddg.AbstractURL || '').trim();
-      const heading = (ddg.Heading || '').trim();
-      if (abstractText && !results.some((r) => r.snippet === abstractText)) {
-        results.unshift({ title: heading || q, snippet: abstractText, url: abstractUrl || '' });
-      }
-    }
-  } catch {
-    // best-effort
-  }
-
-  // Wikipedia — supplement with encyclopedic context.
-  try {
-    const wikiUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(q)}&format=json&origin=*&srlimit=${Math.min(limit, 3)}`;
-    const wikiRes = await universalFetch(wikiUrl, { signal: payloadObj.signal });
-    if (wikiRes.ok) {
-      const wiki = await wikiRes.json();
-      const hits = wiki?.query?.search || [];
-      for (const hit of hits) {
-        if (results.length >= limit) break;
-        const title = hit.title || '';
-        const snippet = (hit.snippet || '').replace(/<[^>]+>/g, '');
-        const url = `https://en.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g, '_'))}`;
-        if (!results.some((r) => r.title === title)) {
-          results.push({ title, snippet, url });
-        }
-      }
-    }
-  } catch {
-    // best-effort
   }
 
   return {
     ok: results.length > 0,
-    json: async () => ({ results: results.slice(0, limit) }),
+    json: async () => ({ results: results.slice(0, limit), grounded: results.length > 0 }),
   };
 }
 

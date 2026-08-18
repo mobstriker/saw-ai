@@ -170,9 +170,11 @@ export interface BYOKSettings {
   webSearchMaxResults: number;
   /** Which web-search backend to use. 'duckduckgo' works out of the box with no
    *  key (parses DDG HTML results — returns real results for weather/news/live
-   *  data, unlike the old Instant-Answer-only path). 'tavily' uses the Tavily
+   *  data, unlike the old Instant-Answer-only path). 'wikipedia' uses the
+   *  Wikipedia search API (encyclopedic, keyless, CORS-open). 'duckduckgo_wikipedia'
+   *  combines both free backends (best free coverage). 'tavily' uses the Tavily
    *  API (needs webSearchApiKey) for the highest-quality results. */
-  webSearchProvider?: 'duckduckgo' | 'tavily';
+  webSearchProvider?: 'duckduckgo' | 'wikipedia' | 'duckduckgo_wikipedia' | 'tavily';
   /** API key for the Tavily search provider (optional). */
   webSearchApiKey?: string;
   mcpServers: MCPServer[];
