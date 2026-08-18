@@ -165,6 +165,83 @@ owner's personal preferences — do not genericize the UX.
   preview, debug button, Save-as-Project) were already committed before this
   Flutter-engine work.
 
+## Multi-feature overhaul (tokens, chat info, MCP bridge, quota fix)
+- **Chat input**: the "Upload whole folder" (`FolderUp`) button was removed —
+  the paperclip (`Paperclip`) now accepts **any** file type and the existing
+  chat-wide drag-drop already handles folders + .zip via `collectDroppedFiles`
+  (`src/utils/dropHandler.ts`, entry-API traversal + zip expansion). The "0
+  tokens" prompt pill was removed from the input footer; the BPE count in the
+  Pure-Context drawer was kept (legitimate info display).
+- **Per-response tokens**: `Message.tokensEstimate` is now actually populated
+  in `App.tsx` on completion — the success finalize path and the clean-stop
+  (transport-close-after-content) path both compute `countTokens(content)`
+  once. `MessageItem.tsx` renders `~{tokens} tokens` at the end of each
+  assistant response via `useMessageTokenCount` hook (`src/utils/useMessageTokenCount.ts`),
+  which prefers `tokensEstimate` and falls back to async BPE counting (seeded
+  with an instant heuristic so it never flickers to 0). The memo comparator
+  checks `tokensEstimate` so the footer updates when the count is attached in
+  the separate post-finalize update.
+- **Three-dots chat info** (`Sidebar.tsx`): a `MoreHorizontal` button is a
+  SEPARATE hover button on each chat row (Rename + Delete stay as direct
+  buttons). Its popover shows: chat scope (Universal Chat vs Project Chat +
+  project name), files created/edited/added (from artifacts + project snapshots
+  + bound project file list), and token spend (total + per-model breakdown from
+  `message.tokensEstimate`). Derived by `src/utils/chatStats.ts` →
+  `deriveChatStats(chat, projects)` from existing data (no extra API calls).
+- **Quota-error fix (CRITICAL)**: a genuine quota/rate-limit error is now
+  recognized ONLY from a REAL HTTP 429 status, carried on `HttpProviderError`
+  (`src/App.tsx`). The old loose substring matcher (`err.message.includes('429'
+  /'quota'/'rate limit')`) turned benign desktop-webview SSE socket-close
+  errors into false "Your model provider reported a quota limit" banners on
+  the 2nd/3rd prompt. Both `!response.ok` blocks (send + continue paths) now
+  throw `HttpProviderError(message, status)`. The catch classifier:
+  - HTTP 401 / clear auth message → API-key config banner.
+  - HTTP 429 / explicit `RESOURCE_EXHAUSTED` in a real HTTP response → quota
+    banner.
+  - Transport error WITH partial content → `isStopped` (continue/retry), NOT a
+    hard error and NOT a fake banner.
+  - Transport error with NO content → generic "Connection Interrupted" +
+    Retry.
+  - Stream close after a clean `finish_reason === 'stop'` + content → finalize
+    as a successful completion (`cleanStop && existingPartialContent` path).
+- **MCP real tool-execution bridge** (`src/utils/mcpExecutor.ts`): MCP is no
+  longer prompt-only. `probeMcpServer(server)` does JSON-RPC `ping` + (on
+  success) `tools/list` to discover the server's real tools; `callMcpTool(server,
+  toolName, args)` does `tools/call` and returns the concatenated result text.
+  All requests go through `universalFetch` (works on web + Tauri desktop).
+  - **Auto status check**: an `useEffect` in `App.tsx` probes every enabled
+    MCP server on load (and when the enabled set changes by id) so their real
+    status + discovered tools are known before the first chat. The runtime
+    filter `s.enabled && s.status === 'online'` requires `online`, so without
+    this probe MCP would silently do nothing even when servers are configured.
+  - **Namespacing + native tools**: each tool is sent as `<serverName>/<toolName>`
+    (`_namespaced`) in the request body's `tools` array so providers that
+    support function-calling invoke them directly; `tool_choice: 'auto'`. The
+    system prompt also describes them in text + the `mcp_tool_call` fenced-block
+    fallback for providers without function calling.
+  - **Tool-call capture + loop**: `accumulateToolCalls` (App.tsx) accumulates
+    streamed OpenAI-style `delta.tool_calls` (index-keyed, arguments
+    concatenated across deltas). After the assistant turn, the app builds the
+    call list from native tool_calls (split on first `/`) PLUS text-parsed
+    `parseToolCallsFromText` (`mcp_tool_call`/`<tool_call>` blocks), executes
+    each against the named server, and feeds the results back as a follow-up
+    user turn `[MCP tool execution results — round N]` via recursive
+    `handleSendMessage(..., isMcpToolFollowup=true)`. `mcpFollowupRef` caps at
+    `MCP_MAX_TOOL_ROUNDS` (6) per manual prompt; reset on fresh send. The MCP
+    follow-up IS allowed to continue the loop (multi-round tool calling);
+    sandbox follow-ups are blocked from spawning MCP rounds (`!isSandboxFollowup`).
+- **Skills**: `ContextInjector.buildSkillsPromptContext` already injects
+  `SKILL.md` + ALL companion files (py/ts/templates) for enabled or
+  prompt-triggered skills into the system prompt. Toggle via
+  `handleToggleChatSkill` (per-chat `enabledSkillIds`; default =
+  `enabledByDefault` skills). No fix needed — verified wiring is intact.
+- **AddSkillModal drag-drop**: the drop tile now uses `collectDroppedFiles`
+  (was only reading flat `dataTransfer.files`, which misses folder contents —
+  browsers expose folder entries via `DataTransferItem.getAsEntry`, not
+  `.files`). Each dropped file is tagged with its `webkitRelativePath` so the
+  existing read loop picks it up. The files input `accept` was widened to any
+  type (was a hardcoded extension allowlist).
+
 ## Tauri version alignment (CRITICAL for the "Build Windows App" CI)
 - `.github/workflows/main.yml` builds for `x86_64-pc-windows-msvc` on every push
   to `main` via `tauri-apps/tauri-action@v0`. `tauri build` runs a
