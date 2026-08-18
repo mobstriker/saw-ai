@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - fix/multi-feature-overhaul
+      - fix-multi-feature-overhaul
   workflow_dispatch:
  
 jobs:
