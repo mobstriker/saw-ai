@@ -16,9 +16,11 @@ import {
   Database,
   Upload,
   LogOut,
-  MoreHorizontal,
+  MoreVertical,
   FileCode,
   Hash,
+  ArrowDownRight,
+  ArrowUpRight,
 } from 'lucide-react';
 import { Project, ChatSession, SidebarTab } from '../types';
 import { deriveChatStats } from '../utils/chatStats';
@@ -425,7 +427,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                       className={`p-1 rounded hover:bg-[#F5E6D3] ${infoChatId === chat.id ? 'text-[#C58B51]' : 'hover:text-[#C58B51]'}`}
                       title="Chat info (files & tokens)"
                     >
-                      <MoreHorizontal size={13} />
+                      <MoreVertical size={13} />
                     </button>
                     <button
                       onClick={(e) => startRename(chat.id, chat.title, e)}
@@ -447,16 +449,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   </div>
                 )}
 
-                {/* Three-dots info popover: chat scope, files touched, token
-                    spend (total + per model). Shown when the user clicks the
-                    MoreHorizontal button on this row. */}
+                {/* Three-dots info drawer: chat scope, files touched, token
+                    spend (total input+output + per model with breakdown).
+                    Renders as a RIGHT-SIDE drawer over the chat/code area (not
+                    a tiny sidebar dropdown) so it has room to show everything. */}
                 {infoChatId === chat.id && (() => {
                   const stats = deriveChatStats(chat, projects);
                   return (
                     <>
                       {/* click-away catcher */}
                       <div
-                        className="fixed inset-0 z-40"
+                        className="fixed inset-0 z-[60] bg-black/20"
                         onClick={(e) => {
                           e.stopPropagation();
                           setInfoChatId(null);
@@ -464,82 +467,134 @@ export const Sidebar: React.FC<SidebarProps> = ({
                       />
                       <div
                         onClick={(e) => e.stopPropagation()}
-                        className="absolute right-0 top-full mt-1 z-50 w-72 max-h-[70vh] overflow-y-auto rounded-2xl bg-white border border-[#E6DFD3] shadow-2xl p-3 text-[#2C2825] font-sans animate-in fade-in zoom-in-95"
+                        className="fixed right-0 top-0 z-[61] h-full w-[min(420px,92vw)] bg-white border-l border-[#E6DFD3] shadow-2xl flex flex-col text-[#2C2825] font-sans animate-in fade-in slide-in-from-right"
                       >
-                        <div className="flex items-center justify-between pb-2 mb-2 border-b border-[#E6DFD3]">
-                          <div className="flex items-center gap-1.5 min-w-0">
-                            <Layers size={13} className="text-[#C58B51] shrink-0" />
-                            <span className="text-xs font-bold truncate">{chat.title}</span>
+                        {/* Header */}
+                        <div className="flex items-center justify-between px-4 py-3 border-b border-[#E6DFD3] bg-[#FAF8F5]">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <Layers size={16} className="text-[#C58B51] shrink-0" />
+                            <div className="min-w-0">
+                              <div className="text-sm font-bold truncate">{chat.title}</div>
+                              <div className="text-[10px] text-[#7C756E]">Chat info &amp; usage</div>
+                            </div>
                           </div>
                           <button
                             onClick={(e) => { e.stopPropagation(); setInfoChatId(null); }}
-                            className="p-0.5 text-[#A09890] hover:text-[#2C2825]"
+                            className="p-1 rounded-lg text-[#A09890] hover:text-[#2C2825] hover:bg-white"
                             title="Close"
                           >
-                            <X size={13} />
+                            <X size={16} />
                           </button>
                         </div>
 
-                        {/* Scope */}
-                        <div className="flex items-center gap-1.5 mb-2">
-                          <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${stats.isUniversal ? 'bg-[#FAF8F5] text-[#7C756E] border border-[#E6DFD3]' : 'bg-[#F5E6D3] text-[#C58B51] border border-[#C58B51]/30'}`}>
-                            {stats.isUniversal ? 'Universal Chat' : 'Project Chat'}
-                          </span>
-                          {!stats.isUniversal && stats.projectName && (
-                            <span className="text-[10px] text-[#7C756E] truncate">{stats.projectName}</span>
-                          )}
-                        </div>
-
-                        {/* Token spend */}
-                        <div className="rounded-xl bg-[#FAF8F5] border border-[#E6DFD3] p-2 mb-2">
-                          <div className="flex items-center justify-between mb-1.5">
-                            <span className="text-[10px] font-bold text-[#2C2825] flex items-center gap-1">
-                              <Hash size={11} className="text-[#C58B51]" />
-                              Tokens spent
+                        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+                          {/* Scope */}
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className={`text-[10px] font-bold px-2 py-1 rounded-lg ${stats.isUniversal ? 'bg-[#FAF8F5] text-[#7C756E] border border-[#E6DFD3]' : 'bg-[#F5E6D3] text-[#C58B51] border border-[#C58B51]/30'}`}>
+                              {stats.isUniversal ? 'Universal Chat' : 'Project Chat'}
                             </span>
-                            <span className="text-[11px] font-mono font-bold text-[#C58B51]">
-                              {stats.totalTokens.toLocaleString()}
+                            {!stats.isUniversal && stats.projectName && (
+                              <span className="text-[11px] text-[#7C756E] truncate">{stats.projectName}</span>
+                            )}
+                            <span className="text-[10px] text-[#A09890] ml-auto">
+                              {stats.assistantResponses} assistant response{stats.assistantResponses === 1 ? '' : 's'}
                             </span>
                           </div>
-                          {stats.perModel.length > 1 ? (
-                            <div className="space-y-1">
-                              {stats.perModel.map((s) => (
-                                <div key={s.model} className="flex items-center justify-between text-[10px]">
-                                  <span className="font-mono text-[#7C756E] truncate max-w-[150px]">{s.model}</span>
-                                  <span className="font-mono text-[#2C2825]">
-                                    {s.tokens.toLocaleString()} <span className="text-[#A09890]">({s.responses}x)</span>
-                                  </span>
-                                </div>
-                              ))}
-                            </div>
-                          ) : stats.perModel.length === 1 ? (
-                            <div className="text-[10px] text-[#7C756E]">
-                              {stats.assistantResponses} response(s) • {stats.perModel[0].model}
-                            </div>
-                          ) : (
-                            <div className="text-[10px] text-[#A09890]">No responses yet</div>
-                          )}
-                        </div>
 
-                        {/* Files touched */}
-                        <div>
-                          <div className="text-[10px] font-bold text-[#2C2825] mb-1 flex items-center gap-1">
-                            <FileCode size={11} className="text-[#C58B51]" />
-                            Files created / edited / added
-                            <span className="text-[#A09890] font-normal">({stats.touchedFiles.length})</span>
-                          </div>
-                          {stats.touchedFiles.length > 0 ? (
-                            <div className="space-y-0.5 max-h-32 overflow-y-auto">
-                              {stats.touchedFiles.map((p) => (
-                                <div key={p} className="text-[10px] font-mono text-[#7C756E] truncate flex items-center gap-1">
-                                  <span className="text-[#C58B51]">•</span>
-                                  <span className="truncate">{p}</span>
-                                </div>
-                              ))}
+                          {/* Token spend — total + breakdown */}
+                          <div>
+                            <div className="flex items-center gap-1.5 mb-2">
+                              <Hash size={13} className="text-[#C58B51]" />
+                              <span className="text-xs font-bold text-[#2C2825]">Token spend</span>
                             </div>
-                          ) : (
-                            <div className="text-[10px] text-[#A09890]">No files created or edited in this chat yet.</div>
-                          )}
+                            <div className="rounded-2xl bg-[#FAF8F5] border border-[#E6DFD3] p-3">
+                              {/* Total */}
+                              <div className="flex items-baseline justify-between pb-2 mb-2 border-b border-[#E6DFD3]">
+                                <span className="text-[10px] font-bold text-[#7C756E] uppercase tracking-wide">Total</span>
+                                <span className="text-xl font-mono font-bold text-[#C58B51]">
+                                  {stats.totalTokens.toLocaleString()}
+                                </span>
+                              </div>
+                              {/* Input / output split */}
+                              <div className="grid grid-cols-2 gap-2 mb-2">
+                                <div className="rounded-xl bg-white border border-[#E6DFD3] px-2.5 py-2">
+                                  <div className="flex items-center gap-1 text-[9px] font-bold text-[#A09890] uppercase tracking-wide mb-0.5">
+                                    <ArrowDownRight size={10} /> Input
+                                  </div>
+                                  <div className="text-sm font-mono font-bold text-[#2C2825]">
+                                    {stats.totalInputTokens.toLocaleString()}
+                                  </div>
+                                </div>
+                                <div className="rounded-xl bg-white border border-[#E6DFD3] px-2.5 py-2">
+                                  <div className="flex items-center gap-1 text-[9px] font-bold text-[#A09890] uppercase tracking-wide mb-0.5">
+                                    <ArrowUpRight size={10} /> Output
+                                  </div>
+                                  <div className="text-sm font-mono font-bold text-[#2C2825]">
+                                    {stats.totalOutputTokens.toLocaleString()}
+                                  </div>
+                                </div>
+                              </div>
+                              {/* Per-model breakdown */}
+                              {stats.perModel.length > 0 ? (
+                                <div className="space-y-1.5">
+                                  <div className="text-[9px] font-bold text-[#A09890] uppercase tracking-wide">Per model</div>
+                                  {stats.perModel.map((s) => {
+                                    const pct = stats.totalTokens > 0 ? (s.tokens / stats.totalTokens) * 100 : 0;
+                                    return (
+                                      <div key={s.model} className="rounded-lg bg-white border border-[#E6DFD3] px-2.5 py-1.5">
+                                        <div className="flex items-center justify-between mb-1">
+                                          <span className="text-[11px] font-mono text-[#2C2825] truncate max-w-[200px]">{s.model}</span>
+                                          <span className="text-[11px] font-mono font-bold text-[#C58B51]">
+                                            {s.tokens.toLocaleString()}
+                                            <span className="text-[#A09890] font-normal"> ({s.responses}x)</span>
+                                          </span>
+                                        </div>
+                                        <div className="flex items-center gap-1.5 text-[9px] text-[#7C756E] font-mono mb-1">
+                                          <span>↓{s.inputTokens.toLocaleString()}</span>
+                                          <span className="text-[#E6DFD3]">·</span>
+                                          <span>↑{s.outputTokens.toLocaleString()}</span>
+                                        </div>
+                                        <div className="h-1 rounded-full bg-[#F5E6D3] overflow-hidden">
+                                          <div className="h-full bg-[#C58B51]" style={{ width: `${pct}%` }} />
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              ) : (
+                                <div className="text-[10px] text-[#A09890] text-center py-1">No responses yet</div>
+                              )}
+                              <div className="text-[9px] text-[#A09890] mt-2 leading-snug">
+                                Input = prompt tokens (system prompt + conversation). Output = completion tokens.
+                                Figures are provider-reported when available; otherwise estimated with a real BPE tokenizer.
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* Files touched */}
+                          <div>
+                            <div className="flex items-center gap-1.5 mb-2">
+                              <FileCode size={13} className="text-[#C58B51]" />
+                              <span className="text-xs font-bold text-[#2C2825]">
+                                Files created / edited / added
+                              </span>
+                              <span className="text-[10px] text-[#A09890]">({stats.touchedFiles.length})</span>
+                            </div>
+                            {stats.touchedFiles.length > 0 ? (
+                              <div className="space-y-0.5 max-h-64 overflow-y-auto rounded-xl bg-[#FAF8F5] border border-[#E6DFD3] p-2">
+                                {stats.touchedFiles.map((p) => (
+                                  <div key={p} className="text-[11px] font-mono text-[#7C756E] truncate flex items-center gap-1.5 px-1 py-0.5">
+                                    <span className="text-[#C58B51]">•</span>
+                                    <span className="truncate">{p}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : (
+                              <div className="text-[11px] text-[#A09890] rounded-xl bg-[#FAF8F5] border border-[#E6DFD3] p-3 text-center">
+                                No files created or edited in this chat yet.
+                              </div>
+                            )}
+                          </div>
                         </div>
                       </div>
                     </>

@@ -67,6 +67,25 @@ function detectDeps(code: string): string[] {
   return Array.from(deps);
 }
 
+/** Detect the "main" component name in a TSX/JSX snippet so we can append a
+ *  working `export default <Name>` when the AI didn't include one. We pick the
+ *  LAST PascalCase component declaration, since the AI's top-level entry
+ *  component is usually defined last (with smaller sub-components above). */
+function detectMainComponentName(code: string): string | null {
+  const names: string[] = [];
+  // function MyComponent(
+  const fnRe = /\bfunction\s+([A-Z]\w*)\s*\(/g;
+  // const MyComponent = (props) => …  |  const MyComponent = () => …
+  const constArrRe = /\bconst\s+([A-Z]\w*)\s*(?::\s*[^=]+)?=\s*(?:\([^)]*\)|\w*)\s*=>/g;
+  // class MyComponent extends …
+  const classRe = /\bclass\s+([A-Z]\w*)\b/g;
+  let m: RegExpExecArray | null;
+  while ((m = fnRe.exec(code)) !== null) names.push(m[1]);
+  while ((m = constArrRe.exec(code)) !== null) names.push(m[1]);
+  while ((m = classRe.exec(code)) !== null) names.push(m[1]);
+  return names.length > 0 ? names[names.length - 1] : null;
+}
+
 const SANDBOX_STYLE: React.CSSProperties = {
   height: '100%',
   width: '100%',
@@ -88,10 +107,26 @@ export const SandpackTsxPreview: React.FC<SandpackTsxPreviewProps> = ({
       ? filename
       : '/App.tsx';
     // Ensure a default export exists so the template's index.tsx can render it.
+    // If the code already has `export default`, leave it alone. Otherwise detect
+    // the main component identifier (a PascalCase function/const arrow component
+    // declared in the file) and append `export default <Name>`. Falling back to
+    // `export default App` (as before) referenced an undefined `App` whenever the
+    // component wasn't named App — which crashed the Sandpack bundler and
+    // rendered a blank preview. When no component name can be detected, wrap the
+    // whole snippet so SOMETHING renders.
     const hasDefaultExport = /export\s+default\s+/.test(code);
-    const source = hasDefaultExport
-      ? code
-      : `${code}\nexport default App;\n`;
+    let source = code;
+    if (!hasDefaultExport) {
+      const compName = detectMainComponentName(code);
+      if (compName) {
+        source = `${code}\nexport default ${compName};\n`;
+      } else {
+        // Couldn't find a name — append a default that re-exports nothing usable
+        // but keeps the bundler from failing on a dangling reference; the
+        // Sandpack console will show the real error.
+        source = `${code}\nexport default (() => null) as React.FC;\n`;
+      }
+    }
     return {
       [appPath]: { code: source, active: true, hidden: false },
     } as Record<string, { code: string; active?: boolean; hidden?: boolean }>;
@@ -111,6 +146,7 @@ export const SandpackTsxPreview: React.FC<SandpackTsxPreviewProps> = ({
   return (
     <div className="w-full h-full flex flex-col bg-white">
       <div className="flex items-center justify-end gap-1 px-2 py-1 border-b border-[#E6DFD3] bg-[#FAF8F5]">
+        <span className="text-[10px] text-[#A09890] mr-auto">Sandpack live preview (real bundler + npm)</span>
         <button
           type="button"
           onClick={() => setShowConsole((v) => !v)}
@@ -124,7 +160,7 @@ export const SandpackTsxPreview: React.FC<SandpackTsxPreviewProps> = ({
           CONSOLE
         </button>
       </div>
-      <div className="flex-1 overflow-hidden">
+      <div className="flex-1 overflow-hidden relative min-h-[200px]">
         <SandpackProvider
           template="react-ts"
           files={files}

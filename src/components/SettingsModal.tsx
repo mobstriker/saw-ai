@@ -1513,7 +1513,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     <h4 className="text-xs font-bold text-[#2C2825]">Built-In Web Grounding (Free & Universal)</h4>
                   </div>
                   <p className="text-xs text-[#7C756E] leading-relaxed">
-                    Real-time web search scrapes authoritative snippets and knowledge via DuckDuckGo and Wikipedia, then injects ground-truth citations into the prompt context prior to answer generation.
+                    Real-time web search returns ranked results from DuckDuckGo (including weather, news, and live
+                    data) and injects ground-truth citations into the prompt before the answer is generated. For the
+                    highest-quality results, add a Tavily API key.
                   </p>
                 </div>
 
@@ -1529,6 +1531,32 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     className="w-4 h-4 accent-[#C58B51] cursor-pointer"
                   />
                 </div>
+
+                <div>
+                  <label className="text-xs font-bold text-[#2C2825] mb-1.5 block">Search Provider</label>
+                  <select
+                    value={formData.webSearchProvider || 'duckduckgo'}
+                    onChange={(e) => setFormData({ ...formData, webSearchProvider: e.target.value as 'duckduckgo' | 'tavily' })}
+                    className="w-full px-3 py-2 rounded-lg border border-[#E6DFD3] bg-white text-xs text-[#2C2825] focus:outline-none focus:ring-2 focus:ring-[#C58B51]/40"
+                  >
+                    <option value="duckduckgo">DuckDuckGo (free, no key — works for weather/news/live data)</option>
+                    <option value="tavily">Tavily (best quality — needs API key below)</option>
+                  </select>
+                </div>
+
+                {(formData.webSearchProvider || 'duckduckgo') === 'tavily' && (
+                  <div>
+                    <label className="text-xs font-bold text-[#2C2825] mb-1.5 block">Tavily API Key</label>
+                    <input
+                      type="password"
+                      value={formData.webSearchApiKey || ''}
+                      onChange={(e) => setFormData({ ...formData, webSearchApiKey: e.target.value })}
+                      placeholder="tvly-..."
+                      className="w-full px-3 py-2 rounded-lg border border-[#E6DFD3] bg-white text-xs text-[#2C2825] focus:outline-none focus:ring-2 focus:ring-[#C58B51]/40"
+                    />
+                    <p className="text-[10px] text-[#7C756E] mt-1">Get a free key at tavily.com. Stored locally only.</p>
+                  </div>
+                )}
 
                 <div>
                   <div className="flex items-center justify-between mb-1.5">
@@ -1627,6 +1655,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     the gist. Paste a GitHub token with the <code className="font-mono">gist</code> scope
                     to enable live previews. Without it, a faithful structural widget-tree preview is used.
                   </p>
+                  <div className="rounded-xl bg-white border border-[#E6DFD3] p-2.5 mb-3 text-[10px] text-[#7C756E] leading-relaxed">
+                    <span className="font-bold text-[#2C2825]">How to get a token:</span><br />
+                    1. Go to <span className="font-mono text-[#C58B51]">github.com → Settings → Developer settings → Personal access tokens</span><br />
+                    2. Pick <span className="font-bold">"Tokens (classic)"</span> → <span className="font-bold">Generate new token (classic)</span><br />
+                    3. Tick the <span className="font-mono text-[#C58B51]">gist</span> scope (everything else can stay unticked)<br />
+                    4. Generate, then copy the <span className="font-mono">ghp_…</span> token and paste it here. (Stored locally only — never sent anywhere except GitHub's gist API.)
+                  </div>
                   <label className="block text-[10px] font-bold text-[#2C2825] mb-1">
                     GitHub Gist Token (optional)
                   </label>

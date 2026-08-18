@@ -109,6 +109,13 @@ export async function runSandboxAgentStep(
   opts: AgentStepOptions
 ): Promise<AgentStepResult> {
   const { mode, store, project, chatId, seedFiles } = opts;
+  // The sandbox jail is per-session keyed by chatId. The workdir is the project's
+  // subdir when a project is bound, or the sandbox ROOT itself for a universal
+  // (no-project) chat (an empty workdir resolves to the root in Rust). We MUST
+  // seed files into the SAME workdir the command will run in, so `python foo.py`
+  // finds the file — including universal chats (the old `if (workdir && ...)`
+  // guard skipped seeding entirely when project was null, so python runs failed
+  // with "file not found" in universal chats).
   const workdir = project ? `proj-${project.id}` : '';
   const sections: string[] = [];
 
@@ -117,6 +124,16 @@ export async function runSandboxAgentStep(
   // Seed the project files once at the start of the step so the AI's builds
   // operate on the latest sources.
   await store.seedProject(project);
+  // Also seed the AI's latest artifacts (e.g. the python file it just wrote)
+  // into the run workdir so `python <file>.py` resolves by name. Works for both
+  // project chats (proj-<id> subdir) and universal chats (sandbox root).
+  if (seedFiles && seedFiles.length > 0) {
+    try {
+      await store.seedFiles(workdir, seedFiles);
+    } catch {
+      // best-effort; the run will still attempt and report its own error
+    }
+  }
   store.ensureChat(chatId);
   // Snapshot the active tab's log length so we can collect only this step's
   // lines for the tool-result block.

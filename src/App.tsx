@@ -113,6 +113,34 @@ function accumulateToolCalls(
   }
 }
 
+/**
+ * Capture provider-reported token usage from a streamed SSE chunk. Providers
+ * emit usage on the final chunk in a few shapes; we recognize the common ones:
+ *  - OpenAI-compatible: `usage: { prompt_tokens, completion_tokens, total_tokens }`
+ *  - Anthropic (message_delta): `usage: { input_tokens, output_tokens }` (the
+ *    initial message_start also carries input_tokens)
+ *  - Google/Gemini: `usageMetadata: { promptTokenCount, candidatesTokenCount }`
+ * The caller passes the hoisted `usageInput`/`usageOutput` accumulators via the
+ * returned values, so the latest non-zero usage wins (providers send it once).
+ */
+function captureUsage(data: any): { input: number; output: number } | null {
+  // Mutates the module-level refs is not possible here; this is a pure reader
+  // used by the inline closure below. (Kept as a standalone fn for clarity.)
+  const u = data?.usage;
+  if (u && typeof u === 'object') {
+    const i = u.prompt_tokens ?? u.input_tokens ?? u.promptTokenCount ?? 0;
+    const o = u.completion_tokens ?? u.output_tokens ?? u.candidatesTokenCount ?? 0;
+    if (i || o) return { input: Number(i) || 0, output: Number(o) || 0 };
+  }
+  const um = data?.usageMetadata;
+  if (um && typeof um === 'object') {
+    const i = um.promptTokenCount ?? 0;
+    const o = um.candidatesTokenCount ?? um.outputTokenCount ?? 0;
+    if (i || o) return { input: Number(i) || 0, output: Number(o) || 0 };
+  }
+  return null;
+}
+
 import { ArtifactParser } from './utils/artifactParser';
 import { PatchApplier, PatchChunk } from './utils/patchApplier';
 import { WorkspaceAutopilot } from './utils/workspaceAutopilot';
@@ -1111,6 +1139,9 @@ export default function App() {
 
     try {
       let fullSystemPrompt = settings.systemPrompt || '';
+      // Same output-discipline guardrail as the main send path (see handleSendMessage).
+      fullSystemPrompt += `\n\n# Output Discipline (IMPORTANT)
+Only produce code, code files, or artifacts when the user's current message explicitly asks you to write, create, build, generate, refactor, or fix code (or a component/app/script/site). For general questions — including factual questions, weather, news, explanations, advice, or anything that does not require code to answer — respond in plain prose with NO code blocks and NO artifacts. Never create code just because code exists elsewhere in the conversation or project. If a previous turn involved code but the current question is unrelated, ignore the code and answer the question directly.`;
       // Project context is injected ONLY for chats bound to a project.
       // Universal chats (no projectId) must not see any project files.
       const chatProject = targetChat.projectId
@@ -1674,6 +1705,12 @@ export default function App() {
     // message isStopped — a clean "stop" must NOT show the false "cut off"
     // continue/retry banner.
     let streamFinishReason: string | null = null;
+    // Provider-reported token usage, captured from the final SSE chunk when the
+    // endpoint emits one (OpenAI-compatible `usage` or Anthropic's
+    // `message_delta.usage`). When present this is the EXACT token spend; we fall
+    // back to a BPE estimate otherwise.
+    let usageInput = 0;
+    let usageOutput = 0;
 
     // Hoisted for the post-completion sandbox agent follow-up (which runs after
     // the try/catch/finally). Filled in inside the try once known.
@@ -1695,6 +1732,8 @@ export default function App() {
             body: JSON.stringify({
               query: resolvedSearchQuery || userPrompt,
               maxResults: settings.webSearchMaxResults || 5,
+              provider: settings.webSearchProvider || 'duckduckgo',
+              apiKey: settings.webSearchApiKey || '',
             }),
             signal: controller.signal,
           });
@@ -1724,6 +1763,15 @@ export default function App() {
 
       // 3. Prepare Pure Context Injection from Project Files, Skills, and Active MCP Servers
       let fullSystemPrompt = settings.systemPrompt || '';
+
+      // Core behavioral guardrail: the AI must NOT produce code files / artifacts
+      // unless the user's prompt explicitly asks for them. This stops the model
+      // from spawning a Python/TSX file in response to an unrelated question
+      // (e.g. "what's the weather?" creating an unwanted script). Answer the
+      // question directly; only write code when the user requests code, a build,
+      // a component, an app, a script, a refactor, a fix, etc.
+      fullSystemPrompt += `\n\n# Output Discipline (IMPORTANT)
+Only produce code, code files, or artifacts when the user's current message explicitly asks you to write, create, build, generate, refactor, or fix code (or a component/app/script/site). For general questions — including factual questions, weather, news, explanations, advice, or anything that does not require code to answer — respond in plain prose with NO code blocks and NO artifacts. Never create code just because code exists elsewhere in the conversation or project. If a previous turn involved code but the current question is unrelated, ignore the code and answer the question directly. When web search results are provided, use them to answer concisely and cite sources; do not generate files from them.`;
 
       // Add active Agent Skills context
       const skillsContext = ContextInjector.buildSkillsPromptContext(
@@ -1803,9 +1851,9 @@ When handling complex multi-step tasks:
 
       // Sandbox access: when the user has granted the AI sandbox command
       // execution and the automation mode permits it, tell the AI how to run
-      // commands. Each allowlisted command it emits in a bash/sh (or
-      // <sandbox_run>) block is executed in the restricted sandbox and the
-      // output is fed back automatically so it can read results and iterate.
+      // commands. Commands emitted in a bash/sh (or <sandbox_run>) block run in
+      // the restricted jailed shell and the output is fed back automatically so
+      // it can read results and iterate.
       if (sandboxStore.available && sandboxStore.accessGranted && effectiveAutoMode !== 'review') {
         const allowList = ALLOWED_SANDBOX_COMMANDS.join(', ');
         const approvalNote =
@@ -1813,7 +1861,7 @@ When handling complex multi-step tasks:
             ? 'Each command you emit will be shown to the user for approval before it runs.'
             : 'Each command you emit runs automatically (the user chose Auto Planner).';
         fullSystemPrompt += `\n\n# Sandbox Command Execution (granted by user)
-You have been granted access to run commands in the user's restricted in-app sandbox. When the task calls for building, installing, or running code, emit the command(s) in a fenced bash/sh code block (or <sandbox_run>...</sandbox_run>). ${approvalNote} Only the leading command per line is honored and it must be one of the allowlisted tools: ${allowList}. Each command runs in the project's sandbox workdir (its files are seeded first). The stdout/stderr and exit code are returned to you automatically — read them and continue. Do NOT emit commands you don't intend to run (e.g. as illustrative examples); if you only want to show a command without running it, use a plain (non-shell) code block or say so explicitly.`;
+You have been granted access to run commands in the user's restricted in-app sandbox — a real jailed shell (NOT just an allowlist). When the task calls for building, installing, or running code, emit the command(s) in a fenced bash/sh code block (or <sandbox_run>...</sandbox_run>). ${approvalNote} The sandbox runs a real shell, so you may use cd, &&, pipes, redirects, and quoted arguments; the available toolchain includes: ${allowList}. Each command runs in the project's sandbox workdir, whose files (including the code you produced this turn) are seeded first — so \`python <file>.py\`, \`npm run dev\`, \`flutter build apk\`, etc. work by name. The stdout/stderr and exit code are returned to you automatically — read them and continue. The sandbox is jailed: it cannot read or write outside the app's sandbox folder, so do not try to access the host filesystem. Do NOT emit commands you don't intend to run (e.g. as illustrative examples); if you only want to show a command without running it, use a plain (non-shell) code block or say so explicitly.`;
       }
 
       let parsedHeaders = {};
@@ -1895,6 +1943,8 @@ You have been granted access to run commands in the user's restricted in-app san
               const fr = data.choices?.[0]?.finish_reason;
               if (fr) streamFinishReason = fr;
               accumulateToolCalls(toolCallBuffers, data.choices?.[0]?.delta?.tool_calls);
+              const _u = captureUsage(data);
+              if (_u) { usageInput = _u.input; usageOutput = _u.output; }
             } catch (pErr) {
               // Non-fatal SSE chunk parse
             }
@@ -1906,6 +1956,8 @@ You have been granted access to run commands in the user's restricted in-app san
               const fr = data.choices?.[0]?.finish_reason;
               if (fr) streamFinishReason = fr;
               accumulateToolCalls(toolCallBuffers, data.choices?.[0]?.delta?.tool_calls || data.choices?.[0]?.message?.tool_calls);
+              const _u = captureUsage(data);
+              if (_u) { usageInput = _u.input; usageOutput = _u.output; }
             } catch (pErr) {
               // Non-fatal JSON chunk parse
             }
@@ -1977,13 +2029,31 @@ You have been granted access to run commands in the user's restricted in-app san
       // (or a missing finish_reason with no content) is a real cutoff.
       const wasTruncatedByLimit = streamFinishReason === 'length';
 
-      // Accurate token count for this completed assistant response (real BPE
-      // tokenizer). Computed once here so the per-response footer and the chat
-      // three-dots info popover both read from message.tokensEstimate.
+      // Accurate token count for this completed assistant response.
+      //  - If the provider reported `usage` (prompt_tokens + completion_tokens),
+      //    use those EXACT figures — this is the gold standard.
+      //  - Otherwise estimate output tokens with the real BPE tokenizer, and
+      //    estimate input tokens by counting the system prompt + conversation
+      //    we actually sent. This gives a true total-spend number (input +
+      //    output) instead of only counting output.
       const finalParsed0 = parseThinkingFromStream(rawAccumulatedStream);
-      const responseTokenCount = await countTokens(
+      const outputTokens = usageOutput || await countTokens(
         (finalParsed0.content || assistantMessageContent || '').trim(),
       );
+      // Input token estimate: count the full system prompt + every message we
+      // sent in the request. (We can't count the model's internal reasoning
+      // tokens, but this captures the bulk of input cost.)
+      let inputTokens = usageInput;
+      if (!inputTokens) {
+        try {
+          const promptText = (fullSystemPrompt || '') + '\n' +
+            cleanApiMessages.map((mm: any) => `${mm.role}: ${mm.content || ''}`).join('\n');
+          inputTokens = await countTokens(promptText);
+        } catch {
+          inputTokens = 0;
+        }
+      }
+      const responseTokenCount = outputTokens; // kept for the per-response footer
 
       // Finalize thinking state on message. Persist immediately (not just
       // via the debounced effect) so the completed assistant message survives
@@ -2033,6 +2103,8 @@ You have been granted access to run commands in the user's restricted in-app san
                     modelUsed: chosenModelDisplayName,
                     generationDurationMs: Date.now() - requestStartTime,
                     tokensEstimate: responseTokenCount,
+                    inputTokens,
+                    outputTokens,
                   }
                 : m
             ),
@@ -2262,7 +2334,12 @@ You have been granted access to run commands in the user's restricted in-app san
         if (cleanStop && existingPartialContent) {
           // Treat as a successful completion (the model finished cleanly; the
           // error was just the transport closing).
-          const completedTokens = await countTokens(existingPartialContent);
+          const completedOutputTokens = usageOutput || await countTokens(existingPartialContent);
+          // usageInput was hoisted before the try, so it's accessible here. If
+          // the provider didn't report usage we can't re-derive the prompt
+          // tokens in this catch path (the try-scoped vars aren't visible), so
+          // we leave input at 0 — the main try path computes it when present.
+          const completedInputTokens = usageInput;
           setChats((prevChats) => {
             const updated = prevChats.map((c) => {
               if (c.id !== targetChat.id) return c;
@@ -2277,7 +2354,9 @@ You have been granted access to run commands in the user's restricted in-app san
                       isError: false,
                       modelUsed: chosenModelDisplayName,
                       generationDurationMs: Date.now() - requestStartTime,
-                      tokensEstimate: completedTokens,
+                      tokensEstimate: completedOutputTokens,
+                      inputTokens: completedInputTokens,
+                      outputTokens: completedOutputTokens,
                     }
                   : m
               );

@@ -980,6 +980,37 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
             onClose={() => setShowSandbox(false)}
             store={sandboxStore}
             chatId={chat.id}
+            allArtifactFiles={(() => {
+              // Seed EVERY code artifact from this chat's history so any file the
+              // AI created is runnable by name (python foo.py, node bar.js,
+              // multi-file imports). Deduped by path (latest wins).
+              const byPath = new Map<string, { path: string; content: string; language: string }>();
+              for (const m of chat.messages) {
+                if (m.role !== 'assistant' || !m.content) continue;
+                const arts = ArtifactParser.extractArtifacts(m.content);
+                for (const a of arts) {
+                  // Use the AI's filename when it carries a real extension;
+                  // otherwise derive `snippet.<ext>` from the language so the file
+                  // is still runnable by name (e.g. `python snippet.py`). The old
+                  // "python snippet" label had no extension, so `python main.py`
+                  // could never find it → "failed".
+                  const lang = (a.language || 'file').toLowerCase();
+                  const ext = lang === 'javascript' ? 'js'
+                    : lang === 'typescript' ? 'ts'
+                    : lang === 'python' ? 'py'
+                    : lang === 'rust' ? 'rs'
+                    : lang === 'html' ? 'html'
+                    : lang === 'css' ? 'css'
+                    : lang === 'json' ? 'json'
+                    : 'txt';
+                  const p = (a.title && a.title.includes('.'))
+                    ? a.title
+                    : `snippet.${ext}`;
+                  byPath.set(p, { path: p, content: a.code, language: a.language });
+                }
+              }
+              return Array.from(byPath.values());
+            })()}
             latestArtifactCode={(() => {
               // Seed the latest Python code artifact so `python <file>.py` has
               // the file the AI just produced in chat.
@@ -990,7 +1021,10 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
                 const py = arts.find(
                   (a) => a.language.toLowerCase() === 'python' || a.title.endsWith('.py'),
                 );
-                if (py) return { filename: py.title || 'main.py', language: py.language, code: py.code };
+                // Ensure a .py extension so `python <name>.py` always resolves.
+                const rawName = py?.title || 'main.py';
+                const filename = rawName.endsWith('.py') ? rawName : `${rawName.replace(/\.[^.]+$/, '')}.py`;
+                if (py) return { filename, language: py.language, code: py.code };
               }
               return null;
             })()}

@@ -264,84 +264,140 @@ export async function performChatRequest(payloadObj: any) {
  * from the Tauri webview / browser with no backend proxy.
  */
 export async function performSearchRequest(payloadObj: any) {
-  const { query, maxResults } = payloadObj.body ? JSON.parse(payloadObj.body) : payloadObj;
+  const parsed = payloadObj.body ? JSON.parse(payloadObj.body) : payloadObj;
+  const { query, maxResults, provider, apiKey } = parsed;
   const q = (query || '').trim();
   const limit = Math.max(1, Math.min(maxResults || 5, 8));
+  const backend = provider || 'duckduckgo';
+
+  // Tavily — highest quality, needs a key. Returns clean answer + sources.
+  if (backend === 'tavily' && apiKey) {
+    try {
+      const tvRes = await universalFetch('https://api.tavily.com/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          api_key: apiKey,
+          query: q,
+          max_results: limit,
+          include_answer: true,
+        }),
+        signal: payloadObj.signal,
+      });
+      if (tvRes.ok) {
+        const tv = await tvRes.json();
+        const results: any[] = [];
+        if (tv.answer) {
+          results.push({ title: 'Tavily answer', snippet: tv.answer, url: '' });
+        }
+        if (Array.isArray(tv.results)) {
+          for (const r of tv.results) {
+            results.push({ title: r.title || '', snippet: r.content || '', url: r.url || '' });
+          }
+        }
+        if (results.length > 0) {
+          return { ok: true, json: async () => ({ results: results.slice(0, limit) }) };
+        }
+      }
+    } catch {
+      // fall through to DuckDuckGo
+    }
+  }
 
   const results: any[] = [];
 
+  // DuckDuckGo HTML results — the KEY fix. The old code used the Instant Answer
+  // API, which returns an abstract ONLY for encyclopedic/dictionary queries and
+  // NOTHING for weather/news/live prices/current events. The HTML results page
+  // returns real ranked web results for EVERY query type. We fetch it through
+  // universalFetch (the Tauri http plugin in the desktop build bypasses CORS, so
+  // this works there; in the pure-web build it may be CORS-blocked and we fall
+  // back to the IA API + Wikipedia below).
   try {
-    // 1. DuckDuckGo Instant Answer API — gives a concise abstract / answer when available
+    const ddgHtmlUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`;
+    const ddgHtmlRes = await universalFetch(ddgHtmlUrl, {
+      headers: { Accept: 'text/html,application/xhtml+xml' },
+      signal: payloadObj.signal,
+    });
+    if (ddgHtmlRes.ok) {
+      const html = await ddgHtmlRes.text();
+      // Each organic result lives in a `.result` block with `.result__a` (title+url)
+      // and `.result__snippet` (text). Parse defensively.
+      const resultBlocks = html.split(/class="result\s/);
+      for (const block of resultBlocks.slice(1)) {
+        if (results.length >= limit) break;
+        const titleMatch = block.match(/class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i);
+        const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/(?:a|td|div|span)>/i);
+        if (titleMatch) {
+          let url = titleMatch[1] || '';
+          // DDG wraps URLs in a redirect (//duckduckgo.com/l/?uddg=<encoded>); unwrap.
+          const uddg = url.match(/uddg=([^&]+)/);
+          if (uddg) url = decodeURIComponent(uddg[1]);
+          const title = decodeHtml(titleMatch[2].replace(/<[^>]+>/g, '').trim());
+          const snippet = snippetMatch ? decodeHtml(snippetMatch[1].replace(/<[^>]+>/g, '').trim()) : '';
+          if (title && !results.some((r) => r.title === title)) {
+            results.push({ title, snippet, url });
+          }
+        }
+      }
+    }
+  } catch {
+    // CORS/network — fall through to IA API + Wikipedia
+  }
+
+  // DuckDuckGo Instant Answer API — supplement (good for definitions/abstracts).
+  try {
     const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(q)}&format=json&no_redirect=1&no_html=1&skip_disambig=1`;
     const ddgRes = await universalFetch(ddgUrl, { signal: payloadObj.signal });
     if (ddgRes.ok) {
       const ddg = await ddgRes.json();
       const abstractText = (ddg.AbstractText || '').trim();
-      const abstractSource = (ddg.AbstractSource || '').trim();
       const abstractUrl = (ddg.AbstractURL || '').trim();
       const heading = (ddg.Heading || '').trim();
-
-      if (abstractText) {
-        results.push({
-          title: heading || q,
-          snippet: abstractText,
-          url: abstractUrl || (ddg.DefinitionURL || ''),
-        });
-      }
-
-      // RelatedTopics is a flat + nested array; pull leaf topics that have a real text/url
-      const flatten = (arr: any[]) => {
-        for (const item of arr) {
-          if (!item) continue;
-          if (item.Topics && Array.isArray(item.Topics)) {
-            flatten(item.Topics);
-          } else if (item.Text && item.FirstURL) {
-            results.push({
-              title: item.Text.split(' - ')[0] || item.Text,
-              snippet: item.Text,
-              url: item.FirstURL,
-            });
-          }
-        }
-      };
-      if (Array.isArray(ddg.RelatedTopics)) flatten(ddg.RelatedTopics);
-
-      // DuckDuckGo definition (for "define" style queries)
-      if (!abstractText && ddg.Definition) {
-        results.push({
-          title: heading || q,
-          snippet: ddg.Definition,
-          url: ddg.DefinitionURL || '',
-        });
+      if (abstractText && !results.some((r) => r.snippet === abstractText)) {
+        results.unshift({ title: heading || q, snippet: abstractText, url: abstractUrl || '' });
       }
     }
-  } catch (e) {
-    // DuckDuckGo is best-effort; fall through to Wikipedia
+  } catch {
+    // best-effort
   }
 
+  // Wikipedia — supplement with encyclopedic context.
   try {
-    // 2. Wikipedia API — rich full-text search results to round out the answer set
-    const wikiUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(q)}&format=json&origin=*&srlimit=${limit}`;
+    const wikiUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(q)}&format=json&origin=*&srlimit=${Math.min(limit, 3)}`;
     const wikiRes = await universalFetch(wikiUrl, { signal: payloadObj.signal });
     if (wikiRes.ok) {
       const wiki = await wikiRes.json();
       const hits = wiki?.query?.search || [];
       for (const hit of hits) {
+        if (results.length >= limit) break;
         const title = hit.title || '';
-        const snippet = (hit.snippet || '').replace(/<[^>]+>/g, ''); // strip highlight spans
+        const snippet = (hit.snippet || '').replace(/<[^>]+>/g, '');
         const url = `https://en.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g, '_'))}`;
         if (!results.some((r) => r.title === title)) {
           results.push({ title, snippet, url });
         }
       }
     }
-  } catch (e) {
-    // Wikipedia is best-effort
+  } catch {
+    // best-effort
   }
 
   return {
     ok: results.length > 0,
     json: async () => ({ results: results.slice(0, limit) }),
   };
+}
+
+/** Minimal HTML-entity decoder so search snippets render readably. */
+function decodeHtml(s: string): string {
+  return s
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/&nbsp;/g, ' ');
 }
 

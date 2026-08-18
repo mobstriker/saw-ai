@@ -1,9 +1,10 @@
 import { useCallback, useRef, useState } from 'react';
 import {
-  runSandboxCommand,
+  runSandboxSession,
   writeSandboxFiles,
   listSandboxArtifacts,
   parseSandboxCommand,
+  buildCommandLine,
   isSandboxAvailable,
   type SandboxStreamLine,
   type SandboxArtifact,
@@ -70,6 +71,9 @@ export interface SandboxStoreValue {
 
   /** Seed a project's files into the sandbox workdir (desktop) / Pyodide FS. */
   seedProject: (project: Project | null) => Promise<void>;
+  /** Seed an arbitrary file set into a sandbox workdir (desktop). Used by the
+   *  SandboxPanel to write ALL chat artifacts so any file is runnable by name. */
+  seedFiles: (workdir: string, files: { path: string; content: string }[]) => Promise<void>;
   /** Run a parsed command in a chat's active tab. Routes Python to Pyodide. */
   runCommand: (opts: RunCommandOptions, source?: 'manual' | 'agent', chatId?: string, seedFiles?: { path: string; content: string }[]) => Promise<number>;
   refreshArtifacts: (workdir?: string) => Promise<void>;
@@ -217,12 +221,18 @@ export function useSandboxStore(): SandboxStoreValue {
     });
   }, []);
 
+  const seedFiles = useCallback(
+    async (workdir: string, files: { path: string; content: string }[]) => {
+      if (!available || files.length === 0) return;
+      await writeSandboxFiles(workdir, files);
+    },
+    [available]
+  );
+
   const seedProject = useCallback(
     async (project: Project | null) => {
       if (!available || !project || project.files.length === 0) return;
       const workdir = `proj-${project.id}`;
-      // Push to the caller's chat is handled by runCommand's seedFiles; here we
-      // just write to the Tauri workdir for desktop builds.
       const files = project.files.map((f) => ({
         path: f.path.startsWith('/') ? f.path.slice(1) : f.path,
         content: f.content,
@@ -251,7 +261,11 @@ export function useSandboxStore(): SandboxStoreValue {
       const isPython = opts.command === 'python' || opts.command === 'python3';
 
       // --- Real in-browser Python via Pyodide (works in web + desktop) ---
-      if (isPython && pythonAvailable) {
+      // Only used when the desktop (Tauri) runner is NOT available — i.e. the
+      // web build. In the desktop build, Python runs through the same jailed
+      // shell as everything else so imports of sibling files the AI created
+      // resolve against the real workdir (written via write_sandbox_files).
+      if (isPython && pythonAvailable && !available) {
         setTabRunning(cid, true, null);
         pushChatLog(cid, 'status', `$ ${opts.command} ${(opts.args ?? []).join(' ')}`, source);
 
@@ -275,11 +289,11 @@ export function useSandboxStore(): SandboxStoreValue {
         }
       }
 
-      // --- Other allowlisted commands: Tauri Rust runner (desktop only) ---
+      // --- Desktop (Tauri) jailed persistent shell: real CLI for everything ---
       if (!available) {
         const msg = isPython
           ? 'Python runner (Pyodide) failed to load. Reload the app and try again.'
-          : `The command "${opts.command}" runs inside the SAW AI desktop app (Tauri). Python is available in-browser; other toolchains need the desktop build.`;
+          : `The command "${opts.command}" runs inside the SAW AI desktop app (Tauri). In the web build, only Python (Pyodide) runs — run "npm run tauri dev" or the built app for the full CLI.`;
         pushChatLog(cid, 'error', msg, source);
         setTabRunning(cid, false, -1);
         return -1;
@@ -287,10 +301,19 @@ export function useSandboxStore(): SandboxStoreValue {
 
       setTabRunning(cid, true, null);
       try {
-        pushChatLog(cid, 'status', `$ ${opts.command} ${(opts.args ?? []).join(' ')}`, source);
-        const code = await runSandboxCommand(opts, (line: SandboxStreamLine) => {
-          pushChatLog(cid, line.stream, line.line, source);
-        });
+        const workdir = opts.workdir ?? '';
+        // Build the full command line. If the caller set rawCommandLine, `command`
+        // is already a complete line (cd, &&, pipes, quoted args) — pass it as-is.
+        const commandLine = opts.rawCommandLine
+          ? opts.command
+          : buildCommandLine(opts.command, opts.args);
+        pushChatLog(cid, 'status', `$ ${commandLine}`, source);
+        const code = await runSandboxSession(
+          { sessionId: cid, workdir, commandLine },
+          (line: SandboxStreamLine) => {
+            pushChatLog(cid, line.stream, line.line, source);
+          },
+        );
         setTabRunning(cid, false, code);
         pushChatLog(cid, 'status', code === 0 ? '✓ Completed successfully.' : `✗ Exited with code ${code}.`, source);
         return code;
@@ -354,6 +377,7 @@ export function useSandboxStore(): SandboxStoreValue {
     closeTab,
     setActiveTab,
     seedProject,
+    seedFiles,
     runCommand,
     refreshArtifacts,
     requestApproval,
@@ -362,5 +386,3 @@ export function useSandboxStore(): SandboxStoreValue {
 }
 
 export { parseSandboxCommand };
-
-

@@ -141,6 +141,24 @@ owner's personal preferences — do not genericize the UX.
   **Sandbox** button in the `ChatWindow` header; docks as a bottom panel.
   `isSandboxAvailable()` checks `__TAURI_INTERNALS__` and degrades gracefully
   (shows a notice) when running as a plain web dev server.
+- **Workdir re-sync (Phase 4 fix)**: the persistent shell's CWD is set at session
+  creation, but `run_sandbox_command` now re-`cd`s into the requested workdir on
+  EVERY run when it differs from the session's current CWD. Without this, a chat
+  whose workdir changed after the first command (universal→project, or the agent
+  loop seeding into a project subdir) had its shell stuck in the old CWD, so files
+  written via `write_sandbox_files` to the new workdir were invisible to
+  `python file.py` → "failed". The cd target is the jail-resolved workdir, so it
+  can never escape the root.
+- **Universal-chat seeding (Phase 4 fix)**: `runSandboxAgentStep` previously
+  skipped seeding seedFiles when `workdir` was empty (universal chat, no
+  project) because of an `if (workdir && ...)` guard. An empty workdir resolves to
+  the sandbox ROOT in Rust, so seeding there is correct — the guard was dropped so
+  Python files are now seeded (and `python foo.py` resolves) in universal chats too.
+- **Filename derivation (Phase 4 fix)**: when the AI's artifact had no real
+  filename, the sandbox seeded it as a generic "python snippet" (no extension),
+  so `python main.py` / `python <name>.py` could never find it. Artifacts now
+  derive `snippet.<ext>` from the language (py/js/ts/rs/...) and Python artifacts
+  always get a `.py` extension, so runs resolve by name.
 - **Verifying Rust**: `cargo check` (from `src-tauri/`) needs system deps on
   Linux: `pkg-config libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev
   libayatana-appindicator3-dev librsvg2-dev libssl-dev`. `src-tauri/gen/` and
@@ -157,6 +175,59 @@ owner's personal preferences — do not genericize the UX.
 ## Web Preview (HTML/TSX/JSX/SVG)
 - `FileViewerModal` builds a sandboxed iframe (`sandbox="allow-scripts ..."`).
 - TSX/JSX are transpiled in-browser (existing logic) before injection.
+- TSX/JSX live preview uses `SandpackTsxPreview` (CodeSandbox Sandpack, real
+  bundler + npm). It hands Sandpack the `react-ts` template with `/App.tsx`
+  overridden by the AI's code. `detectMainComponentName` finds the LAST
+  PascalCase component declaration (function/const-arrow/class) and appends a
+  correct `export default <Name>` when the AI didn't include one — the old
+  `export default App` referenced an undefined `App` whenever the component
+  wasn't named App, crashing the Sandpack bundler → blank preview. Container
+  has `min-h-[200px]` so Sandpack never collapses to 0 height. CONSOLE button
+  toggles the Sandpack console for runtime errors.
+
+## Token accounting (accurate, input + output)
+- `Message.inputTokens` / `Message.outputTokens` (new) hold the TRUE token
+  spend per turn. The SSE stream parser (`captureUsage` in App.tsx) captures
+  the provider's `usage` from the final chunk in all common shapes:
+  OpenAI (`prompt_tokens`/`completion_tokens`), Anthropic
+  (`input_tokens`/`output_tokens`), Gemini (`usageMetadata.promptTokenCount`/
+  `candidatesTokenCount`). When the provider reports usage, those are EXACT.
+  When it doesn't, output is counted via `countTokens` (real BPE, o200k_base)
+  and input is counted by tokenizing the full system prompt + the conversation
+  sent (`fullSystemPrompt` + `cleanApiMessages`). `tokensEstimate` is kept as
+  the legacy output-only field for the per-response footer.
+- `deriveChatStats` (`src/utils/chatStats.ts`) sums input+output per model and
+  exposes `totalInputTokens`/`totalOutputTokens` + per-model
+  `inputTokens`/`outputTokens`. Falls back to `tokensEstimate` for old chats.
+- The three-dots chat-info drawer (`Sidebar.tsx`) renders total + an input/output
+  split card + per-model bars (with a usage-proportion bar). It's a fixed
+  right-side drawer (w-420, h-full) over the chat/code area — NOT a tiny sidebar
+  dropdown — so it has room to show everything.
+- Files-created detection: `deriveChatStats` now also scans message content for
+  fenced code blocks with a `// path/file.ext` comment (mirrors the markdown
+  renderer's smart-filename logic) as a last resort, so universal chats with no
+  projectSnapshotBefore still report the files the AI produced.
+
+## Three-dots chat info (revised)
+- The info button is `MoreVertical` (three dots stacked VERTICALLY), not
+  `MoreHorizontal`. Clicking opens a fixed right-side drawer (`fixed right-0
+  top-0 h-full w-[min(420px,92vw)] z-[61]`) with a backdrop catcher. Shows:
+  scope (Universal/Project + name), token spend (total + input/output split +
+  per-model breakdown with proportion bars), and files created/edited/added.
+
+## Flutter / DartPad (gist-token embed)
+- `src/utils/dartpadEmbed.ts` `buildDartpadEmbedUrl(source, token)` POSTs the
+  Dart to `api.github.com/gists` (Bearer token, public gist, `main.dart`) and
+  returns `https://dartpad.dev/embed-flutter.html?id=<gistId>&run=true`.
+  Cached by an FNV-1a hash of the source (no re-create per keystroke).
+- `gistToken` lives in `BYOKSettings` (Settings → Flutter tab), plumbed
+  App → FileViewerModal/ArtifactViewer → FlutterPhoneSimulator. NEVER hardcode
+  it; the user pastes it once and it persists in Dexie.
+- Without a token, the phone bezel shows the structural widget-tree preview
+  (`dartWidgetParser`) with a "Add a GitHub gist token in Settings for a live
+  DartPad canvas" hint. The Settings UI has a step-by-step "How to get a token"
+  guide (GitHub → Settings → Developer settings → PAT classic → gist scope).
+- `ensureFlutterApp` wraps a bare Widget in `MaterialApp` before gist/analyze.
 
 ## Git / Commits
 - Existing git identity is configured; reuse it. Add

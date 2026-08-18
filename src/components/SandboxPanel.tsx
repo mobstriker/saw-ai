@@ -2,7 +2,6 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { Terminal, Play, Loader2, X, FolderDown, ShieldCheck, AlertTriangle, ChevronDown, ShieldAlert, Check, Plus } from 'lucide-react';
 import {
   parseSandboxCommand,
-  ALLOWED_SANDBOX_COMMANDS,
   type SandboxArtifact,
 } from '../utils/sandboxRunner';
 import { type SandboxLogLine, type SandboxStoreValue } from '../utils/sandboxStore';
@@ -19,6 +18,10 @@ interface SandboxPanelProps {
   /** Latest code artifact (e.g. a Python file the AI just produced) to seed
    *  before running `python <file>.py` so the file actually exists. */
   latestArtifactCode?: { filename: string; language: string; code: string } | null;
+  /** ALL code artifacts from this chat's history, so any file the AI created
+   *  can be run by name (e.g. `python foo.py`, `node bar.js`, multi-file
+   *  projects where foo.py imports bar.py). Deduped by path. */
+  allArtifactFiles?: { path: string; content: string; language: string }[];
 }
 
 type LogLine = SandboxLogLine;
@@ -31,7 +34,7 @@ const QUICK_COMMANDS: { label: string; cmd: string; desc: string }[] = [
   { label: 'cargo build', cmd: 'cargo build --release', desc: 'Rust release build (desktop)' },
 ];
 
-export function SandboxPanel({ project, onClose, store, chatId, latestArtifactCode }: SandboxPanelProps) {
+export function SandboxPanel({ project, onClose, store, chatId, latestArtifactCode, allArtifactFiles }: SandboxPanelProps) {
   const [command, setCommand] = useState('python main.py');
   const [autoSeed, setAutoSeed] = useState(true);
   const [showQuick, setShowQuick] = useState(false);
@@ -67,39 +70,82 @@ export function SandboxPanel({ project, onClose, store, chatId, latestArtifactCo
     return () => document.removeEventListener('mousedown', handler);
   }, [showQuick]);
 
-  // Build the seed files for a run: the bound project's files + the latest AI
-  // code artifact (so `python main.py` has a main.py to run).
+  // Build the seed files for a run: the bound project's files + EVERY artifact
+  // the AI created in this chat (so `python foo.py`, `node bar.js`, and
+  // multi-file imports all resolve). Deduped by path (project files win).
   const buildSeedFiles = useCallback((): { path: string; content: string }[] => {
-    const files: { path: string; content: string }[] = [];
+    const byPath = new Map<string, { path: string; content: string }>();
     if (project && project.files.length > 0) {
       for (const f of project.files) {
-        files.push({ path: f.path.startsWith('/') ? f.path.slice(1) : f.path, content: f.content });
+        const p = f.path.startsWith('/') ? f.path.slice(1) : f.path;
+        byPath.set(p, { path: p, content: f.content });
       }
     }
-    if (latestArtifactCode && latestArtifactCode.code) {
-      files.push({ path: latestArtifactCode.filename || 'main.py', content: latestArtifactCode.code });
+    if (allArtifactFiles && allArtifactFiles.length > 0) {
+      for (const a of allArtifactFiles) {
+        const p = a.path.startsWith('/') ? a.path.slice(1) : a.path;
+        if (!byPath.has(p)) byPath.set(p, { path: p, content: a.content });
+      }
     }
-    return files;
-  }, [project, latestArtifactCode]);
+    // Fall back to the latest single artifact if the full list wasn't passed.
+    if (byPath.size === 0 && latestArtifactCode && latestArtifactCode.code) {
+      byPath.set(latestArtifactCode.filename || 'main.py', {
+        path: latestArtifactCode.filename || 'main.py',
+        content: latestArtifactCode.code,
+      });
+    }
+    return Array.from(byPath.values());
+  }, [project, allArtifactFiles, latestArtifactCode]);
 
   const handleRun = useCallback(async () => {
     if (running) return;
+    const trimmed = command.trim();
+    if (!trimmed) {
+      store.pushLog('error', 'Command is empty.');
+      return;
+    }
+
+    // Seed project + ALL chat artifacts into the Tauri workdir (desktop) so any
+    // file the AI created is runnable by name. For web (Pyodide) we pass them
+    // inline below.
+    const seedFiles = buildSeedFiles();
+    if (available && autoSeed && seedFiles.length > 0) {
+      const workdir = project ? `proj-${project.id}` : '';
+      try {
+        await store.seedFiles(workdir, seedFiles);
+      } catch (e) {
+        store.pushLog('error', `Seeding files failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+
+    // Parse into {command, args} for routing + the leading-token allowlist
+    // check. The store builds a quote-aware command line from these.
     let opts;
     try {
-      opts = parseSandboxCommand(command);
+      opts = parseSandboxCommand(trimmed);
     } catch (e) {
+      // The leading token isn't on the toolchain list. In the desktop build the
+      // backend is a real shell, so shell builtins (cd, ls, pipes, &&) are fine
+      // — surface a clear note and still try to run it as a raw command line so
+      // `cd src && ls` works instead of being rejected.
+      if (available) {
+        const workdir = project ? `proj-${project.id}` : '';
+        await store.runCommand(
+          { command: trimmed, args: [], workdir, rawCommandLine: true } as any,
+          'manual',
+          chatId,
+          undefined,
+        );
+        if (available) await store.refreshArtifacts(workdir);
+        return;
+      }
       store.pushLog('error', e instanceof Error ? e.message : String(e));
       return;
     }
 
-    // Auto-seed project files into the Tauri workdir for desktop builds.
-    if (available && autoSeed && project && project.files.length > 0) {
-      await store.seedProject(project);
-    }
-    // For Python (Pyodide), pass seed files so the entry file exists.
-    const seedFiles = (opts.command === 'python' || opts.command === 'python3') ? buildSeedFiles() : undefined;
+    const pySeed = (opts.command === 'python' || opts.command === 'python3') ? seedFiles : undefined;
     const workdir = project ? `proj-${project.id}` : '';
-    await store.runCommand({ ...opts, workdir }, 'manual', chatId, seedFiles);
+    await store.runCommand({ ...opts, workdir }, 'manual', chatId, pySeed);
     if (available) await store.refreshArtifacts(workdir);
   }, [command, running, project, autoSeed, store, chatId, available, buildSeedFiles]);
 
@@ -222,17 +268,17 @@ export function SandboxPanel({ project, onClose, store, chatId, latestArtifactCo
         <div className="px-4 py-3 bg-amber-900/30 border-b border-amber-700/40 text-amber-200 text-xs flex items-start gap-2">
           <AlertTriangle size={14} className="mt-0.5 shrink-0" />
           <span>
-            <strong>Python runs for real here</strong> via in-browser Pyodide (free, no install). Other toolchains
-            (npm/flutter/cargo) run inside the <strong>SAW AI desktop app</strong> (Tauri) — run
-            <code className="mx-1 px-1 bg-black/30 rounded">npm run tauri dev</code> or the built app to use them.
-            Everything stays scoped to the app's sandbox folder — it cannot touch your PC.
+            <strong>Web build: only Python runs here</strong> (via in-browser Pyodide, free, no install). For the
+            full CLI — <strong>npm, node, dart, flutter, cargo, git, pipes, &&, dev servers</strong> — run
+            <code className="mx-1 px-1 bg-black/30 rounded">npm run tauri dev</code> or the built desktop app. The
+            desktop sandbox is a real jailed shell: it cannot touch your PC or file explorer.
           </span>
         </div>
       )}
       {available && !pythonAvailable && (
-        <div className="px-4 py-2 bg-amber-900/25 border-b border-amber-700/30 text-amber-200 text-[11px] flex items-center gap-2">
-          <AlertTriangle size={12} className="shrink-0" />
-          <span>In-browser Python (Pyodide) is unavailable in this browser — Python commands need the desktop app too.</span>
+        <div className="px-4 py-2 bg-sky-900/20 border-b border-sky-700/30 text-sky-200 text-[11px] flex items-center gap-2">
+          <ShieldCheck size={12} className="shrink-0 text-emerald-400" />
+          <span>Desktop sandbox active — a real jailed shell. Python, npm, flutter, cargo, git, pipes, &&, and dev servers all run here, scoped to the app's folder (no access to your PC).</span>
         </div>
       )}
 
@@ -345,7 +391,9 @@ export function SandboxPanel({ project, onClose, store, chatId, latestArtifactCo
           )}
         </div>
         <p className="text-[10px] text-[#666] leading-relaxed">
-          Python runs in-browser via Pyodide. Other tools ({ALLOWED_SANDBOX_COMMANDS.filter((c) => !c.startsWith('python')).join(', ')}) run inside the desktop app in an app-scoped folder — no shell, no access outside the sandbox.
+          {available
+            ? 'Real jailed shell — run python, npm, flutter, cargo, git, pipes, &&, cd, and dev servers. Everything is scoped to this app folder; your PC stays off-limits.'
+            : 'Web build: Python runs in-browser (Pyodide). The full CLI (npm/node/dart/flutter/cargo/git, pipes, &&, dev servers) runs in the desktop app — run "npm run tauri dev" or the built app.'}
         </p>
       </div>
 

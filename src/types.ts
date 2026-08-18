@@ -7,6 +7,13 @@ export interface Message {
   content: string;
   timestamp: number;
   tokensEstimate?: number;
+  /** Input (prompt) tokens for this turn, from the provider's `usage` when
+   *  available, else a BPE estimate of the system prompt + conversation sent.
+   *  Together with outputTokens this gives the TRUE token spend. */
+  inputTokens?: number;
+  /** Output (completion) tokens for this turn. Same source as inputTokens; when
+   *  the provider reports usage this is exact, else a BPE count of the output. */
+  outputTokens?: number;
   webSearchUsed?: boolean;
   searchResults?: SearchResult[];
   mcpToolsUsed?: string[];
@@ -161,6 +168,13 @@ export interface BYOKSettings {
   systemPrompt: string;
   webSearchEnabled: boolean;
   webSearchMaxResults: number;
+  /** Which web-search backend to use. 'duckduckgo' works out of the box with no
+   *  key (parses DDG HTML results — returns real results for weather/news/live
+   *  data, unlike the old Instant-Answer-only path). 'tavily' uses the Tavily
+   *  API (needs webSearchApiKey) for the highest-quality results. */
+  webSearchProvider?: 'duckduckgo' | 'tavily';
+  /** API key for the Tavily search provider (optional). */
+  webSearchApiKey?: string;
   mcpServers: MCPServer[];
   skills: Skill[]; // Installed and managed skills
   aiProfiles: AIProfile[]; // Saved multiple API keys / AI profiles
