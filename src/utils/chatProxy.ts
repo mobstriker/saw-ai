@@ -257,13 +257,145 @@ export async function performChatRequest(payloadObj: any) {
     fetchPayload.tool_choice = 'auto';
   }
 
-  return await universalFetch(resolvedUrl, {
+  return await fetchChatWithRetry(resolvedUrl, {
     method: 'POST',
     headers,
     body: JSON.stringify(fetchPayload),
     signal: payloadObj.signal,
   });
 }
+
+/**
+ * Retry genuinely-transient failures a few times before giving up. This directly
+ * implements the user's requirement: "if the connection works [on retry], do
+ * not show me an error/retry/continue card in the middle of the 1st/2nd/3rd
+ * prompt." Providers — notably Google's Gemini OpenAI-compatible frontend —
+ * intermittently return HTTP 403 on load-balancer hiccups or during API-key
+ * propagation and then succeed on the next attempt; transient 429 / 408 / 5xx
+ * and raw network errors behave the same. We retry those silently.
+ *
+ * We NEVER retry deterministic client errors (400 bad request, 401 auth, 404
+ * model-not-found, 403-forbidden-with-a-permanent-body) because retrying them is
+ * pointless and would just burn time before showing the SAME real error. The
+ * distinction for 403: a body that clearly indicates a permanent permission /
+ * API-key problem (e.g. "API key not valid", "permission denied", "has not been
+ * used before") is NOT retried — a transient LB 403 has an empty/generic body
+ * and IS retried. This keeps a genuinely-bad key/config surfacing immediately
+ * while a transient hiccup self-heals without bothering the user.
+ */
+const TRANSIENT_RETRY_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+
+function looksLikePermanent403Body(body: string): boolean {
+  const b = (body || '').toLowerCase();
+  // Phrases that mean the key/config is genuinely wrong — do not retry.
+  return (
+    b.includes('api key not valid') ||
+    b.includes('api key not found') ||
+    b.includes('api key invalid') ||
+    b.includes('invalid api key') ||
+    b.includes('permission denied') ||
+    b.includes('access is denied') ||
+    b.includes('not authorized') ||
+    b.includes('has not been used before') ||
+    b.includes('is not enabled') ||
+    b.includes('api not enabled') ||
+    b.includes('forbidden') ||
+    b.includes('safety') ||
+    b.includes('recaptcha')
+  );
+}
+
+function isRetryableNetworkError(err: any): boolean {
+  const m = (err?.message || '').toLowerCase();
+  // A genuine transport/CORS failure (as opposed to a thrown HTTP response).
+  // Aborts are handled separately (we rethrow AbortError before this).
+  return (
+    err?.name === 'TypeError' || // fetch() network failure
+    m.includes('failed to fetch') ||
+    m.includes('networkerror') ||
+    m.includes('network request failed') ||
+    m.includes('load failed') ||
+    m.includes('econnreset') ||
+    m.includes('socket hang up') ||
+    m.includes('timed out')
+  );
+}
+
+async function fetchChatWithRetry(url: string, init: RequestInit, maxAttempts = 3): Promise<Response> {
+  const signal = init.signal as AbortSignal | undefined;
+  let lastError: any;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // Honor an already-aborted request (user clicked stop).
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    let res: Response | null = null;
+    try {
+      res = await universalFetch(url, init);
+    } catch (err: any) {
+      // Network-level error: transient — retry (unless the user aborted).
+      if (signal?.aborted || (err?.name === 'AbortError')) throw err;
+      lastError = err;
+      if (attempt < maxAttempts && isRetryableNetworkError(err)) {
+        await sleep(backoffMs(attempt));
+        continue;
+      }
+      throw err;
+    }
+    if (res.ok) return res;
+
+    // Non-ok response: decide whether it's transient (retry) or permanent (throw).
+    const status = res.status;
+    const bodyText = await res.text().catch(() => '');
+    const permanent =
+      status === 403 ? looksLikePermanent403Body(bodyText) : false;
+    const transient =
+      !permanent &&
+      (TRANSIENT_RETRY_STATUSES.has(status) ||
+        status === 403);
+
+    if (transient && attempt < maxAttempts) {
+      await sleep(backoffMs(attempt));
+      continue;
+    }
+
+    // Permanent error or out of retries — rethrow as an Error carrying the real
+    // HTTP status + provider message so the caller's classifier (which checks
+    // `typeof e.status === 'number'`) can show the true cause instead of a
+    // generic "connection interrupted".
+    let errJson: any = {};
+    try { errJson = JSON.parse(bodyText); } catch { errJson = {}; }
+    const msg = extractChatErrorMessage(errJson, status, bodyText);
+    const httpErr = new Error(msg);
+    (httpErr as any).status = status;
+    (httpErr as any).name = 'HttpProviderError';
+    throw httpErr;
+  }
+  // Should be unreachable, but keep the type-checker happy.
+  throw lastError ?? new Error('Chat request failed.');
+}
+
+function backoffMs(attempt: number): number {
+  // 350ms, 800ms — short, so the 2nd/3rd prompt isn't delayed noticeably while
+  // still spacing out retries to let a transient LB/key-propagation clear.
+  const base = attempt === 1 ? 350 : 800;
+  return base + Math.floor(Math.random() * 200);
+}
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+function extractChatErrorMessage(json: any, status: number, rawText?: string): string {
+  if (!json) return rawText?.trim() || `HTTP ${status}`;
+  if (typeof json === 'string') return json;
+  if (typeof json.message === 'string') return json.message;
+  if (typeof json.error === 'string') return json.error;
+  if (json.error && typeof json.error === 'object') {
+    if (typeof json.error.message === 'string') return json.error.message;
+    if (typeof json.error.type === 'string') return `${json.error.type}: ${json.error.message || ''}`.trim();
+  }
+  if (json.detail && typeof json.detail === 'string') return json.detail;
+  if (rawText && rawText.length < 500) return rawText.trim();
+  return `HTTP ${status}`;
+}
+
 
 /**
  * Key-free, CORS-friendly web search.

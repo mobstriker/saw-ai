@@ -402,15 +402,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
                       <div className="truncate text-xs font-semibold text-[#2C2825]">
                         {displayTitle}
                       </div>
-                      <div className="text-[10px] text-[#A09890] flex items-center gap-1 mt-0.5">
-                        <span>{chat.messages.length} messages</span>
-                        <span>•</span>
+                      <div className="text-[10px] text-[#A09890] flex items-center gap-1.5 mt-0.5 whitespace-nowrap overflow-hidden">
+                        <span className="shrink-0 tabular-nums">{chat.messages.length} msg</span>
+                        <span className="shrink-0 text-[#E6DFD3]">•</span>
                         {parentProject ? (
-                          <span className="text-[#C58B51] font-medium truncate max-w-[90px]">
+                          <span className="text-[#C58B51] font-medium truncate">
                             {parentProject.name}
                           </span>
                         ) : (
-                          <span className="text-[#7C756E] font-medium">Universal Chat</span>
+                          <span className="text-[#7C756E] font-medium shrink-0">Universal Chat</span>
                         )}
                       </div>
                     </div>

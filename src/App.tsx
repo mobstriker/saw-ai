@@ -1764,6 +1764,12 @@ Only produce code, code files, or artifacts when the user's current message expl
       // toggle always searches, so the AI genuinely receives web context.)
       if (willSearchWeb) {
         setAiStatus('searching_web');
+        // The search runs BEFORE the chat and shares the chat's AbortController,
+        // so cap it with its own short timeout — a slow/hung DuckDuckGo or
+        // Wikipedia request must never block the AI response. If it times out
+        // the chat simply proceeds without web context (graceful degradation).
+        const searchTimeout = new AbortController();
+        const searchTimer = setTimeout(() => searchTimeout.abort(), 7000);
         try {
           const searchRes = await performSearchRequest({
             method: 'POST',
@@ -1774,7 +1780,7 @@ Only produce code, code files, or artifacts when the user's current message expl
               provider: settings.webSearchProvider || 'duckduckgo_wikipedia',
               apiKey: settings.webSearchApiKey || '',
             }),
-            signal: controller.signal,
+            signal: searchTimeout.signal,
           });
           if (searchRes.ok) {
             const sData = await searchRes.json();
@@ -1783,7 +1789,10 @@ Only produce code, code files, or artifacts when the user's current message expl
             }
           }
         } catch (sErr) {
+          // Includes the timeout abort + a user-initiated stop — never fatal.
           console.warn('Web search fetch error:', sErr);
+        } finally {
+          clearTimeout(searchTimer);
         }
       }
 
