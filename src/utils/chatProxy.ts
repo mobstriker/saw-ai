@@ -138,7 +138,7 @@ export async function universalFetch(
 }
 
 export async function performChatRequest(payloadObj: any) {
-  const { baseUrl: targetUrl, apiKey, model, messages, stream, system_prompt, custom_headers, max_tokens, reasoning_effort, web_search_context } = payloadObj.body ? JSON.parse(payloadObj.body) : payloadObj;
+  const { baseUrl: targetUrl, apiKey, model, messages, stream, system_prompt, custom_headers, max_tokens, reasoning_effort, web_search_context, mcp_tools } = payloadObj.body ? JSON.parse(payloadObj.body) : payloadObj;
 
   // --- Transparency guards: fail loudly instead of silently falling back ---
   if (!targetUrl || !targetUrl.trim()) {
@@ -218,6 +218,34 @@ export async function performChatRequest(payloadObj: any) {
 
   if (max_tokens && max_tokens > 0) {
     fetchPayload.max_tokens = max_tokens;
+  }
+
+  // MCP tools: advertise them to the provider as native function-calling
+  // tools so models that support tool_calls invoke them directly. Each tool is
+  // namespaced as "<serverName>/<toolName>" so the app can route the returned
+  // tool_call back to the originating server. The system prompt also describes
+  // them in text (for providers without function calling the model is told to
+  // emit ```mcp_tool_call blocks instead).
+  if (Array.isArray(mcp_tools) && mcp_tools.length > 0) {
+    fetchPayload.tools = mcp_tools.map((t: any) => ({
+      type: 'function',
+      function: {
+        name: t._namespaced || t.name,
+        description: t.description || `MCP tool: ${t.name}`,
+        parameters: t.parametersSchema
+          ? (() => {
+              try {
+                return typeof t.parametersSchema === 'string'
+                  ? JSON.parse(t.parametersSchema)
+                  : t.parametersSchema;
+              } catch {
+                return { type: 'object', properties: {} };
+              }
+            })()
+          : { type: 'object', properties: {} },
+      },
+    }));
+    fetchPayload.tool_choice = 'auto';
   }
 
   return await universalFetch(resolvedUrl, {

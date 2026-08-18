@@ -16,8 +16,12 @@ import {
   Database,
   Upload,
   LogOut,
+  MoreHorizontal,
+  FileCode,
+  Hash,
 } from 'lucide-react';
 import { Project, ChatSession, SidebarTab } from '../types';
+import { deriveChatStats } from '../utils/chatStats';
 
 interface SidebarProps {
   isOpen: boolean;
@@ -68,6 +72,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
   const [isDragOver, setIsDragOver] = useState(false);
+  const [infoChatId, setInfoChatId] = useState<string | null>(null);
 
   if (!isOpen) return null;
 
@@ -413,6 +418,16 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 {!isEditing && (
                   <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
                     <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setInfoChatId(infoChatId === chat.id ? null : chat.id);
+                      }}
+                      className={`p-1 rounded hover:bg-[#F5E6D3] ${infoChatId === chat.id ? 'text-[#C58B51]' : 'hover:text-[#C58B51]'}`}
+                      title="Chat info (files & tokens)"
+                    >
+                      <MoreHorizontal size={13} />
+                    </button>
+                    <button
                       onClick={(e) => startRename(chat.id, chat.title, e)}
                       className="p-1 hover:text-[#C58B51]"
                       title="Rename Chat"
@@ -431,6 +446,105 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     </button>
                   </div>
                 )}
+
+                {/* Three-dots info popover: chat scope, files touched, token
+                    spend (total + per model). Shown when the user clicks the
+                    MoreHorizontal button on this row. */}
+                {infoChatId === chat.id && (() => {
+                  const stats = deriveChatStats(chat, projects);
+                  return (
+                    <>
+                      {/* click-away catcher */}
+                      <div
+                        className="fixed inset-0 z-40"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setInfoChatId(null);
+                        }}
+                      />
+                      <div
+                        onClick={(e) => e.stopPropagation()}
+                        className="absolute right-0 top-full mt-1 z-50 w-72 max-h-[70vh] overflow-y-auto rounded-2xl bg-white border border-[#E6DFD3] shadow-2xl p-3 text-[#2C2825] font-sans animate-in fade-in zoom-in-95"
+                      >
+                        <div className="flex items-center justify-between pb-2 mb-2 border-b border-[#E6DFD3]">
+                          <div className="flex items-center gap-1.5 min-w-0">
+                            <Layers size={13} className="text-[#C58B51] shrink-0" />
+                            <span className="text-xs font-bold truncate">{chat.title}</span>
+                          </div>
+                          <button
+                            onClick={(e) => { e.stopPropagation(); setInfoChatId(null); }}
+                            className="p-0.5 text-[#A09890] hover:text-[#2C2825]"
+                            title="Close"
+                          >
+                            <X size={13} />
+                          </button>
+                        </div>
+
+                        {/* Scope */}
+                        <div className="flex items-center gap-1.5 mb-2">
+                          <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${stats.isUniversal ? 'bg-[#FAF8F5] text-[#7C756E] border border-[#E6DFD3]' : 'bg-[#F5E6D3] text-[#C58B51] border border-[#C58B51]/30'}`}>
+                            {stats.isUniversal ? 'Universal Chat' : 'Project Chat'}
+                          </span>
+                          {!stats.isUniversal && stats.projectName && (
+                            <span className="text-[10px] text-[#7C756E] truncate">{stats.projectName}</span>
+                          )}
+                        </div>
+
+                        {/* Token spend */}
+                        <div className="rounded-xl bg-[#FAF8F5] border border-[#E6DFD3] p-2 mb-2">
+                          <div className="flex items-center justify-between mb-1.5">
+                            <span className="text-[10px] font-bold text-[#2C2825] flex items-center gap-1">
+                              <Hash size={11} className="text-[#C58B51]" />
+                              Tokens spent
+                            </span>
+                            <span className="text-[11px] font-mono font-bold text-[#C58B51]">
+                              {stats.totalTokens.toLocaleString()}
+                            </span>
+                          </div>
+                          {stats.perModel.length > 1 ? (
+                            <div className="space-y-1">
+                              {stats.perModel.map((s) => (
+                                <div key={s.model} className="flex items-center justify-between text-[10px]">
+                                  <span className="font-mono text-[#7C756E] truncate max-w-[150px]">{s.model}</span>
+                                  <span className="font-mono text-[#2C2825]">
+                                    {s.tokens.toLocaleString()} <span className="text-[#A09890]">({s.responses}x)</span>
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          ) : stats.perModel.length === 1 ? (
+                            <div className="text-[10px] text-[#7C756E]">
+                              {stats.assistantResponses} response(s) • {stats.perModel[0].model}
+                            </div>
+                          ) : (
+                            <div className="text-[10px] text-[#A09890]">No responses yet</div>
+                          )}
+                        </div>
+
+                        {/* Files touched */}
+                        <div>
+                          <div className="text-[10px] font-bold text-[#2C2825] mb-1 flex items-center gap-1">
+                            <FileCode size={11} className="text-[#C58B51]" />
+                            Files created / edited / added
+                            <span className="text-[#A09890] font-normal">({stats.touchedFiles.length})</span>
+                          </div>
+                          {stats.touchedFiles.length > 0 ? (
+                            <div className="space-y-0.5 max-h-32 overflow-y-auto">
+                              {stats.touchedFiles.map((p) => (
+                                <div key={p} className="text-[10px] font-mono text-[#7C756E] truncate flex items-center gap-1">
+                                  <span className="text-[#C58B51]">•</span>
+                                  <span className="truncate">{p}</span>
+                                </div>
+                              ))}
+                            </div>
+                          ) : (
+                            <div className="text-[10px] text-[#A09890]">No files created or edited in this chat yet.</div>
+                          )}
+                        </div>
+                      </div>
+                    </>
+                  );
+                })()}
               </div>
             );
           })

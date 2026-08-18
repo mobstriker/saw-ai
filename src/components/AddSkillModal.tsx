@@ -17,6 +17,7 @@ import {
 import { Skill, SkillFile } from '../types';
 import { FileSecurity } from '../utils/fileSecurity';
 import { extractZipFiles, isZipFileExport } from '../utils/zipImporter';
+import { collectDroppedFiles } from '../utils/dropHandler';
 
 interface AddSkillModalProps {
   isOpen: boolean;
@@ -300,11 +301,26 @@ ${triggerConditions ? `Trigger: ${triggerConditions}\n` : ''}
                 setDragOver(true);
               }}
               onDragLeave={() => setDragOver(false)}
-              onDrop={(e) => {
+              onDrop={async (e) => {
                 e.preventDefault();
                 setDragOver(false);
-                if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-                  handleUploadedFilesList(e.dataTransfer.files);
+                // Use the shared drop handler so dragging a whole FOLDER onto
+                // this tile traverses every nested file (browsers expose folder
+                // contents via DataTransferItem.getAsEntry, not via .files).
+                // Each dropped file is tagged with its relative path so the
+                // existing read loop picks it up. Zips are expanded inside
+                // collectDroppedFiles too.
+                const dropped = await collectDroppedFiles(e.dataTransfer);
+                if (dropped.length > 0) {
+                  const tagged: File[] = dropped.map((d) => {
+                    const fake = new File([d.file], d.file.name, { type: d.file.type });
+                    Object.defineProperty(fake, 'webkitRelativePath', {
+                      value: d.path,
+                      configurable: true,
+                    });
+                    return fake;
+                  });
+                  handleUploadedFilesList(tagged);
                 }
               }}
               className={`p-4 rounded-xl border-2 border-dashed transition-all text-center flex flex-col items-center justify-center gap-2 ${
@@ -355,7 +371,6 @@ ${triggerConditions ? `Trigger: ${triggerConditions}\n` : ''}
                 ref={filesInputRef}
                 type="file"
                 multiple
-                accept=".zip,.md,.py,.ts,.js,.tsx,.jsx,.json,.txt,.yaml,.yml,.toml,.sh,.bash,.dart,.html,.css,.go,.rs,.java,.kt,.swift,.rb,.php,.c,.cpp,.h,.sql,.csv"
                 className="hidden"
                 onChange={(e) => {
                   if (e.target.files) handleUploadedFilesList(e.target.files);

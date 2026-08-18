@@ -4,7 +4,6 @@ import {
   Square,
   Globe,
   Paperclip,
-  FolderUp,
   Sparkles,
   Layers,
   Trash2,
@@ -188,12 +187,12 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   const [webSearchActive, setWebSearchActive] = useState(settings.webSearchEnabled);
   const [showTokenInfo, setShowTokenInfo] = useState(false);
   const [isDragOverChat, setIsDragOverChat] = useState(false);
+  const [isDragOverInput, setIsDragOverInput] = useState(false);
   const [uploadNotice, setUploadNotice] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const folderInputRef = useRef<HTMLInputElement | null>(null);
   const [isUserScrolledUp, setIsUserScrolledUp] = useState(false);
 
   const [showMcpPopover, setShowMcpPopover] = useState(false);
@@ -1079,49 +1078,28 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
               className="w-full resize-none text-xs outline-none placeholder:text-[#A09890] text-[#2C2825] leading-relaxed bg-transparent"
             />
 
-            {/* Hidden File Input for Paperclip */}
+            {/* Hidden File Input for Paperclip — accepts any file type (files,
+                folders dropped onto the chat/input are handled by the drop
+                handler; zips are extracted in-browser). */}
             <input
               type="file"
               ref={fileInputRef}
               onChange={handleFileSelect}
               multiple
-              accept=".zip,.md,.py,.ts,.js,.tsx,.jsx,.json,.txt,.yaml,.yml,.toml,.sh,.bash,.dart,.html,.css,.go,.rs,.java,.kt,.swift,.rb,.php,.c,.cpp,.h,.sql,.csv,.xml,.svg,.vue,.svelte"
-              className="hidden"
-            />
-            {/* Hidden Folder Input — allows picking a whole directory (also
-                covers dropping a folder, which plain file inputs can't). */}
-            <input
-              type="file"
-              ref={folderInputRef}
-              onChange={handleFileSelect}
-              multiple
-              // @ts-ignore - non-standard but supported in all Chromium/WebKit
-              webkitdirectory=""
-              directory=""
               className="hidden"
             />
 
             {/* Input Controls Footer */}
             <div className="mt-2 flex items-center justify-between pt-1 relative">
               <div className="flex items-center gap-1.5 flex-wrap">
-                {/* Paperclip File Upload */}
+                {/* Paperclip File Upload (any file type; folders/zips handled via drag-drop) */}
                 <button
                   type="button"
                   onClick={() => fileInputRef.current?.click()}
                   className="flex items-center justify-center h-7 w-7 rounded-lg text-[#7C756E] hover:text-[#2C2825] hover:bg-[#FAF8F5] transition-colors cursor-pointer"
-                  title="Upload files (or .zip) to prompt context"
+                  title="Add files (or drop a file/folder/.zip onto the chat)"
                 >
                   <Paperclip size={14} />
-                </button>
-
-                {/* Folder Upload — ingest a whole directory (also handles zips) */}
-                <button
-                  type="button"
-                  onClick={() => folderInputRef.current?.click()}
-                  className="flex items-center justify-center h-7 w-7 rounded-lg text-[#7C756E] hover:text-[#2C2825] hover:bg-[#FAF8F5] transition-colors cursor-pointer"
-                  title="Upload whole folder"
-                >
-                  <FolderUp size={14} />
                 </button>
 
                 {/* MCP Protocol Active Selector Popover Trigger */}
@@ -1318,15 +1296,6 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
 
               {/* Right Side: Reasoning Mode Dropdown (on LEFT side of Send Message button) & Send Button */}
               <div className="flex items-center gap-2">
-                {/* Accurate prompt token count (real BPE tokenizer, not char count). */}
-                <span
-                  className="hidden sm:flex items-center gap-1 px-2 py-1 rounded-lg bg-[#FAF8F5] border border-[#E6DFD3] text-[10px] font-mono font-bold text-[#7C756E] shrink-0"
-                  title="Tokens that will be spent on this prompt (project context + your message), counted with a real BPE tokenizer"
-                >
-                  <span className="text-[#C58B51]">{promptTokenCount.toLocaleString()}</span>
-                  <span className="text-[#A09890] font-normal">tokens</span>
-                </span>
-
                 {/* Reasoning Mode Dropdown Button */}
                 <div className="relative" ref={reasoningPopoverRef}>
                   <button

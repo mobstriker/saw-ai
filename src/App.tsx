@@ -71,6 +71,48 @@ function parseClarificationRequest(content: string): { requests: Array<{ questio
   return null;
 }
 
+/**
+ * A thrown error that carries the provider's HTTP status code. We only treat a
+ * response as a genuine quota/rate-limit error when there is a REAL 429 — never
+ * from a loose substring match on an arbitrary transport error message (which
+ * produced false "Your model provider reported a quota limit" banners on the
+ * desktop webview when the SSE socket closed abruptly after a normal response).
+ */
+class HttpProviderError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'HttpProviderError';
+    this.status = status;
+  }
+}
+function isHttpProviderError(e: any): e is HttpProviderError {
+  return e && typeof e.status === 'number';
+}
+
+/**
+ * Accumulate streamed OpenAI-style tool_call deltas into a map keyed by the
+ * tool_call index. The first delta for a given index carries `id` + `name`;
+ * later deltas carry `arguments` fragments that must be concatenated (the
+ * arguments JSON is streamed token-by-token across many deltas).
+ */
+function accumulateToolCalls(
+  buffers: Map<number, { id: string; name: string; arguments: string }>,
+  toolCalls: any[] | undefined,
+) {
+  if (!Array.isArray(toolCalls)) return;
+  for (const tc of toolCalls) {
+    const idx: number = typeof tc.index === 'number' ? tc.index : 0;
+    const existing = buffers.get(idx) || { id: '', name: '', arguments: '' };
+    if (tc.id) existing.id = tc.id;
+    if (tc.function?.name) existing.name = tc.function.name;
+    if (typeof tc.function?.arguments === 'string') {
+      existing.arguments += tc.function.arguments;
+    }
+    buffers.set(idx, existing);
+  }
+}
+
 import { ArtifactParser } from './utils/artifactParser';
 import { PatchApplier, PatchChunk } from './utils/patchApplier';
 import { WorkspaceAutopilot } from './utils/workspaceAutopilot';
@@ -80,7 +122,9 @@ import { ALLOWED_SANDBOX_COMMANDS } from './utils/sandboxRunner';
 import { IntentDetector } from './utils/intentDetector';
 import { ModelRouter } from './utils/modelRouter';
 import { ChatTitler } from './utils/chatTitler';
+import { countTokens } from './utils/tokenCounter';
 import { parseThinkingFromStream } from './utils/reasoning';
+import { probeMcpServer, callMcpTool, parseToolCallsFromText } from './utils/mcpExecutor';
 import { Sidebar } from './components/Sidebar';
 import { ChatWindow } from './components/ChatWindow';
 import { RightPanel } from './components/RightPanel';
@@ -215,6 +259,10 @@ export default function App() {
   // runaway loops. Reset whenever the user sends a fresh message.
   const sandboxFollowupRef = useRef(0);
   const SANDBOX_MAX_FOLLOWUPS = 6;
+  const MCP_MAX_TOOL_ROUNDS = 6;
+  // Bounds AI→MCP tool→AI follow-up rounds per manual user prompt (tool-calling
+  // loop). Reset whenever the user sends a fresh message.
+  const mcpFollowupRef = useRef(0);
 
   // 4. Modals
   const [selectedFileForModal, setSelectedFileForModal] = useState<ProjectFile | null>(null);
@@ -483,6 +531,34 @@ export default function App() {
       setCurrentArtifact((prev) => prev ?? extracted[extracted.length - 1]);
     }
   }, [activeChatId, activeChat?.messages.length]);
+
+  // On load, automatically probe every enabled MCP server so their real status
+  // (online/offline) + discovered tools are known before the first chat. Without
+  // this, servers show as "unknown"/"untested" and their tools are never sent to
+  // the model (the runtime filter requires status === 'online'), so MCP would
+  // silently do nothing even when servers are configured.
+  useEffect(() => {
+    if (!isDataLoaded) return;
+    const enabled = (settings.mcpServers || []).filter((s) => s.enabled);
+    if (enabled.length === 0) return;
+    let cancelled = false;
+    (async () => {
+      const probed = await Promise.all(enabled.map((s) => probeMcpServer(s)));
+      if (cancelled) return;
+      setSettings((prev) => {
+        const map = new Map(probed.map((s) => [s.id, s]));
+        const next = (prev.mcpServers || []).map((s) => map.get(s.id) || s);
+        return { ...prev, mcpServers: next };
+      });
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // Only re-probe when the set of enabled servers changes (by id), not on
+    // every settings mutation (which would re-probe after each probe writes
+    // status back and loop). isDataLoaded gates the first run.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isDataLoaded, (settings.mcpServers || []).filter((s) => s.enabled).map((s) => s.id).join(',')]);
 
   // In a universal (no-project) chat the Files tab has no project to show, so
   // it is hidden in the RightPanel header. Make sure the active tab lands on
@@ -1086,7 +1162,10 @@ export default function App() {
 
       if (!response.ok) {
         const errJson = await response.json().catch(() => ({}));
-        throw new Error(errJson.message || errJson.error || `HTTP ${response.status}`);
+        throw new HttpProviderError(
+          errJson.message || errJson.error || `HTTP ${response.status}`,
+          response.status,
+        );
       }
 
       const reader = response.body?.getReader();
@@ -1435,14 +1514,16 @@ export default function App() {
     useWebSearch: boolean,
     priorMessagesOverride?: Message[],
     forcedChatId?: string,
-    isSandboxFollowup = false
+    isSandboxFollowup = false,
+    isMcpToolFollowup = false
   ) => {
     if (!userPrompt.trim() || isGenerating) return;
 
     // A fresh manual user message starts a new agent turn — reset the
     // sandbox follow-up round counter. Follow-up re-prompts keep it counting.
-    if (!isSandboxFollowup) {
+    if (!isSandboxFollowup && !isMcpToolFollowup) {
       sandboxFollowupRef.current = 0;
+      mcpFollowupRef.current = 0;
     }
 
     let targetChat = forcedChatId ? chats.find(c => c.id === forcedChatId) || activeChat : activeChat;
@@ -1599,6 +1680,9 @@ export default function App() {
     let completedAssistantText = '';
     let completedChatId = chatTargetId;
     let completedAutoMode: AutomationMode = 'automatic';
+    // Hoisted for the post-completion MCP tool-execution follow-up: native
+    // tool_calls captured from the stream + text-parsed mcp_tool_call blocks.
+    let completedNativeToolCalls: Array<{ id: string; name: string; arguments: string }> = [];
 
     try {
       // 2. Perform Web Search ONLY if IntentDetector verified it is genuinely required
@@ -1682,16 +1766,27 @@ export default function App() {
       const activeMcps = (settings.mcpServers || []).filter(
         (s) => s.enabled && s.status === 'online',
       );
+      // Namespaced tool list for the request body + a server-lookup map. Each
+      // tool is sent as "<serverName>/<toolName>" so a returned tool_call can be
+      // routed back to the originating MCP server.
+      const mcpNamespacedTools = activeMcps.flatMap((s) =>
+        (s.tools || [])
+          .filter((t) => t.enabled)
+          .map((t) => ({ ...t, _namespaced: `${s.name}/${t.name}`, _serverName: s.name, _serverUrl: s.url })),
+      );
+      // serverName -> server (for executing tool calls after the model returns).
+      const mcpServerByName = new Map(activeMcps.map((s) => [s.name, s]));
+
       if (activeMcps.length > 0) {
         const mcpDescriptions = activeMcps.map((s) => {
           const enabledTools = (s.tools || []).filter((t) => t.enabled);
           const toolList = enabledTools.length > 0
-            ? enabledTools.map((t) => `  - ${t.name}: ${t.description}`).join('\n')
+            ? enabledTools.map((t) => `  - ${s.name}/${t.name}: ${t.description}`).join('\n')
             : '  (server reachable but no tools discovered)';
           return `[MCP Server: ${s.name} (${s.type}) — ${s.url}]\n${toolList}`;
         }).join('\n\n');
 
-        fullSystemPrompt += `\n\n# Active Model Context Protocol (MCP) Tools:\nThe following MCP servers are connected and their tools are available for this chat. You may invoke or reference them to inspect data, run analytical queries, or read external resources:\n${mcpDescriptions}\n\nWhen tool execution is requested, format tool usage clearly (tool name + JSON arguments) so the MCP execution layer can run it.`;
+        fullSystemPrompt += `\n\n# Active Model Context Protocol (MCP) Tools:\nThe following MCP servers are connected and their tools are available for this chat. You may invoke or reference them to inspect data, run analytical queries, or read external resources:\n${mcpDescriptions}\n\n## How to call MCP tools\nIf your runtime supports native tool/function calling, call a tool by its full namespaced id (e.g. \`${activeMcps[0]?.name}/${(activeMcps[0]?.tools?.find((t) => t.enabled)?.name) || 'toolName'}\`). If it does NOT support native function calling, emit a fenced block:\n\n\`\`\`mcp_tool_call\n{ "tool": "<serverName>/<toolName>", "arguments": { ... } }\n\`\`\`\n\nYou may make multiple tool calls. The MCP execution layer runs each call against the named server and returns the result text to you automatically so you can read it and continue. Only call tools that are relevant to the user's request.`;
       }
 
       // In Autonomous Multi-Step Planning mode, instruct AI on interactive checklists for complex tasks
@@ -1743,7 +1838,7 @@ You have been granted access to run commands in the user's restricted in-app san
           system_prompt: fullSystemPrompt,
           web_search_context: webSearchResults,
           custom_headers: parsedHeaders,
-          mcp_tools: activeMcps.flatMap(s => (s.tools || []).filter(t => t.enabled)),
+          mcp_tools: mcpNamespacedTools,
           reasoning_effort: reasoningMode,
           max_tokens: activeProfile?.maxTokens || settings.maxTokens || 0,
         }),
@@ -1752,7 +1847,10 @@ You have been granted access to run commands in the user's restricted in-app san
 
       if (!response.ok) {
         const errJson = await response.json().catch(() => ({}));
-        throw new Error(errJson.message || errJson.error || `HTTP ${response.status}`);
+        throw new HttpProviderError(
+          errJson.message || errJson.error || `HTTP ${response.status}`,
+          response.status,
+        );
       }
 
       // 5. Read SSE stream
@@ -1766,6 +1864,9 @@ You have been granted access to run commands in the user's restricted in-app san
       let buffer = '';
       rawAccumulatedStream = '';
       rawAccumulatedThinking = '';
+      // Accumulates native OpenAI-style tool_calls streamed across deltas.
+      // Index -> { id, name(nameSpaced), arguments(string, built up across deltas) }.
+      const toolCallBuffers = new Map<number, { id: string; name: string; arguments: string }>();
 
       while (true) {
         const { done, value } = await reader.read();
@@ -1793,6 +1894,7 @@ You have been granted access to run commands in the user's restricted in-app san
               reasoningDelta = data.choices?.[0]?.delta?.reasoning_content || data.choices?.[0]?.delta?.reasoning || data.choices?.[0]?.delta?.thinking || '';
               const fr = data.choices?.[0]?.finish_reason;
               if (fr) streamFinishReason = fr;
+              accumulateToolCalls(toolCallBuffers, data.choices?.[0]?.delta?.tool_calls);
             } catch (pErr) {
               // Non-fatal SSE chunk parse
             }
@@ -1803,6 +1905,7 @@ You have been granted access to run commands in the user's restricted in-app san
               reasoningDelta = data.choices?.[0]?.delta?.reasoning_content || data.choices?.[0]?.delta?.reasoning || data.choices?.[0]?.delta?.thinking || '';
               const fr = data.choices?.[0]?.finish_reason;
               if (fr) streamFinishReason = fr;
+              accumulateToolCalls(toolCallBuffers, data.choices?.[0]?.delta?.tool_calls || data.choices?.[0]?.message?.tool_calls);
             } catch (pErr) {
               // Non-fatal JSON chunk parse
             }
@@ -1874,6 +1977,14 @@ You have been granted access to run commands in the user's restricted in-app san
       // (or a missing finish_reason with no content) is a real cutoff.
       const wasTruncatedByLimit = streamFinishReason === 'length';
 
+      // Accurate token count for this completed assistant response (real BPE
+      // tokenizer). Computed once here so the per-response footer and the chat
+      // three-dots info popover both read from message.tokensEstimate.
+      const finalParsed0 = parseThinkingFromStream(rawAccumulatedStream);
+      const responseTokenCount = await countTokens(
+        (finalParsed0.content || assistantMessageContent || '').trim(),
+      );
+
       // Finalize thinking state on message. Persist immediately (not just
       // via the debounced effect) so the completed assistant message survives
       // a reload even if it happens within the debounce window.
@@ -1921,6 +2032,7 @@ You have been granted access to run commands in the user's restricted in-app san
                     clarificationAnswers: [],
                     modelUsed: chosenModelDisplayName,
                     generationDurationMs: Date.now() - requestStartTime,
+                    tokensEstimate: responseTokenCount,
                   }
                 : m
             ),
@@ -1942,6 +2054,10 @@ You have been granted access to run commands in the user's restricted in-app san
 
       // Capture for the post-completion sandbox agent follow-up.
       completedAssistantText = fullAssistantOutput;
+      // Capture native tool_calls streamed this turn for the MCP follow-up.
+      completedNativeToolCalls = Array.from(toolCallBuffers.values()).filter(
+        (tc) => tc.name,
+      );
 
       let targetProject = targetChat.projectId
         ? projects.find((p) => p.id === targetChat.projectId) || null
@@ -2146,6 +2262,7 @@ You have been granted access to run commands in the user's restricted in-app san
         if (cleanStop && existingPartialContent) {
           // Treat as a successful completion (the model finished cleanly; the
           // error was just the transport closing).
+          const completedTokens = await countTokens(existingPartialContent);
           setChats((prevChats) => {
             const updated = prevChats.map((c) => {
               if (c.id !== targetChat.id) return c;
@@ -2160,6 +2277,7 @@ You have been granted access to run commands in the user's restricted in-app san
                       isError: false,
                       modelUsed: chosenModelDisplayName,
                       generationDurationMs: Date.now() - requestStartTime,
+                      tokensEstimate: completedTokens,
                     }
                   : m
               );
@@ -2169,32 +2287,48 @@ You have been granted access to run commands in the user's restricted in-app san
             return updated;
           });
         } else {
+          // Classify the error. CRITICAL: a genuine quota/rate-limit error is
+          // recognized ONLY from a real HTTP 429 status (carried on
+          // HttpProviderError) — never from a loose substring match on an
+          // arbitrary thrown transport error message. The old substring matcher
+          // turned benign desktop-webview socket-close errors into false
+          // "Your model provider reported a quota limit" banners on the 2nd/3rd
+          // prompt. Transport errors with partial content are treated as a
+          // stop (continue/retry), not a hard error.
+          const httpStatus = isHttpProviderError(err) ? err.status : 0;
+
           const isApiKeyError =
+            httpStatus === 401 ||
             err.message?.includes('No API') ||
             err.message?.includes('API key') ||
             err.message?.includes('API Key') ||
             err.message?.includes('configure an API') ||
-            err.message?.includes('401') ||
             err.message?.includes('Unauthorized') ||
             err.message?.includes('Invalid Authentication');
 
+          // Real 429, or an explicit provider quota payload (only from a real
+          // HTTP response, not a transport error).
           const isQuotaError =
-            err.message?.includes('resource_exhausted') ||
-            err.message?.includes('RESOURCE_EXHAUSTED') ||
-            err.message?.includes('quota') ||
-            err.message?.includes('Quota') ||
-            err.message?.includes('429') ||
-            err.message?.includes('rate limit') ||
-            err.message?.includes('Rate limit') ||
-            err.message?.includes('exceeded your current quota');
+            httpStatus === 429 ||
+            (isHttpProviderError(err) && (
+              err.message?.includes('resource_exhausted') ||
+              err.message?.includes('RESOURCE_EXHAUSTED') ||
+              err.message?.includes('exceeded your current quota')
+            ));
 
           let errorContent = '';
           if (isApiKeyError) {
             errorContent = `⚠️ **API Key Configuration Required**\n\nTo connect to your configured model, please enter your API key in **Settings** (⚙️).\n\n*Click the "Open Settings" button in the top header or sidebar to configure your key.*`;
           } else if (isQuotaError) {
             errorContent = `⚠️ **API Rate Limit / Quota Exceeded**\n\nYour model provider reported a quota limit (\`RESOURCE_EXHAUSTED\` / \`429\`):\n\n> *${err.message}*\n\n**Recommended Solutions:**\n- ⏳ **Wait 30–60 seconds** for the model provider's rate limit window to reset.\n- ⚙️ **Switch Model/Profile:** Open **Settings (⚙️)** to switch to a different model (e.g., Claude 3.5 Sonnet, GPT-4o, DeepSeek R1, or another Gemini tier).\n- 🔑 **Custom Key:** If using your own API key, check your quota and billing tier in your provider's developer console.`;
+          } else if (existingPartialContent) {
+            // Transport interruption with partial content: NOT a hard error.
+            // Keep what the model produced and offer Continue/Retry. Do not
+            // show a scary quota/connection banner — the response itself is
+            // useful and the user can just continue.
+            errorContent = '';
           } else {
-            errorContent = `⚠️ **Connection Error**\n\n${err.message || 'Unable to connect to the model endpoint. Please check your settings or network connection.'}`;
+            errorContent = `⚠️ **Connection Interrupted**\n\nThe response stream was interrupted before any content arrived. Click **Retry** to try again.\n\n\`${err.message || 'Network/stream error'}\``;
           }
 
           setChats((prevChats) => {
@@ -2210,10 +2344,11 @@ You have been granted access to run commands in the user's restricted in-app san
                           content: existingPartialContent || errorContent,
                           thinkingContent: combinedThinking || m.thinkingContent,
                           isThinking: false,
-                          isError: !existingPartialContent,
-                          // A genuine transport error with partial content is a
-                          // real interruption → allow continue/retry. (No clean
-                          // finish_reason reached us, unlike the path above.)
+                          // A transport error with partial content is an
+                          // interruption (continue/retry) — NOT a hard error
+                          // and NOT a fake quota banner. Only show isError when
+                          // there is no content at all.
+                          isError: !existingPartialContent && Boolean(errorContent),
                           isStopped: Boolean(existingPartialContent),
                         }
                       : m
@@ -2226,7 +2361,7 @@ You have been granted access to run commands in the user's restricted in-app san
                       content: existingPartialContent || errorContent,
                       thinkingContent: combinedThinking,
                       timestamp: Date.now(),
-                      isError: !existingPartialContent,
+                      isError: !existingPartialContent && Boolean(errorContent),
                       isStopped: Boolean(existingPartialContent),
                     },
                   ];
@@ -2245,6 +2380,91 @@ You have been granted access to run commands in the user's restricted in-app san
       setCurrentGeneratingModelName(null);
       setAiStatus('idle');
       abortControllerRef.current = null;
+    }
+
+    // 6.5. MCP tool-execution follow-up (AI → MCP server → AI). When the model
+    // requested MCP tools this turn — either via native tool_calls (OpenAI
+    // function calling) or via ```mcp_tool_call text blocks — the app actually
+    // executes each call against the named MCP server (JSON-RPC tools/call) and
+    // feeds the result text back as a follow-up user turn so the model can read
+    // the data and continue. This is the real tool-execution bridge: the model's
+    // tool calls are no longer just described in the prompt — they're run, and
+    // the output is returned. Capped to avoid runaway loops.
+    if (
+      completedAssistantText &&
+      mcpFollowupRef.current < MCP_MAX_TOOL_ROUNDS &&
+      !isSandboxFollowup // sandbox follow-ups must not spawn MCP rounds (avoid cross-loops)
+      // isMcpToolFollowup IS allowed to continue the MCP tool-calling loop so
+      // the model can make multiple sequential tool calls across rounds.
+    ) {
+      // Build the list of tool calls requested this turn.
+      // Native tool_calls: name is namespaced "serverName/toolName".
+      const nativeCalls = completedNativeToolCalls
+        .map((tc) => {
+          const slash = tc.name.indexOf('/');
+          if (slash < 0) return null;
+          const serverName = tc.name.slice(0, slash);
+          const toolName = tc.name.slice(slash + 1);
+          let args: Record<string, unknown> = {};
+          try {
+            args = tc.arguments ? JSON.parse(tc.arguments) : {};
+          } catch {
+            args = { _raw: tc.arguments };
+          }
+          return { serverName, toolName, args, raw: tc.name };
+        })
+        .filter(Boolean) as Array<{ serverName: string; toolName: string; args: Record<string, unknown>; raw: string }>;
+
+      // Text-based fallback: ```mcp_tool_call blocks.
+      const textCalls = parseToolCallsFromText(completedAssistantText).map((p) => ({
+        serverName: p.serverName,
+        toolName: p.toolName,
+        args: p.args,
+        raw: p.raw,
+      }));
+
+      const allCalls = [...nativeCalls, ...textCalls];
+      if (allCalls.length > 0) {
+        mcpFollowupRef.current += 1;
+        const round = mcpFollowupRef.current;
+        const servers = (settings.mcpServers || []).filter((s) => s.enabled);
+        const serverByName = new Map(servers.map((s) => [s.name, s]));
+        const results: string[] = [];
+        for (const call of allCalls) {
+          const server = call.serverName ? serverByName.get(call.serverName) : servers[0];
+          if (!server) {
+            results.push(
+              `🔧 MCP tool call "${call.raw}" → no enabled server named "${call.serverName}". Available: ${servers.map((s) => s.name).join(', ') || '(none)'}.`,
+            );
+            continue;
+          }
+          if (server.status !== 'online') {
+            // Try to (re)probe before failing — it may just be stale status.
+            const probed = await probeMcpServer(server);
+            if (probed.status !== 'online') {
+              results.push(`🔧 MCP tool call "${call.raw}" → server "${server.name}" is offline (${server.url}).`);
+              continue;
+            }
+          }
+          const res = await callMcpTool(server, call.toolName, call.args);
+          const tag = res.isError ? '⚠️' : '✅';
+          results.push(
+            `${tag} MCP tool call "${call.raw}" → ${res.isError ? 'errored' : 'succeeded'}:\n${res.content}`,
+          );
+        }
+
+        if (results.length > 0) {
+          const combined = results.join('\n\n---\n\n');
+          await handleSendMessage(
+            `[MCP tool execution results — round ${round}]\n\n${combined}\n\nRead these results and continue the task. If you need more data, make additional MCP tool calls; otherwise, summarize the outcome for the user.`,
+            false,
+            undefined,
+            completedChatId,
+            false,
+            true,
+          );
+        }
+      }
     }
 
     // 7. Sandbox agent follow-up (AI → sandbox → AI). Only when the user has
