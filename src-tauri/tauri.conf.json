@@ -22,7 +22,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self' 'unsafe-inline' 'unsafe-eval' https: http://localhost:* http://127.0.0.1:*; connect-src 'self' https: http://localhost:* http://127.0.0.1:* https://localhost:* https://127.0.0.1:* blob: data: ws: wss:; img-src 'self' data: blob: https:; frame-src 'self' data: blob: https://dartpad.dev https://*.dartpad.dev https://codesandbox.io https://*.codesandbox.io https://*.csb.app https://sandpack-bundler*; worker-src 'self' blob:;"
+      "csp": "default-src 'self' 'unsafe-inline' 'unsafe-eval' https: http://localhost:* http://127.0.0.1:*; connect-src 'self' https: http://localhost:* http://127.0.0.1:* https://localhost:* https://127.0.0.1:* blob: data: ws: wss:; img-src 'self' data: blob: https:; frame-src 'self' data: blob: https://dartpad.dev https://*.dartpad.dev https://codesandbox.io https://*.codesandbox.io https://*.csb.app; worker-src 'self' blob:;"
     }
   },
   "bundle": {
