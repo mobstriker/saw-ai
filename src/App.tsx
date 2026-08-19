@@ -293,18 +293,15 @@ export default function App() {
     if (typeof window === 'undefined' || !(window as any).__TAURI_INTERNALS__) return;
     let unlisten: (() => void) | undefined;
     let disposed = false;
-    (async () => {
+    const un = await win.onCloseRequested(async (event) => {
+      event.preventDefault();
       try {
-        const { getCurrentWindow } = await import('@tauri-apps/api/window');
-        const win = getCurrentWindow();
-        const un = await win.onCloseRequested(async (event) => {
-          event.preventDefault();
-          try {
-            await StorageService.flushPendingAsync();
-          } finally {
-            await win.destroy();
-          }
-        });
+        // StorageService.flushPending is synchronous — call it to commit debounced writes.
+        StorageService.flushPending();
+      } finally {
+        await win.destroy();
+      }
+    });
         if (disposed) un();
         else unlisten = un;
       } catch {
