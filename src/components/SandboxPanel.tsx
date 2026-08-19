@@ -56,6 +56,13 @@ export function SandboxPanel({ project, onClose, store, chatId, latestArtifactCo
   const artifacts = chatState?.artifacts ?? [];
   const { available, pythonAvailable, accessGranted, pendingApproval } = store;
 
+  // Per-chat sandbox workdir. A project-bound chat uses the project's dir;
+  // a universal chat gets its OWN dir keyed by chat id (`chat-<id>`) — the old
+  // code used the sandbox ROOT for every universal chat, so files from
+  // different chats leaked into each other and commands ran in a shared,
+  // stale directory instead of a per-chat workdir.
+  const workdir = project ? `proj-${project.id}` : `chat-${chatId}`;
+
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [logs.length]);
@@ -110,7 +117,6 @@ export function SandboxPanel({ project, onClose, store, chatId, latestArtifactCo
     // inline below.
     const seedFiles = buildSeedFiles();
     if (available && autoSeed && seedFiles.length > 0) {
-      const workdir = project ? `proj-${project.id}` : '';
       try {
         await store.seedFiles(workdir, seedFiles);
       } catch (e) {
@@ -129,7 +135,6 @@ export function SandboxPanel({ project, onClose, store, chatId, latestArtifactCo
       // — surface a clear note and still try to run it as a raw command line so
       // `cd src && ls` works instead of being rejected.
       if (available) {
-        const workdir = project ? `proj-${project.id}` : '';
         await store.runCommand(
           { command: trimmed, args: [], workdir, rawCommandLine: true } as any,
           'manual',
@@ -144,10 +149,9 @@ export function SandboxPanel({ project, onClose, store, chatId, latestArtifactCo
     }
 
     const pySeed = (opts.command === 'python' || opts.command === 'python3') ? seedFiles : undefined;
-    const workdir = project ? `proj-${project.id}` : '';
     await store.runCommand({ ...opts, workdir }, 'manual', chatId, pySeed);
     if (available) await store.refreshArtifacts(workdir);
-  }, [command, running, project, autoSeed, store, chatId, available, buildSeedFiles]);
+  }, [command, running, project, autoSeed, store, chatId, available, buildSeedFiles, workdir]);
 
   const downloadArtifact = useCallback((a: SandboxArtifact) => {
     // Use the Tauri FS plugin's readTextFile/binary read is overkill; instead

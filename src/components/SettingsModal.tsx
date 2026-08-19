@@ -1536,12 +1536,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 <div className="p-4 rounded-2xl bg-[#FAF8F5] border border-[#E6DFD3]">
                   <div className="flex items-center gap-2 mb-1">
                     <Globe size={16} className="text-[#C58B51]" />
-                    <h4 className="text-xs font-bold text-[#2C2825]">Built-In Web Grounding (Free & Universal)</h4>
+                    <h4 className="text-xs font-bold text-[#2C2825]">Web Grounding (Bring Your Own Search Key)</h4>
                   </div>
                   <p className="text-xs text-[#7C756E] leading-relaxed">
-                    Real-time web search returns ranked results from DuckDuckGo (including weather, news, and live
-                    data) and injects ground-truth citations into the prompt before the answer is generated. For the
-                    highest-quality results, add a Tavily API key.
+                    Pick ONE search provider and paste its API key — results are injected as ground-truth citations
+                    into the prompt before the answer is generated. All three providers offer generous free credits
+                    on a fresh account (enough to get through the month for typical use): Tavily, Serper (real
+                    Google results), and LangSearch.
                   </p>
                 </div>
 
@@ -1559,32 +1560,56 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
 
                 <div>
-                  <label className="text-xs font-bold text-[#2C2825] mb-1.5 block">Search Provider</label>
+                  <label className="text-xs font-bold text-[#2C2825] mb-1.5 block">Search Provider (one active at a time)</label>
                   <select
-                    value={formData.webSearchProvider || 'duckduckgo_wikipedia'}
-                    onChange={(e) => setFormData({ ...formData, webSearchProvider: e.target.value as 'duckduckgo' | 'wikipedia' | 'duckduckgo_wikipedia' | 'tavily' })}
+                    value={formData.webSearchProvider || 'tavily'}
+                    onChange={(e) => setFormData({ ...formData, webSearchProvider: e.target.value as 'tavily' | 'serper' | 'langsearch' })}
                     className="w-full px-3 py-2 rounded-lg border border-[#E6DFD3] bg-white text-xs text-[#2C2825] focus:outline-none focus:ring-2 focus:ring-[#C58B51]/40"
                   >
-                    <option value="duckduckgo_wikipedia">DuckDuckGo + Wikipedia (free, no key — best free coverage)</option>
-                    <option value="duckduckgo">DuckDuckGo (free, no key — weather/news/live data)</option>
-                    <option value="wikipedia">Wikipedia (free, no key — encyclopedic lookups)</option>
-                    <option value="tavily">Tavily (best quality — needs API key below)</option>
+                    <option value="tavily">Tavily (clean answers + ranked sources)</option>
+                    <option value="serper">Serper (real Google results — 2,500 free queries)</option>
+                    <option value="langsearch">LangSearch (free web-search API, no credit card)</option>
                   </select>
+                  <p className="text-[10px] text-[#7C756E] mt-1">
+                    Only the selected provider is used. Add keys for any of them below and switch freely.
+                  </p>
                 </div>
 
-                {(formData.webSearchProvider || 'duckduckgo_wikipedia') === 'tavily' && (
-                  <div>
-                    <label className="text-xs font-bold text-[#2C2825] mb-1.5 block">Tavily API Key</label>
-                    <input
-                      type="password"
-                      value={formData.webSearchApiKey || ''}
-                      onChange={(e) => setFormData({ ...formData, webSearchApiKey: e.target.value })}
-                      placeholder="tvly-..."
-                      className="w-full px-3 py-2 rounded-lg border border-[#E6DFD3] bg-white text-xs text-[#2C2825] focus:outline-none focus:ring-2 focus:ring-[#C58B51]/40"
-                    />
-                    <p className="text-[10px] text-[#7C756E] mt-1">Get a free key at tavily.com. Stored locally only.</p>
-                  </div>
-                )}
+                <div>
+                  <label className="text-xs font-bold text-[#2C2825] mb-1.5 block">Tavily API Key</label>
+                  <input
+                    type="password"
+                    value={formData.webSearchApiKey || ''}
+                    onChange={(e) => setFormData({ ...formData, webSearchApiKey: e.target.value })}
+                    placeholder="tvly-..."
+                    className="w-full px-3 py-2 rounded-lg border border-[#E6DFD3] bg-white text-xs text-[#2C2825] focus:outline-none focus:ring-2 focus:ring-[#C58B51]/40"
+                  />
+                  <p className="text-[10px] text-[#7C756E] mt-1">Free key at tavily.com. Stored locally only.</p>
+                </div>
+
+                <div>
+                  <label className="text-xs font-bold text-[#2C2825] mb-1.5 block">Serper API Key</label>
+                  <input
+                    type="password"
+                    value={formData.serperApiKey || ''}
+                    onChange={(e) => setFormData({ ...formData, serperApiKey: e.target.value })}
+                    placeholder="Serper API key..."
+                    className="w-full px-3 py-2 rounded-lg border border-[#E6DFD3] bg-white text-xs text-[#2C2825] focus:outline-none focus:ring-2 focus:ring-[#C58B51]/40"
+                  />
+                  <p className="text-[10px] text-[#7C756E] mt-1">Free key at serper.dev (2,500 free queries). Stored locally only.</p>
+                </div>
+
+                <div>
+                  <label className="text-xs font-bold text-[#2C2825] mb-1.5 block">LangSearch API Key</label>
+                  <input
+                    type="password"
+                    value={formData.langsearchApiKey || ''}
+                    onChange={(e) => setFormData({ ...formData, langsearchApiKey: e.target.value })}
+                    placeholder="LangSearch API key..."
+                    className="w-full px-3 py-2 rounded-lg border border-[#E6DFD3] bg-white text-xs text-[#2C2825] focus:outline-none focus:ring-2 focus:ring-[#C58B51]/40"
+                  />
+                  <p className="text-[10px] text-[#7C756E] mt-1">Free key at langsearch.com (no credit card). Stored locally only.</p>
+                </div>
 
                 <div>
                   <div className="flex items-center justify-between mb-1.5">

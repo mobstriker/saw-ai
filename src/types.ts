@@ -168,15 +168,17 @@ export interface BYOKSettings {
   systemPrompt: string;
   webSearchEnabled: boolean;
   webSearchMaxResults: number;
-  /** Which web-search backend to use. 'duckduckgo' works out of the box with no
-   *  key (parses DDG HTML results — returns real results for weather/news/live
-   *  data, unlike the old Instant-Answer-only path). 'wikipedia' uses the
-   *  Wikipedia search API (encyclopedic, keyless, CORS-open). 'duckduckgo_wikipedia'
-   *  combines both free backends (best free coverage). 'tavily' uses the Tavily
-   *  API (needs webSearchApiKey) for the highest-quality results. */
-  webSearchProvider?: 'duckduckgo' | 'wikipedia' | 'duckduckgo_wikipedia' | 'tavily';
-  /** API key for the Tavily search provider (optional). */
+  /** Which web-search backend to use. Only ONE provider is active at a time
+   *  (whichever is selected here). All three give generous free credits on a
+   *  fresh account: 'tavily' (tavily.com), 'serper' (serper.dev — Google
+   *  results), and 'langsearch' (langsearch.com — Bing-compatible shape). */
+  webSearchProvider?: 'tavily' | 'serper' | 'langsearch';
+  /** API key for the Tavily search provider (free key at tavily.com). */
   webSearchApiKey?: string;
+  /** API key for the Serper search provider (free key at serper.dev). */
+  serperApiKey?: string;
+  /** API key for the LangSearch search provider (free key at langsearch.com). */
+  langsearchApiKey?: string;
   mcpServers: MCPServer[];
   skills: Skill[]; // Installed and managed skills
   aiProfiles: AIProfile[]; // Saved multiple API keys / AI profiles

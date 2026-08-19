@@ -42,7 +42,6 @@ export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
 }) => {
   const [deviceType, setDeviceType] = useState<DeviceType>('pixel8');
   const [isDarkMode, setIsDarkMode] = useState(false);
-  const [showDebugBanner, setShowDebugBanner] = useState(true);
   const [isHotReloading, setIsHotReloading] = useState(false);
   // Immersive (app-only) mode for the live DartPad canvas: when ON, the
   // DartPad embed is cropped so only the Flutter canvas shows (DartPad's own
@@ -290,20 +289,6 @@ export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
             {isDarkMode ? <Sun size={13} className="text-amber-500" /> : <Moon size={13} />}
           </button>
 
-          {/* Debug banner visibility toggle (separate from the bug-report button) */}
-          <button
-            type="button"
-            onClick={() => setShowDebugBanner(!showDebugBanner)}
-            className={`px-2 py-1 rounded-lg text-[10px] font-bold border transition-all cursor-pointer ${
-              showDebugBanner
-                ? 'bg-gray-100 text-gray-500 border-gray-200'
-                : 'bg-gray-50 text-gray-300 border-gray-200'
-            }`}
-            title="Toggle the corner DEBUG banner visibility"
-          >
-            BANNER
-          </button>
-
           {/* Open the current Flutter source in DartPad (new tab). The free
               public embed no longer accepts custom source, so this is the
               escape hatch when no gist token is configured. */}
@@ -408,15 +393,6 @@ export const FlutterPhoneSimulator: React.FC<FlutterPhoneSimulatorProps> = ({
                 <span>98%</span>
               </div>
             </div>
-
-            {/* DEBUG corner banner (visibility toggle only) */}
-            {showDebugBanner && (
-              <div className="absolute top-9 right-0 z-30 pointer-events-none">
-                <div className="bg-red-600 text-white font-mono text-[8px] font-bold px-4 py-0.5 transform rotate-45 translate-x-3 translate-y-1 shadow-xs">
-                  DEBUG
-                </div>
-              </div>
-            )}
 
             {/* Rendered App Body */}
             <div className="flex-1 overflow-hidden flex flex-col relative bg-white">

@@ -296,6 +296,11 @@ export default function App() {
   
   (async () => {
     try {
+      // Resolve the Tauri window handle lazily so the web build (no Tauri
+      // internals) never touches the API. `win` was previously used without
+      // being defined — the actual fix for the typecheck/runtime failure.
+      const { getCurrentWindow } = await import('@tauri-apps/api/window');
+      const win = getCurrentWindow();
       const un = await win.onCloseRequested(async (event) => {
         event.preventDefault();
         try {
@@ -1799,9 +1804,9 @@ Only produce code, code files, or artifacts when the user's current message expl
       if (willSearchWeb) {
         setAiStatus('searching_web');
         // The search runs BEFORE the chat and shares the chat's AbortController,
-        // so cap it with its own short timeout — a slow/hung DuckDuckGo or
-        // Wikipedia request must never block the AI response. If it times out
-        // the chat simply proceeds without web context (graceful degradation).
+        // so cap it with its own short timeout — a slow/hung search-provider
+        // request must never block the AI response. If it times out the chat
+        // simply proceeds without web context (graceful degradation).
         const searchTimeout = new AbortController();
         const searchTimer = setTimeout(() => searchTimeout.abort(), 7000);
         try {
@@ -1811,8 +1816,14 @@ Only produce code, code files, or artifacts when the user's current message expl
             body: JSON.stringify({
               query: resolvedSearchQuery || userPrompt,
               maxResults: settings.webSearchMaxResults || 5,
-              provider: settings.webSearchProvider || 'duckduckgo_wikipedia',
-              apiKey: settings.webSearchApiKey || '',
+              provider: settings.webSearchProvider || 'tavily',
+              // Exactly ONE provider is active at a time; resolve its key.
+              apiKey:
+                settings.webSearchProvider === 'serper'
+                  ? settings.serperApiKey || ''
+                  : settings.webSearchProvider === 'langsearch'
+                  ? settings.langsearchApiKey || ''
+                  : settings.webSearchApiKey || '',
             }),
             signal: searchTimeout.signal,
           });
@@ -1875,6 +1886,28 @@ Only produce code, code files, or artifacts when the user's current message expl
       // a component, an app, a script, a refactor, a fix, etc.
       fullSystemPrompt += `\n\n# Output Discipline (IMPORTANT)
 Only produce code, code files, or artifacts when the user's current message explicitly asks you to write, create, build, generate, refactor, or fix code (or a component/app/script/site). For general questions — including factual questions, weather, news, explanations, advice, or anything that does not require code to answer — respond in plain prose with NO code blocks and NO artifacts. Never create code just because code exists elsewhere in the conversation or project. If a previous turn involved code but the current question is unrelated, ignore the code and answer the question directly. When web search results are provided, use them to answer concisely and cite sources; do not generate files from them.`;
+
+      // Artifact naming rules: the app saves every code block as a file named
+      // from its first-line filename comment. Without these rules the model
+      // (a) reuses the same filename for a "new" file (silently overwriting
+      // the previous artifact in the workspace), and (b) references a made-up
+      // name in its prose/run instructions ("run python calculator.py") that
+      // doesn't match the real saved artifact ("python_run.py").
+      const existingArtifactNames: string[] = [];
+      for (const m of targetChat.messages) {
+        if (m.role !== 'assistant' || !m.content) continue;
+        for (const a of ArtifactParser.extractArtifacts(m.content)) {
+          if (a.title && !existingArtifactNames.includes(a.title)) {
+            existingArtifactNames.push(a.title);
+          }
+        }
+      }
+      fullSystemPrompt += `\n\n# Code Artifact Naming (IMPORTANT)
+When you produce a code file/artifact:
+1. Begin EVERY code block with a filename comment on the FIRST line naming the exact file you intend to create (e.g. \`// calculator.py\`, \`// login-form.tsx\`, \`// lib/main.dart\`). The app saves the artifact under EXACTLY that name.
+2. When the user asks for a NEW file, choose a fresh, unique, descriptive filename — NEVER reuse the name of an existing artifact unless the user explicitly asked you to modify that same file. Files already created in this chat: ${existingArtifactNames.length > 0 ? existingArtifactNames.join(', ') : '(none yet)'}.
+3. In your prose, always refer to the file by its EXACT filename — including in run instructions (only write \`python calculator.py\` if the file is actually named calculator.py).
+4. After delivering a file, add a short one-line description of what it does and how to run or use it.`;
 
       // Add active Agent Skills context
       const skillsContext = ContextInjector.buildSkillsPromptContext(
@@ -2523,11 +2556,16 @@ Then reference that EXACT name when you emit a run command (\`python calculator.
           const isProvider4xx =
             httpStatus >= 400 && httpStatus < 500 && httpStatus !== 401 && httpStatus !== 429;
 
+          // The REAL provider error detail is always included verbatim in the
+          // card — never swallowed — so the user sees the true cause (invalid
+          // key, wrong model, exhausted quota) instead of a one-size-fits-all
+          // banner they can't act on.
+          const providerDetail = (err.message || '').trim();
           let errorContent = '';
           if (isApiKeyError) {
-            errorContent = `⚠️ **API Key Configuration Required**\n\nTo connect to your configured model, please enter your API key in **Settings** (⚙️).\n\n*Click the "Open Settings" button in the top header or sidebar to configure your key.*`;
+            errorContent = `⚠️ **API Key Problem** (HTTP ${httpStatus || 'auth'})\n\n${providerDetail ? `> *${providerDetail}*\n\n` : ''}The provider rejected the request as an authentication/key problem. Open **Settings (⚙️)** and check that the API key is correct, active, and has access to the configured model.`;
           } else if (isQuotaError) {
-            errorContent = `⚠️ **API Rate Limit / Quota Exceeded**\n\nYour model provider reported a quota limit (\`RESOURCE_EXHAUSTED\` / \`429\`):\n\n> *${err.message}*\n\n**Recommended Solutions:**\n- ⏳ **Wait 30–60 seconds** for the model provider's rate limit window to reset.\n- ⚙️ **Switch Model/Profile:** Open **Settings (⚙️)** to switch to a different model (e.g., Claude 3.5 Sonnet, GPT-4o, DeepSeek R1, or another Gemini tier).\n- 🔑 **Custom Key:** If using your own API key, check your quota and billing tier in your provider's developer console.`;
+            errorContent = `⚠️ **API Rate Limit / Quota Exceeded** (HTTP ${httpStatus || 429})\n\nYour model provider reported a real quota/rate-limit error:\n\n> *${providerDetail || 'RESOURCE_EXHAUSTED'}*\n\n**Recommended Solutions:**\n- ⏳ **Wait 30–60 seconds** for the provider's rate-limit window to reset.\n- ⚙️ **Switch Model/Profile:** Open **Settings (⚙️)** to switch to a different model or provider.\n- 🔑 **Custom Key:** Check your usage quota and billing tier in your provider's developer console.`;
           } else if (isProvider4xx) {
             // Surface the REAL provider error with its HTTP status so the user
             // sees the actual cause (e.g. "400 model_not_found", "400 unknown

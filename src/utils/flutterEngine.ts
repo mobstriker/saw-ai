@@ -91,22 +91,42 @@ export async function analyzeDart(source: string): Promise<DartAnalysisResult> {
  * `void main()` entrypoint. DartPad requires a main() to run, so we wrap bare
  * widget code: detect the first `class X extends StatelessWidget|StatefulWidget`
  * and synthesize a `runApp(X())` main. If main already exists, return as-is.
+ *
+ * Every MaterialApp also gets `debugShowCheckedModeBanner: false` injected
+ * (unless the source already sets it) so the REAL Flutter canvas never shows
+ * Flutter's own red diagonal "DEBUG" ribbon — the app has its own DEBUG bug
+ * button, and the ribbon only covers the top-right of the phone screen.
  */
 export function ensureFlutterApp(source: string): string {
-  const hasMain = /\bvoid\s+main\s*\(/.test(source) || /\bmain\s*\(\s*\)\s*(?:async\s*)?=>/.test(source);
-  if (hasMain) return source;
+  const withBannerOff = hideDebugBanner(source);
+  const hasMain = /\bvoid\s+main\s*\(/.test(withBannerOff) || /\bmain\s*\(\s*\)\s*(?:async\s*)?=>/.test(withBannerOff);
+  if (hasMain) return withBannerOff;
 
-  const hasFlutterImport = /import\s+['"]package:flutter\/material\.dart['"]/.test(source);
+  const hasFlutterImport = /import\s+['"]package:flutter\/material\.dart['"]/.test(withBannerOff);
   const importLine = hasFlutterImport ? '' : "import 'package:flutter/material.dart';\n\n";
 
   // Find the first Widget class name.
-  const classMatch = source.match(/class\s+([A-Z][A-Za-z0-9_]*)\s+extends\s+(?:StatelessWidget|StatefulWidget)/);
+  const classMatch = withBannerOff.match(/class\s+([A-Z][A-Za-z0-9_]*)\s+extends\s+(?:StatelessWidget|StatefulWidget)/);
   if (classMatch) {
     const widgetName = classMatch[1];
-    return `${importLine}${source}\n\nvoid main() => runApp(const ${widgetName}());\n`;
+    return `${importLine}${withBannerOff}\n\nvoid main() => runApp(const ${widgetName}());\n`;
   }
 
   // No widget class found — still wrap with a generic placeholder runner so
   // DartPad at least compiles and the analyzer reports the real errors.
-  return `${importLine}${source}\n\nvoid main() => runApp(const MaterialApp(home: Scaffold(body: Center(child: Text('Awaiting a Widget to render')))));\n`;
+  return `${importLine}${withBannerOff}\n\nvoid main() => runApp(const MaterialApp(debugShowCheckedModeBanner: false, home: Scaffold(body: Center(child: Text('Awaiting a Widget to render')))));\n`;
+}
+
+/**
+ * Inject `debugShowCheckedModeBanner: false` into the first MaterialApp /
+ * MaterialApp.router constructor when the source doesn't set the flag itself.
+ * This kills Flutter's red DEBUG ribbon on the live DartPad canvas (and in
+ * any real `flutter run` of the pasted code).
+ */
+function hideDebugBanner(source: string): string {
+  if (/debugShowCheckedModeBanner\s*:/.test(source)) return source;
+  return source.replace(
+    /MaterialApp(\.router)?(\s*)\(/,
+    'MaterialApp$1$2(debugShowCheckedModeBanner: false, '
+  );
 }

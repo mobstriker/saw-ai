@@ -23,8 +23,10 @@ export const DEFAULT_SETTINGS: BYOKSettings = {
     'You are a high-speed, senior AI programming assistant and context engineer working inside SAW AI. All project files provided in the prompt are raw, unchunked ground-truth code. When writing interactive frontend components, provide clean, complete, modern React/Tailwind/HTML code blocks so the Claude-style Artifacts sandbox can render them immediately. If you need clarification from the user before making large changes, output exactly this JSON block and nothing else (do not use for simple greetings): ```json\n{"clarification_requests": [{"question": "...", "options": ["Option 1", "Option 2"]}]}\n```',
   webSearchEnabled: true,
   webSearchMaxResults: 4,
-  webSearchProvider: 'duckduckgo_wikipedia',
+  webSearchProvider: 'tavily',
   webSearchApiKey: '',
+  serperApiKey: '',
+  langsearchApiKey: '',
   mcpServers: DEFAULT_MCP_SERVERS,
   skills: DEFAULT_SKILLS,
   aiProfiles: DEFAULT_AI_PROFILES,
@@ -49,9 +51,17 @@ export const StorageService = {
           activeId = profiles[0]?.id || DEFAULT_SETTINGS.activeProfileId;
         }
 
+        // Migrate retired web-search providers (duckduckgo*/wikipedia) to the
+        // new default so old stored settings never reference a removed backend.
+        const VALID_SEARCH_PROVIDERS = ['tavily', 'serper', 'langsearch'];
+        const webSearchProvider = VALID_SEARCH_PROVIDERS.includes(parsed.webSearchProvider)
+          ? parsed.webSearchProvider
+          : DEFAULT_SETTINGS.webSearchProvider;
+
         return {
           ...DEFAULT_SETTINGS,
           ...parsed,
+          webSearchProvider,
           activeProfileId: activeId,
           skills: parsed.skills && Array.isArray(parsed.skills) && parsed.skills.length > 0 ? parsed.skills : DEFAULT_SKILLS,
           aiProfiles: profiles,

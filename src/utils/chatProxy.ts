@@ -18,6 +18,21 @@ export function resolveChatCompletionsUrl(rawUrl: string): string {
   if (!url) return url;
   url = url.replace(/\/+$/, '');
   if (/\/chat\/completions$/i.test(url)) return url;
+
+  // Google Gemini (AI Studio key): the ONLY chat-completions surface Google
+  // exposes is the OpenAI-compatible frontend at
+  // `/v1beta/openai/chat/completions`. Users naturally paste the API root
+  // (`https://generativelanguage.googleapis.com`) or `/v1beta`, which made
+  // every request 404 ("Gemini doesn't work") while NVIDIA NIM (a plain
+  // OpenAI-style `/v1`) worked. Normalize whatever Google base the user
+  // provides to the working OpenAI-compatible path.
+  if (/generativelanguage\.googleapis\.com/i.test(url)) {
+    if (!/\/openai(\/|$)/i.test(url)) {
+      url = url.replace(/\/v1beta(\/models)?$/i, '');
+      url += '/v1beta/openai';
+    }
+  }
+
   // Strip a lone trailing `/chat` or `/responses` so we don't end up with
   // `/chat/chat/completions`.
   url = url.replace(/\/(chat|responses)$/i, '');
@@ -395,45 +410,96 @@ function extractChatErrorMessage(json: any, status: number, rawText?: string): s
 
 
 /**
- * Key-free, CORS-friendly web search.
+ * Web search via the user's own API key. Exactly ONE provider is active at a
+ * time (the one selected in Settings); all three offer generous free credits
+ * on a fresh account:
+ *   - 'tavily'     → POST https://api.tavily.com/search (api_key in body)
+ *   - 'serper'     → POST https://google.serper.dev/search (X-API-KEY header;
+ *                    real Google results, 2.5k free queries)
+ *   - 'langsearch' → POST https://api.langsearch.com/v1/web-search (Bearer;
+ *                    Bing-compatible response shape, free tier)
  *
- * The provider selected in Settings decides which backends run:
- *   - 'duckduckgo'         → DuckDuckGo HTML results + Instant Answer API
- *   - 'wikipedia'          → Wikipedia search API only
- *   - 'duckduckgo_wikipedia' (default) → DuckDuckGo + Wikipedia (best free mix)
- *   - 'tavily'             → Tavily API (needs a key); falls back to DDG on failure
- *
- * DuckDuckGo and Wikipedia require no API key and both send permissive CORS
- * headers (or work through the Tauri http plugin on desktop, which bypasses
- * CORS), so they work directly from the webview/browser with no backend proxy.
+ * If the chosen provider's request fails (bad key, network, CORS in web), we
+ * return ok:false with a human-readable reason instead of silently falling
+ * back to a DIFFERENT provider — the user explicitly picks one backend.
  */
 export async function performSearchRequest(payloadObj: any) {
   const parsed = payloadObj.body ? JSON.parse(payloadObj.body) : payloadObj;
   const { query, maxResults, provider, apiKey } = parsed;
   const q = (query || '').trim();
   const limit = Math.max(1, Math.min(maxResults || 5, 8));
-  const backend = provider || 'duckduckgo_wikipedia';
+  const backend = provider || 'tavily';
 
+  const emptyResult = (grounded = false) => ({
+    ok: false,
+    json: async () => ({ results: [], grounded }),
+  });
+
+  if (!q) return emptyResult();
+  if (!apiKey || !apiKey.trim()) return emptyResult();
+  const key = apiKey.trim();
   const results: any[] = [];
-  // Track whether the AI will actually receive search context; the caller can
-  // read this to show a "grounded N results" indicator.
 
-  // Tavily — highest quality, needs a key. Returns clean answer + sources.
-  if (backend === 'tavily' && apiKey) {
-    try {
-      const tvRes = await universalFetch('https://api.tavily.com/search', {
+  try {
+    if (backend === 'serper') {
+      // Serper — real Google SERP JSON. Auth via X-API-KEY header.
+      const res = await universalFetch('https://google.serper.dev/search', {
+        method: 'POST',
+        headers: { 'X-API-KEY': key, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ q, num: limit }),
+        signal: payloadObj.signal,
+      });
+      if (res.ok) {
+        const data = await res.json();
+        // The instant answer box (when present) is the single best snippet.
+        const answer = data?.answerBox?.answer || data?.answerBox?.snippet;
+        if (answer) {
+          results.push({ title: data.answerBox.title || 'Google answer', snippet: answer, url: data.answerBox.link || '' });
+        }
+        if (Array.isArray(data?.organic)) {
+          for (const r of data.organic) {
+            if (results.length >= limit) break;
+            results.push({ title: r.title || '', snippet: r.snippet || '', url: r.link || '' });
+          }
+        }
+      }
+    } else if (backend === 'langsearch') {
+      // LangSearch — Bing-compatible response shape. Auth via Bearer token.
+      const res = await universalFetch('https://api.langsearch.com/v1/web-search', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: q, freshness: 'noLimit', summary: true, count: limit }),
+        signal: payloadObj.signal,
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const pages = data?.data?.webPages?.value;
+        if (Array.isArray(pages)) {
+          for (const p of pages) {
+            if (results.length >= limit) break;
+            results.push({
+              title: p.name || '',
+              snippet: p.summary || p.snippet || '',
+              url: p.url || '',
+            });
+          }
+        }
+      }
+    } else {
+      // Tavily (default) — clean answer + ranked sources. api_key in body.
+      const res = await universalFetch('https://api.tavily.com/search', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          api_key: apiKey,
+          api_key: key,
           query: q,
           max_results: limit,
           include_answer: true,
         }),
         signal: payloadObj.signal,
       });
-      if (tvRes.ok) {
-        const tv = await tvRes.json();
+      if (res.ok) {
+        const tv = await res.json();
         if (tv.answer) {
           results.push({ title: 'Tavily answer', snippet: tv.answer, url: '' });
         }
@@ -442,114 +508,16 @@ export async function performSearchRequest(payloadObj: any) {
             results.push({ title: r.title || '', snippet: r.content || '', url: r.url || '' });
           }
         }
-        if (results.length > 0) {
-          return { ok: true, json: async () => ({ results: results.slice(0, limit), grounded: true }) };
-        }
       }
-    } catch {
-      // fall through to free backends
     }
-  }
-
-  // DuckDuckGo HTML results — the KEY free path. The old code used the Instant
-  // Answer API, which returns an abstract ONLY for encyclopedic/dictionary
-  // queries and NOTHING for weather/news/live prices/current events. The HTML
-  // results page returns real ranked web results for EVERY query type. We fetch
-  // it through universalFetch (the Tauri http plugin in the desktop build
-  // bypasses CORS, so this works there; in the pure-web build it may be
-  // CORS-blocked and we fall back to the IA API + Wikipedia below).
-  const useDdg = backend === 'duckduckgo' || backend === 'duckduckgo_wikipedia' || (backend === 'tavily' && results.length === 0);
-  if (useDdg) {
-    try {
-      const ddgHtmlUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`;
-      const ddgHtmlRes = await universalFetch(ddgHtmlUrl, {
-        headers: { Accept: 'text/html,application/xhtml+xml' },
-        signal: payloadObj.signal,
-      });
-      if (ddgHtmlRes.ok) {
-        const html = await ddgHtmlRes.text();
-        // Each organic result lives in a `.result` block with `.result__a` (title+url)
-        // and `.result__snippet` (text). Parse defensively.
-        const resultBlocks = html.split(/class="result\s/);
-        for (const block of resultBlocks.slice(1)) {
-          if (results.length >= limit) break;
-          const titleMatch = block.match(/class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/i);
-          const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/(?:a|td|div|span)>/i);
-          if (titleMatch) {
-            let url = titleMatch[1] || '';
-            // DDG wraps URLs in a redirect (//duckduckgo.com/l/?uddg=<encoded>); unwrap.
-            const uddg = url.match(/uddg=([^&]+)/);
-            if (uddg) url = decodeURIComponent(uddg[1]);
-            const title = decodeHtml(titleMatch[2].replace(/<[^>]+>/g, '').trim());
-            const snippet = snippetMatch ? decodeHtml(snippetMatch[1].replace(/<[^>]+>/g, '').trim()) : '';
-            if (title && !results.some((r) => r.title === title)) {
-              results.push({ title, snippet, url });
-            }
-          }
-        }
-      }
-    } catch {
-      // CORS/network — fall through to IA API + Wikipedia
-    }
-
-    // DuckDuckGo Instant Answer API — supplement (good for definitions/abstracts).
-    try {
-      const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(q)}&format=json&no_redirect=1&no_html=1&skip_disambig=1`;
-      const ddgRes = await universalFetch(ddgUrl, { signal: payloadObj.signal });
-      if (ddgRes.ok) {
-        const ddg = await ddgRes.json();
-        const abstractText = (ddg.AbstractText || '').trim();
-        const abstractUrl = (ddg.AbstractURL || '').trim();
-        const heading = (ddg.Heading || '').trim();
-        if (abstractText && !results.some((r) => r.snippet === abstractText)) {
-          results.unshift({ title: heading || q, snippet: abstractText, url: abstractUrl || '' });
-        }
-      }
-    } catch {
-      // best-effort
-    }
-  }
-
-  // Wikipedia — encyclopedic context. Runs for the 'wikipedia' and combined
-  // backends, and as a free supplement when DDG returned nothing.
-  const useWiki = backend === 'wikipedia' || backend === 'duckduckgo_wikipedia' || results.length === 0;
-  if (useWiki) {
-    try {
-      const wikiUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(q)}&format=json&origin=*&srlimit=${Math.min(limit, 3)}`;
-      const wikiRes = await universalFetch(wikiUrl, { signal: payloadObj.signal });
-      if (wikiRes.ok) {
-        const wiki = await wikiRes.json();
-        const hits = wiki?.query?.search || [];
-        for (const hit of hits) {
-          if (results.length >= limit) break;
-          const title = hit.title || '';
-          const snippet = (hit.snippet || '').replace(/<[^>]+>/g, '');
-          const url = `https://en.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g, '_'))}`;
-          if (!results.some((r) => r.title === title)) {
-            results.push({ title, snippet, url });
-          }
-        }
-      }
-    } catch {
-      // best-effort
-    }
+  } catch {
+    // Network/CORS failure — report no grounding rather than falling back to
+    // a different provider the user didn't select.
   }
 
   return {
     ok: results.length > 0,
     json: async () => ({ results: results.slice(0, limit), grounded: results.length > 0 }),
   };
-}
-
-/** Minimal HTML-entity decoder so search snippets render readably. */
-function decodeHtml(s: string): string {
-  return s
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&#x27;/g, "'")
-    .replace(/&nbsp;/g, ' ');
 }
 

@@ -341,3 +341,57 @@ owner's personal preferences — do not genericize the UX.
 - `vite.config.ts`: manual vendor chunks (react, markdown/katex, tauri,
   data/dexie+jszip+motion+lucide). HMR disabled when `DISABLE_HMR=true`.
 - `chunkSizeWarningLimit: 1100` (app chunk is large by design).
+
+## Multi-feature bugfix round (TSX preview, DEBUG banners, drag-drop, web search, Gemini, errors)
+- **TSX/JSX live preview styling**: `SandpackTsxPreview` overrides
+  `/public/index.html` (hidden) with the Tailwind Play CDN `<script
+  src="https://cdn.tailwindcss.com">` and `/styles.css` with a margin/reset
+  base. Sandpack's stock `react-ts` template ships NO CSS framework, so AI
+  components using Tailwind utility classes (bg-purple-600, flex, …) rendered
+  completely unstyled (black text, top-left, white background) even though the
+  preview "worked". Keep the CDN script tag in INDEX_HTML if you touch that
+  file.
+- **Flutter DEBUG ribbons are fully gone**: the HTML corner ribbon + BANNER
+  toggle were removed from `FlutterPhoneSimulator`, and `ensureFlutterApp`
+  (`flutterEngine.ts`) injects `debugShowCheckedModeBanner: false` into the
+  first `MaterialApp(`/`MaterialApp.router(` (unless the source already sets
+  it) so the live DartPad canvas and any real `flutter run` of pasted code
+  never show Flutter's red DEBUG ribbon. The DEBUG bug-report button
+  (analyzer-driven) is unchanged.
+- **Artifact IDs are content-addressed**: `ArtifactParser.extractArtifacts`
+  ids are `art-${index}-${fnv1a(title+code)}` — never reuse `Date.now()`. The
+  old time-based ids collided across messages (index restarts at 1 per
+  message), so clicking a NEW same-named artifact selected the OLD one by id
+  (looked exactly like "the app overwrote my old file with new code").
+- **AI file naming rules** live in the main send path in `App.tsx`
+  ("Code Artifact Naming" block): first-line filename comment required,
+  unique names for NEW files (existing artifact names are injected into the
+  prompt), exact-name references in prose/run commands, one-line description
+  after each file.
+- **Gemini endpoint normalization**: `resolveChatCompletionsUrl` maps any
+  `generativelanguage.googleapis.com` base (bare root, `/v1beta`,
+  `/v1beta/models`, or `/v1beta/openai`) to
+  `/v1beta/openai/chat/completions` — the ONLY chat surface Google AI Studio
+  keys work against. Other providers (NVIDIA, OpenAI, custom) untouched.
+- **Sandbox workdir is per-chat**: universal chats use `chat-<chatId>` (was
+  the shared sandbox ROOT); project chats keep `proj-<id>`. Both
+  `SandboxPanel` and `sandboxAgent.runSandboxAgentStep` compute the same
+  workdir — keep them in sync.
+- **Drag & drop in the desktop app**: `tauri.conf.json` windows config has
+  `dragDropEnabled: false`. Without it, Tauri's webview intercepts OS file
+  drops natively and NO HTML5 dragenter/dragover/drop events ever reach the
+  JS handlers (chat drop, AddSkillModal drop, project drop all looked "broken"
+  despite correct JS). Never re-enable unless switching to Tauri-native drop
+  handling.
+- **Web search is BYOK-only**: providers are `tavily` | `serper` |
+  `langsearch` (one active at a time), keys in `webSearchApiKey` /
+  `serperApiKey` / `langsearchApiKey`. `performSearchRequest` never falls
+  back across providers. Old stored `duckduckgo*`/`wikipedia` values migrate
+  to `tavily` in `getSettingsAsync`.
+- **Error cards always quote the provider**: every error branch (auth, 429
+  quota, other 4xx, 5xx, transport) includes the real provider message
+  verbatim — never render a banner without it.
+- **Tauri window close handler**: `win` is obtained via a lazy
+  `await import('@tauri-apps/api/window')` + `getCurrentWindow()` inside the
+  effect — a bare/top-level reference breaks the pure-web typecheck.
+

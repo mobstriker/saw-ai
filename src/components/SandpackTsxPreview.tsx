@@ -93,6 +93,45 @@ const SANDBOX_STYLE: React.CSSProperties = {
   borderRadius: 0,
 };
 
+/**
+ * The page shell Sandpack serves for the preview. We override the template's
+ * `public/index.html` so the preview includes the Tailwind Play CDN runtime.
+ * WITHOUT this, AI-generated components styled with Tailwind utility classes
+ * (`bg-purple-600 text-white flex min-h-screen …`) render completely UNSTYLED
+ * (white page, black top-left text) because the stock `react-ts` template
+ * ships no CSS framework at all — the exact "preview shows nothing like the
+ * code" bug. The CDN script scans the DOM at runtime (MutationObserver), so
+ * every class the AI emits Just Works, including arbitrary values.
+ */
+const INDEX_HTML = `<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      html, body, #root { height: 100%; margin: 0; padding: 0; }
+      body { -webkit-font-smoothing: antialiased; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>
+`;
+
+/**
+ * Base stylesheet override. The stock template's `styles.css` only centers
+ * `.App` text; we replace it with a margin reset so the AI's layout is the
+ * single source of truth (no white frame around full-bleed backgrounds).
+ */
+const BASE_CSS = `html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+`;
+
 export const SandpackTsxPreview: React.FC<SandpackTsxPreviewProps> = ({
   code,
   filename,
@@ -129,6 +168,8 @@ export const SandpackTsxPreview: React.FC<SandpackTsxPreviewProps> = ({
     }
     return {
       [appPath]: { code: source, active: true, hidden: false },
+      '/styles.css': { code: BASE_CSS, hidden: true },
+      '/public/index.html': { code: INDEX_HTML, hidden: true },
     } as Record<string, { code: string; active?: boolean; hidden?: boolean }>;
   }, [code, filename]);
 
