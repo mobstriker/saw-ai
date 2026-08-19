@@ -290,29 +290,32 @@ export default function App() {
   // reverted after closing the desktop app. Intercept the close request,
   // await the pending writes, then destroy the window.
   useEffect(() => {
-    if (typeof window === 'undefined' || !(window as any).__TAURI_INTERNALS__) return;
-    let unlisten: (() => void) | undefined;
-    let disposed = false;
-    const un = await win.onCloseRequested(async (event) => {
-      event.preventDefault();
-      try {
-        // StorageService.flushPending is synchronous — call it to commit debounced writes.
-        StorageService.flushPending();
-      } finally {
-        await win.destroy();
-      }
-    });
-        if (disposed) un();
-        else unlisten = un;
-      } catch {
-        // Window API unavailable — nothing to do.
-      }
-    })();
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, []);
+  if (typeof window === 'undefined' || !(window as any).__TAURI_INTERNALS__) return;
+  let unlisten: (() => void) | undefined;
+  let disposed = false;
+  
+  (async () => {
+    try {
+      const un = await win.onCloseRequested(async (event) => {
+        event.preventDefault();
+        try {
+          StorageService.flushPending();
+        } finally {
+          await win.destroy();
+        }
+      });
+      if (disposed) un();
+      else unlisten = un;
+    } catch {
+      // Window API unavailable — nothing to do.
+    }
+  })();
+  
+  return () => {
+    disposed = true;
+    unlisten?.();
+  };
+}, []);
 
   // 2. Selection & Panel Layout State
   const [isLeftSidebarOpen, setIsLeftSidebarOpen] = useState(true);
