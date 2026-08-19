@@ -222,19 +222,29 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   };
 
   const handleSave = () => {
-    // Ensure active profile synchronization
-    const currentActive = profiles.find((p) => p.id === formData.activeProfileId) || profiles[0];
-    const finalSettings: BYOKSettings = {
-      ...formData,
-      baseUrl: currentActive?.baseUrl || '',
-      apiKey: currentActive?.apiKey || '',
-      defaultModel: currentActive?.model || '',
-      customHeaders: currentActive?.customHeaders || '',
-      systemPrompt: currentActive?.systemPrompt || formData.systemPrompt,
-    };
-    onSaveSettings(finalSettings);
-    onClose();
+  // Ensure active profile synchronization
+  const currentActive = profiles.find((p) => p.id === formData.activeProfileId) || profiles[0];
+  const finalSettings: BYOKSettings = {
+    ...formData,
+    baseUrl: currentActive?.baseUrl || '',
+    apiKey: currentActive?.apiKey || '',
+    defaultModel: currentActive?.model || '',
+    customHeaders: currentActive?.customHeaders || '',
+    systemPrompt: currentActive?.systemPrompt || formData.systemPrompt,
   };
+
+  // Persist immediately to IndexedDB so the app can safely close/restart
+  try {
+    StorageService.saveSettings(finalSettings);
+  } catch (e) {
+    // Fall back to updating state even if persistence fails
+    console.error('Failed to persist settings to DB', e);
+  }
+
+  // Update app state via parent callback and close modal
+  onSaveSettings(finalSettings);
+  onClose();
+};
 
   const testProfileConnection = async (id: string, baseUrl: string, apiKey: string, model: string, customHeaders?: string) => {
     const trimmedUrl = (baseUrl || '').trim();
