@@ -2981,11 +2981,18 @@ Then reference that EXACT name when you emit a run command (\`python calculator.
 
       {/* 5. BYOK Workspace Settings Modal */}
       <SettingsModal
-        isOpen={isSettingsModalOpen}
-        onClose={() => setIsSettingsModalOpen(false)}
-        settings={settings}
-        onSaveSettings={(newSettings) => setSettings(newSettings)}
-      />
+  isOpen={isSettingsModalOpen}
+  onClose={() => setIsSettingsModalOpen(false)}
+  settings={settings}
+  onSaveSettings={(newSettings) => {
+    setSettings(newSettings);
+    try {
+      StorageService.saveSettings(newSettings);
+    } catch (e) {
+      console.error('Failed to persist settings from App', e);
+    }
+  }}
+/>
 
       {/* 5b. Create New Project Workspace Modal */}
       <CreateProjectModal
