@@ -1515,6 +1515,10 @@ Only produce code, code files, or artifacts when the user's current message expl
       ).trim();
 
       const hasContent = Boolean(fullCombinedSoFar || previousAssistantContent);
+      // Same rule as the main send path: content already streamed + a mere
+      // transport/socket error means the model WORKED — finalize as success.
+      // Only a real provider HTTP error (HttpProviderError) is a true failure.
+      const isRealHttpError = isHttpProviderError(err);
 
       let updatedTargetChat: ChatSession | null = null;
       setChats((prevChats) => {
@@ -1534,8 +1538,8 @@ Only produce code, code files, or artifacts when the user's current message expl
                         : `Generation error: ${err.message || 'Stream interrupted'}`),
                     thinkingContent: combinedThinking || m.thinkingContent,
                     isThinking: false,
-                    isStopped: hasContent,
-                    isError: !hasContent,
+                    isStopped: isAbort,
+                    isError: isRealHttpError || !hasContent,
                   }
                 : m
             ),
@@ -2478,10 +2482,20 @@ Then reference that EXACT name when you emit a run command (\`python calculator.
         // as completed instead of marking it errored/cut-off. This is the path
         // that produced the false "continue/retry" banner on normal responses
         // for providers whose connection tears down abruptly post-stream.
-        const cleanStop = streamFinishReason === 'stop' || streamFinishReason === 'stop_sequence' || streamFinishReason === 'tool_calls';
+        // The model WORKED if any real tokens arrived. Providers (NVIDIA NIM
+        // especially) and the desktop webview often close the SSE socket
+        // abruptly right after the content — that trailing transport error is
+        // NOT a generation failure. Finalize as a success instead of surfacing
+        // a false "error / continue / retry" card. Only a real provider HTTP
+        // error (HttpProviderError) still counts as an error.
         const parsedStream = parseThinkingFromStream(rawAccumulatedStream);
         const combinedThinking = (rawAccumulatedThinking + (parsedStream.thinking ? (rawAccumulatedThinking ? '\n' : '') + parsedStream.thinking : '')).trim();
         const existingPartialContent = (parsedStream.content || assistantMessageContent || '').trim();
+        const cleanStop =
+          streamFinishReason === 'stop' ||
+          streamFinishReason === 'stop_sequence' ||
+          streamFinishReason === 'tool_calls' ||
+          (Boolean(existingPartialContent) && !isHttpProviderError(err));
 
         if (cleanStop && existingPartialContent) {
           // Treat as a successful completion (the model finished cleanly; the

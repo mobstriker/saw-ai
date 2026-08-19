@@ -342,6 +342,25 @@ owner's personal preferences — do not genericize the UX.
   data/dexie+jszip+motion+lucide). HMR disabled when `DISABLE_HMR=true`.
 - `chunkSizeWarningLimit: 1100` (app chunk is large by design).
 
+## API error-classification follow-up (false "error/retry" cards on NVIDIA, Gemini unreachable)
+- Both branches' transport (`chatProxy.ts` universalFetch/native-first) is
+  identical; the false positives live in the App.tsx catch classifier.
+- **Partial content = success**: in both the main-send and continuation catch
+  paths, ANY streamed content now finalizes the message as completed unless
+  the thrown error is a real `HttpProviderError`. NVIDIA NIM (and the desktop
+  webview in general) frequently closes the SSE socket right after the
+  content — that trailing transport error previously flipped the message to
+  `isStopped` (false "continue/retry" card) or `isError` (false error card)
+  even when generation fully succeeded. This was also main's "second prompt
+  always errors" bug. Never gate the clean-finalize on `finish_reason` alone.
+- **Gemini endpoint normalization** (`resolveChatCompletionsUrl`) maps any
+  `generativelanguage.googleapis.com` base to
+  `/v1beta/openai/chat/completions` — Google's ONLY chat surface for AI Studio
+  keys. Without it every chat 404'd regardless of key (looked like "Gemini
+  doesn't work"). NVIDIA/OpenAI/custom URLs untouched, so both providers work
+  side by side.
+
+
 ## Multi-feature bugfix round (TSX preview, DEBUG banners, drag-drop, web search, Gemini, errors)
 - **TSX/JSX live preview styling**: `SandpackTsxPreview` overrides
   `/public/index.html` (hidden) with the Tailwind Play CDN `<script
