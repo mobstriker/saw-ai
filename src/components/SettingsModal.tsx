@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   X,
   Key,
@@ -88,6 +88,22 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [editingProfileId, setEditingProfileId] = useState<string | null>(
     formData.activeProfileId || formData.aiProfiles?.[0]?.id || null
   );
+
+  // Re-sync the form from the latest persisted settings every time the modal
+  // is OPENED. This component stays mounted while closed, so without this the
+  // form keeps whatever `settings` was at app start — the synchronous
+  // defaults captured before the async DB load finished — showing ZERO
+  // profiles/keys even though they were saved, and wiping the user's real
+  // API keys if they hit "Save Settings" in that state.
+  useEffect(() => {
+    if (isOpen) {
+      setFormData({ ...settings });
+      setEditingProfileId(settings.activeProfileId || settings.aiProfiles?.[0]?.id || null);
+    }
+    // Only re-sync on open — not on every settings change while the user is
+    // editing (that would clobber in-progress edits).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen]);
 
   if (!isOpen) return null;
 

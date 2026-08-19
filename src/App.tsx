@@ -283,6 +283,40 @@ export default function App() {
     };
   }, []);
 
+  // Desktop (Tauri): pagehide/beforeunload do NOT reliably fire when the
+  // window is closed — the webview process is destroyed immediately, taking
+  // any pending debounced write (and even a just-issued settings put) with
+  // it. That is why saved API keys / new chats vanished and deletions
+  // reverted after closing the desktop app. Intercept the close request,
+  // await the pending writes, then destroy the window.
+  useEffect(() => {
+    if (typeof window === 'undefined' || !(window as any).__TAURI_INTERNALS__) return;
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    (async () => {
+      try {
+        const { getCurrentWindow } = await import('@tauri-apps/api/window');
+        const win = getCurrentWindow();
+        const un = await win.onCloseRequested(async (event) => {
+          event.preventDefault();
+          try {
+            await StorageService.flushPendingAsync();
+          } finally {
+            await win.destroy();
+          }
+        });
+        if (disposed) un();
+        else unlisten = un;
+      } catch {
+        // Window API unavailable — nothing to do.
+      }
+    })();
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
   // 2. Selection & Panel Layout State
   const [isLeftSidebarOpen, setIsLeftSidebarOpen] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState<number>(270);

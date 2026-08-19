@@ -219,15 +219,12 @@ export async function performChatRequest(payloadObj: any) {
     fetchPayload.max_tokens = max_tokens;
   }
 
-  // Reasoning effort: only send when explicitly enabled (not 'off'). Many
-  // OpenAI-compatible providers reject the unknown `reasoning_effort` field (or
-  // an unsupported value) with a 400 "unknown parameter", which the old code
-  // triggered on EVERY request — even for plain chat — because it always sent
-  // the field. Omitting it when 'off' keeps the request clean for providers
-  // that don't support extended thinking.
-  if (reasoning_effort && reasoning_effort !== 'off') {
-    fetchPayload.reasoning_effort = reasoning_effort;
-  }
+  // NOTE: `reasoning_effort` is intentionally NOT forwarded to the provider.
+  // The app's reasoning mode only shapes the system prompt. Sending the field
+  // breaks strict OpenAI-compatible providers (Gemini, NVIDIA NIM, OpenRouter,
+  // TokenRouter) with HTTP 400 "unknown parameter" on every request — the
+  // connection test passes (it never sends this field) but real prompts fail.
+  void reasoning_effort;
 
   // MCP tools: advertise them to the provider as native function-calling
   // tools so models that support tool_calls invoke them directly. Each tool is
