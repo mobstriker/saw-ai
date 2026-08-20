@@ -7,6 +7,13 @@ export interface Message {
   content: string;
   timestamp: number;
   tokensEstimate?: number;
+  /** Input (prompt) tokens for this turn, from the provider's `usage` when
+   *  available, else a BPE estimate of the system prompt + conversation sent.
+   *  Together with outputTokens this gives the TRUE token spend. */
+  inputTokens?: number;
+  /** Output (completion) tokens for this turn. Same source as inputTokens; when
+   *  the provider reports usage this is exact, else a BPE count of the output. */
+  outputTokens?: number;
   webSearchUsed?: boolean;
   searchResults?: SearchResult[];
   mcpToolsUsed?: string[];
@@ -161,6 +168,17 @@ export interface BYOKSettings {
   systemPrompt: string;
   webSearchEnabled: boolean;
   webSearchMaxResults: number;
+  /** Which web-search backend to use. Only ONE provider is active at a time
+   *  (whichever is selected here). All three give generous free credits on a
+   *  fresh account: 'tavily' (tavily.com), 'serper' (serper.dev — Google
+   *  results), and 'langsearch' (langsearch.com — Bing-compatible shape). */
+  webSearchProvider?: 'tavily' | 'serper' | 'langsearch';
+  /** API key for the Tavily search provider (free key at tavily.com). */
+  webSearchApiKey?: string;
+  /** API key for the Serper search provider (free key at serper.dev). */
+  serperApiKey?: string;
+  /** API key for the LangSearch search provider (free key at langsearch.com). */
+  langsearchApiKey?: string;
   mcpServers: MCPServer[];
   skills: Skill[]; // Installed and managed skills
   aiProfiles: AIProfile[]; // Saved multiple API keys / AI profiles
@@ -172,6 +190,11 @@ export interface BYOKSettings {
   maxTokens?: number;
   temperature?: number;
   topP?: number;
+  /** GitHub token with `gist` scope. When set, Flutter previews embed a REAL
+   *  DartPad canvas (the AI's Dart is pushed to an anonymous gist and loaded
+   *  via dartpad.dev/embed-flutter.html?id=…). Optional — without it we fall
+   *  back to the structural widget-tree preview. */
+  gistToken?: string;
 }
 
 export interface MCPServer {

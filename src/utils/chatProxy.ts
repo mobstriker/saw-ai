@@ -18,6 +18,21 @@ export function resolveChatCompletionsUrl(rawUrl: string): string {
   if (!url) return url;
   url = url.replace(/\/+$/, '');
   if (/\/chat\/completions$/i.test(url)) return url;
+
+  // Google Gemini (AI Studio key): the ONLY chat-completions surface Google
+  // exposes is the OpenAI-compatible frontend at
+  // `/v1beta/openai/chat/completions`. Users naturally paste the API root
+  // (`https://generativelanguage.googleapis.com`) or `/v1beta`, which made
+  // every request 404 ("Gemini doesn't work") while NVIDIA NIM (a plain
+  // OpenAI-style `/v1`) worked. Normalize whatever Google base the user
+  // provides to the working OpenAI-compatible path.
+  if (/generativelanguage\.googleapis\.com/i.test(url)) {
+    if (!/\/openai(\/|$)/i.test(url)) {
+      url = url.replace(/\/v1beta(\/models)?$/i, '');
+      url += '/v1beta/openai';
+    }
+  }
+
   // Strip a lone trailing `/chat` or `/responses` so we don't end up with
   // `/chat/chat/completions`.
   url = url.replace(/\/(chat|responses)$/i, '');
@@ -138,8 +153,7 @@ export async function universalFetch(
 }
 
 export async function performChatRequest(payloadObj: any) {
-  const { baseUrl: targetUrl, apiKey, model, messages, stream, system_prompt, custom_headers, max_tokens, reasoning_effort, web_search_context } = payloadObj.body ? JSON.parse(payloadObj.body) : payloadObj;
-
+  const { baseUrl: targetUrl, apiKey, model, messages, stream, system_prompt, custom_headers, max_tokens, reasoning_effort, web_search_context, mcp_tools } = payloadObj.body ? JSON.parse(payloadObj.body) : payloadObj;
   // --- Transparency guards: fail loudly instead of silently falling back ---
   if (!targetUrl || !targetUrl.trim()) {
     throw new Error('No API endpoint configured. Add an AI profile in Settings (⚙️) and enter a Base URL.');
@@ -220,7 +234,42 @@ export async function performChatRequest(payloadObj: any) {
     fetchPayload.max_tokens = max_tokens;
   }
 
-  return await universalFetch(resolvedUrl, {
+  // NOTE: `reasoning_effort` is intentionally NOT forwarded to the provider.
+  // The app's reasoning mode only shapes the system prompt. Sending the field
+  // breaks strict OpenAI-compatible providers (Gemini, NVIDIA NIM, OpenRouter,
+  // TokenRouter) with HTTP 400 "unknown parameter" on every request — the
+  // connection test passes (it never sends this field) but real prompts fail.
+  void reasoning_effort;
+
+  // MCP tools: advertise them to the provider as native function-calling
+  // tools so models that support tool_calls invoke them directly. Each tool is
+  // namespaced as "<serverName>/<toolName>" so the app can route the returned
+  // tool_call back to the originating server. The system prompt also describes
+  // them in text (for providers without function calling the model is told to
+  // emit ```mcp_tool_call blocks instead).
+  if (Array.isArray(mcp_tools) && mcp_tools.length > 0) {
+    fetchPayload.tools = mcp_tools.map((t: any) => ({
+      type: 'function',
+      function: {
+        name: t._namespaced || t.name,
+        description: t.description || `MCP tool: ${t.name}`,
+        parameters: t.parametersSchema
+          ? (() => {
+              try {
+                return typeof t.parametersSchema === 'string'
+                  ? JSON.parse(t.parametersSchema)
+                  : t.parametersSchema;
+              } catch {
+                return { type: 'object', properties: {} };
+              }
+            })()
+          : { type: 'object', properties: {} },
+      },
+    }));
+    fetchPayload.tool_choice = 'auto';
+  }
+
+  return await fetchChatWithRetry(resolvedUrl, {
     method: 'POST',
     headers,
     body: JSON.stringify(fetchPayload),
@@ -229,91 +278,246 @@ export async function performChatRequest(payloadObj: any) {
 }
 
 /**
- * Key-free, CORS-friendly web search.
- * Combines the DuckDuckGo Instant Answer API (instant answers / abstracts)
- * with the Wikipedia search API (full result lists). Neither requires an API
- * key and both send `Access-Control-Allow-Origin: *`, so they work directly
- * from the Tauri webview / browser with no backend proxy.
+ * Retry genuinely-transient failures a few times before giving up. This directly
+ * implements the user's requirement: "if the connection works [on retry], do
+ * not show me an error/retry/continue card in the middle of the 1st/2nd/3rd
+ * prompt." Providers — notably Google's Gemini OpenAI-compatible frontend —
+ * intermittently return HTTP 403 on load-balancer hiccups or during API-key
+ * propagation and then succeed on the next attempt; transient 429 / 408 / 5xx
+ * and raw network errors behave the same. We retry those silently.
+ *
+ * We NEVER retry deterministic client errors (400 bad request, 401 auth, 404
+ * model-not-found, 403-forbidden-with-a-permanent-body) because retrying them is
+ * pointless and would just burn time before showing the SAME real error. The
+ * distinction for 403: a body that clearly indicates a permanent permission /
+ * API-key problem (e.g. "API key not valid", "permission denied", "has not been
+ * used before") is NOT retried — a transient LB 403 has an empty/generic body
+ * and IS retried. This keeps a genuinely-bad key/config surfacing immediately
+ * while a transient hiccup self-heals without bothering the user.
+ */
+const TRANSIENT_RETRY_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+
+function looksLikePermanent403Body(body: string): boolean {
+  const b = (body || '').toLowerCase();
+  // Phrases that mean the key/config is genuinely wrong — do not retry.
+  return (
+    b.includes('api key not valid') ||
+    b.includes('api key not found') ||
+    b.includes('api key invalid') ||
+    b.includes('invalid api key') ||
+    b.includes('permission denied') ||
+    b.includes('access is denied') ||
+    b.includes('not authorized') ||
+    b.includes('has not been used before') ||
+    b.includes('is not enabled') ||
+    b.includes('api not enabled') ||
+    b.includes('forbidden') ||
+    b.includes('safety') ||
+    b.includes('recaptcha')
+  );
+}
+
+function isRetryableNetworkError(err: any): boolean {
+  const m = (err?.message || '').toLowerCase();
+  // A genuine transport/CORS failure (as opposed to a thrown HTTP response).
+  // Aborts are handled separately (we rethrow AbortError before this).
+  return (
+    err?.name === 'TypeError' || // fetch() network failure
+    m.includes('failed to fetch') ||
+    m.includes('networkerror') ||
+    m.includes('network request failed') ||
+    m.includes('load failed') ||
+    m.includes('econnreset') ||
+    m.includes('socket hang up') ||
+    m.includes('timed out')
+  );
+}
+
+async function fetchChatWithRetry(url: string, init: RequestInit, maxAttempts = 3): Promise<Response> {
+  const signal = init.signal as AbortSignal | undefined;
+  let lastError: any;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // Honor an already-aborted request (user clicked stop).
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    let res: Response | null = null;
+    try {
+      res = await universalFetch(url, init);
+    } catch (err: any) {
+      // Network-level error: transient — retry (unless the user aborted).
+      if (signal?.aborted || (err?.name === 'AbortError')) throw err;
+      lastError = err;
+      if (attempt < maxAttempts && isRetryableNetworkError(err)) {
+        await sleep(backoffMs(attempt));
+        continue;
+      }
+      throw err;
+    }
+    if (res.ok) return res;
+
+    // Non-ok response: decide whether it's transient (retry) or permanent (throw).
+    const status = res.status;
+    const bodyText = await res.text().catch(() => '');
+    const permanent =
+      status === 403 ? looksLikePermanent403Body(bodyText) : false;
+    const transient =
+      !permanent &&
+      (TRANSIENT_RETRY_STATUSES.has(status) ||
+        status === 403);
+
+    if (transient && attempt < maxAttempts) {
+      await sleep(backoffMs(attempt));
+      continue;
+    }
+
+    // Permanent error or out of retries — rethrow as an Error carrying the real
+    // HTTP status + provider message so the caller's classifier (which checks
+    // `typeof e.status === 'number'`) can show the true cause instead of a
+    // generic "connection interrupted".
+    let errJson: any = {};
+    try { errJson = JSON.parse(bodyText); } catch { errJson = {}; }
+    const msg = extractChatErrorMessage(errJson, status, bodyText);
+    const httpErr = new Error(msg);
+    (httpErr as any).status = status;
+    (httpErr as any).name = 'HttpProviderError';
+    throw httpErr;
+  }
+  // Should be unreachable, but keep the type-checker happy.
+  throw lastError ?? new Error('Chat request failed.');
+}
+
+function backoffMs(attempt: number): number {
+  // 350ms, 800ms — short, so the 2nd/3rd prompt isn't delayed noticeably while
+  // still spacing out retries to let a transient LB/key-propagation clear.
+  const base = attempt === 1 ? 350 : 800;
+  return base + Math.floor(Math.random() * 200);
+}
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+function extractChatErrorMessage(json: any, status: number, rawText?: string): string {
+  if (!json) return rawText?.trim() || `HTTP ${status}`;
+  if (typeof json === 'string') return json;
+  if (typeof json.message === 'string') return json.message;
+  if (typeof json.error === 'string') return json.error;
+  if (json.error && typeof json.error === 'object') {
+    if (typeof json.error.message === 'string') return json.error.message;
+    if (typeof json.error.type === 'string') return `${json.error.type}: ${json.error.message || ''}`.trim();
+  }
+  if (json.detail && typeof json.detail === 'string') return json.detail;
+  if (rawText && rawText.length < 500) return rawText.trim();
+  return `HTTP ${status}`;
+}
+
+
+/**
+ * Web search via the user's own API key. Exactly ONE provider is active at a
+ * time (the one selected in Settings); all three offer generous free credits
+ * on a fresh account:
+ *   - 'tavily'     → POST https://api.tavily.com/search (api_key in body)
+ *   - 'serper'     → POST https://google.serper.dev/search (X-API-KEY header;
+ *                    real Google results, 2.5k free queries)
+ *   - 'langsearch' → POST https://api.langsearch.com/v1/web-search (Bearer;
+ *                    Bing-compatible response shape, free tier)
+ *
+ * If the chosen provider's request fails (bad key, network, CORS in web), we
+ * return ok:false with a human-readable reason instead of silently falling
+ * back to a DIFFERENT provider — the user explicitly picks one backend.
  */
 export async function performSearchRequest(payloadObj: any) {
-  const { query, maxResults } = payloadObj.body ? JSON.parse(payloadObj.body) : payloadObj;
+  const parsed = payloadObj.body ? JSON.parse(payloadObj.body) : payloadObj;
+  const { query, maxResults, provider, apiKey } = parsed;
   const q = (query || '').trim();
   const limit = Math.max(1, Math.min(maxResults || 5, 8));
+  const backend = provider || 'tavily';
 
+  const emptyResult = (grounded = false) => ({
+    ok: false,
+    json: async () => ({ results: [], grounded }),
+  });
+
+  if (!q) return emptyResult();
+  if (!apiKey || !apiKey.trim()) return emptyResult();
+  const key = apiKey.trim();
   const results: any[] = [];
 
   try {
-    // 1. DuckDuckGo Instant Answer API — gives a concise abstract / answer when available
-    const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(q)}&format=json&no_redirect=1&no_html=1&skip_disambig=1`;
-    const ddgRes = await universalFetch(ddgUrl, { signal: payloadObj.signal });
-    if (ddgRes.ok) {
-      const ddg = await ddgRes.json();
-      const abstractText = (ddg.AbstractText || '').trim();
-      const abstractSource = (ddg.AbstractSource || '').trim();
-      const abstractUrl = (ddg.AbstractURL || '').trim();
-      const heading = (ddg.Heading || '').trim();
-
-      if (abstractText) {
-        results.push({
-          title: heading || q,
-          snippet: abstractText,
-          url: abstractUrl || (ddg.DefinitionURL || ''),
-        });
+    if (backend === 'serper') {
+      // Serper — real Google SERP JSON. Auth via X-API-KEY header.
+      const res = await universalFetch('https://google.serper.dev/search', {
+        method: 'POST',
+        headers: { 'X-API-KEY': key, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ q, num: limit }),
+        signal: payloadObj.signal,
+      });
+      if (res.ok) {
+        const data = await res.json();
+        // The instant answer box (when present) is the single best snippet.
+        const answer = data?.answerBox?.answer || data?.answerBox?.snippet;
+        if (answer) {
+          results.push({ title: data.answerBox.title || 'Google answer', snippet: answer, url: data.answerBox.link || '' });
+        }
+        if (Array.isArray(data?.organic)) {
+          for (const r of data.organic) {
+            if (results.length >= limit) break;
+            results.push({ title: r.title || '', snippet: r.snippet || '', url: r.link || '' });
+          }
+        }
       }
-
-      // RelatedTopics is a flat + nested array; pull leaf topics that have a real text/url
-      const flatten = (arr: any[]) => {
-        for (const item of arr) {
-          if (!item) continue;
-          if (item.Topics && Array.isArray(item.Topics)) {
-            flatten(item.Topics);
-          } else if (item.Text && item.FirstURL) {
+    } else if (backend === 'langsearch') {
+      // LangSearch — Bing-compatible response shape. Auth via Bearer token.
+      const res = await universalFetch('https://api.langsearch.com/v1/web-search', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: q, freshness: 'noLimit', summary: true, count: limit }),
+        signal: payloadObj.signal,
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const pages = data?.data?.webPages?.value;
+        if (Array.isArray(pages)) {
+          for (const p of pages) {
+            if (results.length >= limit) break;
             results.push({
-              title: item.Text.split(' - ')[0] || item.Text,
-              snippet: item.Text,
-              url: item.FirstURL,
+              title: p.name || '',
+              snippet: p.summary || p.snippet || '',
+              url: p.url || '',
             });
           }
         }
-      };
-      if (Array.isArray(ddg.RelatedTopics)) flatten(ddg.RelatedTopics);
-
-      // DuckDuckGo definition (for "define" style queries)
-      if (!abstractText && ddg.Definition) {
-        results.push({
-          title: heading || q,
-          snippet: ddg.Definition,
-          url: ddg.DefinitionURL || '',
-        });
       }
-    }
-  } catch (e) {
-    // DuckDuckGo is best-effort; fall through to Wikipedia
-  }
-
-  try {
-    // 2. Wikipedia API — rich full-text search results to round out the answer set
-    const wikiUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(q)}&format=json&origin=*&srlimit=${limit}`;
-    const wikiRes = await universalFetch(wikiUrl, { signal: payloadObj.signal });
-    if (wikiRes.ok) {
-      const wiki = await wikiRes.json();
-      const hits = wiki?.query?.search || [];
-      for (const hit of hits) {
-        const title = hit.title || '';
-        const snippet = (hit.snippet || '').replace(/<[^>]+>/g, ''); // strip highlight spans
-        const url = `https://en.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g, '_'))}`;
-        if (!results.some((r) => r.title === title)) {
-          results.push({ title, snippet, url });
+    } else {
+      // Tavily (default) — clean answer + ranked sources. api_key in body.
+      const res = await universalFetch('https://api.tavily.com/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          api_key: key,
+          query: q,
+          max_results: limit,
+          include_answer: true,
+        }),
+        signal: payloadObj.signal,
+      });
+      if (res.ok) {
+        const tv = await res.json();
+        if (tv.answer) {
+          results.push({ title: 'Tavily answer', snippet: tv.answer, url: '' });
+        }
+        if (Array.isArray(tv.results)) {
+          for (const r of tv.results) {
+            results.push({ title: r.title || '', snippet: r.content || '', url: r.url || '' });
+          }
         }
       }
     }
-  } catch (e) {
-    // Wikipedia is best-effort
+  } catch {
+    // Network/CORS failure — report no grounding rather than falling back to
+    // a different provider the user didn't select.
   }
 
   return {
     ok: results.length > 0,
-    json: async () => ({ results: results.slice(0, limit) }),
+    json: async () => ({ results: results.slice(0, limit), grounded: results.length > 0 }),
   };
 }
 

@@ -12,6 +12,7 @@ pub fn run() {
             sandbox::run_sandbox_command,
             sandbox::list_sandbox_artifacts,
             sandbox::write_sandbox_files,
+            sandbox::close_sandbox_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

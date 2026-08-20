@@ -23,6 +23,10 @@ export const DEFAULT_SETTINGS: BYOKSettings = {
     'You are a high-speed, senior AI programming assistant and context engineer working inside SAW AI. All project files provided in the prompt are raw, unchunked ground-truth code. When writing interactive frontend components, provide clean, complete, modern React/Tailwind/HTML code blocks so the Claude-style Artifacts sandbox can render them immediately. If you need clarification from the user before making large changes, output exactly this JSON block and nothing else (do not use for simple greetings): ```json\n{"clarification_requests": [{"question": "...", "options": ["Option 1", "Option 2"]}]}\n```',
   webSearchEnabled: true,
   webSearchMaxResults: 4,
+  webSearchProvider: 'tavily',
+  webSearchApiKey: '',
+  serperApiKey: '',
+  langsearchApiKey: '',
   mcpServers: DEFAULT_MCP_SERVERS,
   skills: DEFAULT_SKILLS,
   aiProfiles: DEFAULT_AI_PROFILES,
@@ -47,9 +51,17 @@ export const StorageService = {
           activeId = profiles[0]?.id || DEFAULT_SETTINGS.activeProfileId;
         }
 
+        // Migrate retired web-search providers (duckduckgo*/wikipedia) to the
+        // new default so old stored settings never reference a removed backend.
+        const VALID_SEARCH_PROVIDERS = ['tavily', 'serper', 'langsearch'];
+        const webSearchProvider = VALID_SEARCH_PROVIDERS.includes(parsed.webSearchProvider)
+          ? parsed.webSearchProvider
+          : DEFAULT_SETTINGS.webSearchProvider;
+
         return {
           ...DEFAULT_SETTINGS,
           ...parsed,
+          webSearchProvider,
           activeProfileId: activeId,
           skills: parsed.skills && Array.isArray(parsed.skills) && parsed.skills.length > 0 ? parsed.skills : DEFAULT_SKILLS,
           aiProfiles: profiles,
@@ -61,9 +73,20 @@ export const StorageService = {
     return DEFAULT_SETTINGS;
   },
 
+  _saveSettingsInFlight: null as Promise<any> | null,
+
   saveSettings(settings: BYOKSettings): void {
     try {
-      db.settings.put({ ...settings, id: 'default' } as any).catch(e => console.error(e));
+      // Track the in-flight write so flushPendingAsync() can await it — on
+      // desktop the webview is destroyed on window close, which could kill a
+      // just-issued put (the "API key gone after closing the app" bug).
+      this._saveSettingsInFlight = Promise.resolve(
+        db.settings.put({ ...settings, id: 'default' } as any)
+      )
+        .catch((e) => console.error(e))
+        .finally(() => {
+          this._saveSettingsInFlight = null;
+        });
     } catch (e) {
       console.error('Failed to save settings to DB', e);
     }
@@ -138,6 +161,31 @@ export const StorageService = {
     }
   },
 
+  // Awaitable variant of flushPending(). Used on the Tauri window's
+  // close-requested event, where we preventDefault the close, await the
+  // writes, then destroy the window — the desktop webview is killed instantly
+  // on close, so fire-and-forget writes from pagehide/beforeunload (which
+  // don't reliably fire there anyway) never land.
+  async flushPendingAsync(): Promise<void> {
+    if (this._saveChatsTimer) {
+      clearTimeout(this._saveChatsTimer);
+      this._saveChatsTimer = null;
+    }
+    if (this._saveProjectsTimer) {
+      clearTimeout(this._saveProjectsTimer);
+      this._saveProjectsTimer = null;
+    }
+    const pendingChats = this._pendingChats;
+    const pendingProjects = this._pendingProjects;
+    this._pendingChats = null;
+    this._pendingProjects = null;
+    const ops: Promise<any>[] = [];
+    if (pendingChats) ops.push(this._saveChatsNow(pendingChats));
+    if (pendingProjects) ops.push(this._saveProjectsNow(pendingProjects));
+    if (this._saveSettingsInFlight) ops.push(this._saveSettingsInFlight);
+    if (ops.length > 0) await Promise.all(ops);
+  },
+
   async getProjectsAsync(): Promise<Project[]> {
     try {
       const data = await db.projects.toArray();
@@ -151,6 +199,17 @@ export const StorageService = {
   },
 
   saveProjects(projects: Project[]): void {
+    // An immediate save SUPERSEDES any pending debounced write: cancel the
+    // timer and drop the stale pending list so a later flushPending() can
+    // never re-write an older array over this one (which resurrected deleted
+    // projects). Also update the signature so the trailing debounced effect
+    // call for this same list is correctly skipped.
+    this._lastProjectsSignature = projects.map((p) => `${p.id}:${p.updatedAt ?? 0}`).join('|');
+    this._pendingProjects = null;
+    if (this._saveProjectsTimer) {
+      clearTimeout(this._saveProjectsTimer);
+      this._saveProjectsTimer = null;
+    }
     this._saveProjectsNow(projects);
   },
 
@@ -188,6 +247,18 @@ export const StorageService = {
   },
 
   saveChats(chats: ChatSession[]): void {
+    // Same supersede rule as saveProjects: an immediate save cancels and
+    // replaces any pending debounced write. Without this, the delete handler's
+    // flushPending() re-committed the STALE pre-delete chat list after the
+    // deletion, so deleted chats reappeared on the next app launch (especially
+    // on desktop, where the window can be destroyed before the trailing
+    // debounced write corrects it).
+    this._lastChatsSignature = chats.map((c) => `${c.id}:${c.updatedAt ?? 0}`).join('|');
+    this._pendingChats = null;
+    if (this._saveChatsTimer) {
+      clearTimeout(this._saveChatsTimer);
+      this._saveChatsTimer = null;
+    }
     this._saveChatsNow(chats);
   },
 

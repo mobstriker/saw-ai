@@ -141,6 +141,24 @@ owner's personal preferences — do not genericize the UX.
   **Sandbox** button in the `ChatWindow` header; docks as a bottom panel.
   `isSandboxAvailable()` checks `__TAURI_INTERNALS__` and degrades gracefully
   (shows a notice) when running as a plain web dev server.
+- **Workdir re-sync (Phase 4 fix)**: the persistent shell's CWD is set at session
+  creation, but `run_sandbox_command` now re-`cd`s into the requested workdir on
+  EVERY run when it differs from the session's current CWD. Without this, a chat
+  whose workdir changed after the first command (universal→project, or the agent
+  loop seeding into a project subdir) had its shell stuck in the old CWD, so files
+  written via `write_sandbox_files` to the new workdir were invisible to
+  `python file.py` → "failed". The cd target is the jail-resolved workdir, so it
+  can never escape the root.
+- **Universal-chat seeding (Phase 4 fix)**: `runSandboxAgentStep` previously
+  skipped seeding seedFiles when `workdir` was empty (universal chat, no
+  project) because of an `if (workdir && ...)` guard. An empty workdir resolves to
+  the sandbox ROOT in Rust, so seeding there is correct — the guard was dropped so
+  Python files are now seeded (and `python foo.py` resolves) in universal chats too.
+- **Filename derivation (Phase 4 fix)**: when the AI's artifact had no real
+  filename, the sandbox seeded it as a generic "python snippet" (no extension),
+  so `python main.py` / `python <name>.py` could never find it. Artifacts now
+  derive `snippet.<ext>` from the language (py/js/ts/rs/...) and Python artifacts
+  always get a `.py` extension, so runs resolve by name.
 - **Verifying Rust**: `cargo check` (from `src-tauri/`) needs system deps on
   Linux: `pkg-config libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev
   libayatana-appindicator3-dev librsvg2-dev libssl-dev`. `src-tauri/gen/` and
@@ -157,6 +175,59 @@ owner's personal preferences — do not genericize the UX.
 ## Web Preview (HTML/TSX/JSX/SVG)
 - `FileViewerModal` builds a sandboxed iframe (`sandbox="allow-scripts ..."`).
 - TSX/JSX are transpiled in-browser (existing logic) before injection.
+- TSX/JSX live preview uses `SandpackTsxPreview` (CodeSandbox Sandpack, real
+  bundler + npm). It hands Sandpack the `react-ts` template with `/App.tsx`
+  overridden by the AI's code. `detectMainComponentName` finds the LAST
+  PascalCase component declaration (function/const-arrow/class) and appends a
+  correct `export default <Name>` when the AI didn't include one — the old
+  `export default App` referenced an undefined `App` whenever the component
+  wasn't named App, crashing the Sandpack bundler → blank preview. Container
+  has `min-h-[200px]` so Sandpack never collapses to 0 height. CONSOLE button
+  toggles the Sandpack console for runtime errors.
+
+## Token accounting (accurate, input + output)
+- `Message.inputTokens` / `Message.outputTokens` (new) hold the TRUE token
+  spend per turn. The SSE stream parser (`captureUsage` in App.tsx) captures
+  the provider's `usage` from the final chunk in all common shapes:
+  OpenAI (`prompt_tokens`/`completion_tokens`), Anthropic
+  (`input_tokens`/`output_tokens`), Gemini (`usageMetadata.promptTokenCount`/
+  `candidatesTokenCount`). When the provider reports usage, those are EXACT.
+  When it doesn't, output is counted via `countTokens` (real BPE, o200k_base)
+  and input is counted by tokenizing the full system prompt + the conversation
+  sent (`fullSystemPrompt` + `cleanApiMessages`). `tokensEstimate` is kept as
+  the legacy output-only field for the per-response footer.
+- `deriveChatStats` (`src/utils/chatStats.ts`) sums input+output per model and
+  exposes `totalInputTokens`/`totalOutputTokens` + per-model
+  `inputTokens`/`outputTokens`. Falls back to `tokensEstimate` for old chats.
+- The three-dots chat-info drawer (`Sidebar.tsx`) renders total + an input/output
+  split card + per-model bars (with a usage-proportion bar). It's a fixed
+  right-side drawer (w-420, h-full) over the chat/code area — NOT a tiny sidebar
+  dropdown — so it has room to show everything.
+- Files-created detection: `deriveChatStats` now also scans message content for
+  fenced code blocks with a `// path/file.ext` comment (mirrors the markdown
+  renderer's smart-filename logic) as a last resort, so universal chats with no
+  projectSnapshotBefore still report the files the AI produced.
+
+## Three-dots chat info (revised)
+- The info button is `MoreVertical` (three dots stacked VERTICALLY), not
+  `MoreHorizontal`. Clicking opens a fixed right-side drawer (`fixed right-0
+  top-0 h-full w-[min(420px,92vw)] z-[61]`) with a backdrop catcher. Shows:
+  scope (Universal/Project + name), token spend (total + input/output split +
+  per-model breakdown with proportion bars), and files created/edited/added.
+
+## Flutter / DartPad (gist-token embed)
+- `src/utils/dartpadEmbed.ts` `buildDartpadEmbedUrl(source, token)` POSTs the
+  Dart to `api.github.com/gists` (Bearer token, public gist, `main.dart`) and
+  returns `https://dartpad.dev/embed-flutter.html?id=<gistId>&run=true`.
+  Cached by an FNV-1a hash of the source (no re-create per keystroke).
+- `gistToken` lives in `BYOKSettings` (Settings → Flutter tab), plumbed
+  App → FileViewerModal/ArtifactViewer → FlutterPhoneSimulator. NEVER hardcode
+  it; the user pastes it once and it persists in Dexie.
+- Without a token, the phone bezel shows the structural widget-tree preview
+  (`dartWidgetParser`) with a "Add a GitHub gist token in Settings for a live
+  DartPad canvas" hint. The Settings UI has a step-by-step "How to get a token"
+  guide (GitHub → Settings → Developer settings → PAT classic → gist scope).
+- `ensureFlutterApp` wraps a bare Widget in `MaterialApp` before gist/analyze.
 
 ## Git / Commits
 - Existing git identity is configured; reuse it. Add
@@ -164,6 +235,83 @@ owner's personal preferences — do not genericize the UX.
 - Previous 5 features (smart filenames, TSX/JSX preview, Swift/Kotlin mobile
   preview, debug button, Save-as-Project) were already committed before this
   Flutter-engine work.
+
+## Multi-feature overhaul (tokens, chat info, MCP bridge, quota fix)
+- **Chat input**: the "Upload whole folder" (`FolderUp`) button was removed —
+  the paperclip (`Paperclip`) now accepts **any** file type and the existing
+  chat-wide drag-drop already handles folders + .zip via `collectDroppedFiles`
+  (`src/utils/dropHandler.ts`, entry-API traversal + zip expansion). The "0
+  tokens" prompt pill was removed from the input footer; the BPE count in the
+  Pure-Context drawer was kept (legitimate info display).
+- **Per-response tokens**: `Message.tokensEstimate` is now actually populated
+  in `App.tsx` on completion — the success finalize path and the clean-stop
+  (transport-close-after-content) path both compute `countTokens(content)`
+  once. `MessageItem.tsx` renders `~{tokens} tokens` at the end of each
+  assistant response via `useMessageTokenCount` hook (`src/utils/useMessageTokenCount.ts`),
+  which prefers `tokensEstimate` and falls back to async BPE counting (seeded
+  with an instant heuristic so it never flickers to 0). The memo comparator
+  checks `tokensEstimate` so the footer updates when the count is attached in
+  the separate post-finalize update.
+- **Three-dots chat info** (`Sidebar.tsx`): a `MoreHorizontal` button is a
+  SEPARATE hover button on each chat row (Rename + Delete stay as direct
+  buttons). Its popover shows: chat scope (Universal Chat vs Project Chat +
+  project name), files created/edited/added (from artifacts + project snapshots
+  + bound project file list), and token spend (total + per-model breakdown from
+  `message.tokensEstimate`). Derived by `src/utils/chatStats.ts` →
+  `deriveChatStats(chat, projects)` from existing data (no extra API calls).
+- **Quota-error fix (CRITICAL)**: a genuine quota/rate-limit error is now
+  recognized ONLY from a REAL HTTP 429 status, carried on `HttpProviderError`
+  (`src/App.tsx`). The old loose substring matcher (`err.message.includes('429'
+  /'quota'/'rate limit')`) turned benign desktop-webview SSE socket-close
+  errors into false "Your model provider reported a quota limit" banners on
+  the 2nd/3rd prompt. Both `!response.ok` blocks (send + continue paths) now
+  throw `HttpProviderError(message, status)`. The catch classifier:
+  - HTTP 401 / clear auth message → API-key config banner.
+  - HTTP 429 / explicit `RESOURCE_EXHAUSTED` in a real HTTP response → quota
+    banner.
+  - Transport error WITH partial content → `isStopped` (continue/retry), NOT a
+    hard error and NOT a fake banner.
+  - Transport error with NO content → generic "Connection Interrupted" +
+    Retry.
+  - Stream close after a clean `finish_reason === 'stop'` + content → finalize
+    as a successful completion (`cleanStop && existingPartialContent` path).
+- **MCP real tool-execution bridge** (`src/utils/mcpExecutor.ts`): MCP is no
+  longer prompt-only. `probeMcpServer(server)` does JSON-RPC `ping` + (on
+  success) `tools/list` to discover the server's real tools; `callMcpTool(server,
+  toolName, args)` does `tools/call` and returns the concatenated result text.
+  All requests go through `universalFetch` (works on web + Tauri desktop).
+  - **Auto status check**: an `useEffect` in `App.tsx` probes every enabled
+    MCP server on load (and when the enabled set changes by id) so their real
+    status + discovered tools are known before the first chat. The runtime
+    filter `s.enabled && s.status === 'online'` requires `online`, so without
+    this probe MCP would silently do nothing even when servers are configured.
+  - **Namespacing + native tools**: each tool is sent as `<serverName>/<toolName>`
+    (`_namespaced`) in the request body's `tools` array so providers that
+    support function-calling invoke them directly; `tool_choice: 'auto'`. The
+    system prompt also describes them in text + the `mcp_tool_call` fenced-block
+    fallback for providers without function calling.
+  - **Tool-call capture + loop**: `accumulateToolCalls` (App.tsx) accumulates
+    streamed OpenAI-style `delta.tool_calls` (index-keyed, arguments
+    concatenated across deltas). After the assistant turn, the app builds the
+    call list from native tool_calls (split on first `/`) PLUS text-parsed
+    `parseToolCallsFromText` (`mcp_tool_call`/`<tool_call>` blocks), executes
+    each against the named server, and feeds the results back as a follow-up
+    user turn `[MCP tool execution results — round N]` via recursive
+    `handleSendMessage(..., isMcpToolFollowup=true)`. `mcpFollowupRef` caps at
+    `MCP_MAX_TOOL_ROUNDS` (6) per manual prompt; reset on fresh send. The MCP
+    follow-up IS allowed to continue the loop (multi-round tool calling);
+    sandbox follow-ups are blocked from spawning MCP rounds (`!isSandboxFollowup`).
+- **Skills**: `ContextInjector.buildSkillsPromptContext` already injects
+  `SKILL.md` + ALL companion files (py/ts/templates) for enabled or
+  prompt-triggered skills into the system prompt. Toggle via
+  `handleToggleChatSkill` (per-chat `enabledSkillIds`; default =
+  `enabledByDefault` skills). No fix needed — verified wiring is intact.
+- **AddSkillModal drag-drop**: the drop tile now uses `collectDroppedFiles`
+  (was only reading flat `dataTransfer.files`, which misses folder contents —
+  browsers expose folder entries via `DataTransferItem.getAsEntry`, not
+  `.files`). Each dropped file is tagged with its `webkitRelativePath` so the
+  existing read loop picks it up. The files input `accept` was widened to any
+  type (was a hardcoded extension allowlist).
 
 ## Tauri version alignment (CRITICAL for the "Build Windows App" CI)
 - `.github/workflows/main.yml` builds for `x86_64-pc-windows-msvc` on every push
@@ -193,3 +341,76 @@ owner's personal preferences — do not genericize the UX.
 - `vite.config.ts`: manual vendor chunks (react, markdown/katex, tauri,
   data/dexie+jszip+motion+lucide). HMR disabled when `DISABLE_HMR=true`.
 - `chunkSizeWarningLimit: 1100` (app chunk is large by design).
+
+## API error-classification follow-up (false "error/retry" cards on NVIDIA, Gemini unreachable)
+- Both branches' transport (`chatProxy.ts` universalFetch/native-first) is
+  identical; the false positives live in the App.tsx catch classifier.
+- **Partial content = success**: in both the main-send and continuation catch
+  paths, ANY streamed content now finalizes the message as completed unless
+  the thrown error is a real `HttpProviderError`. NVIDIA NIM (and the desktop
+  webview in general) frequently closes the SSE socket right after the
+  content — that trailing transport error previously flipped the message to
+  `isStopped` (false "continue/retry" card) or `isError` (false error card)
+  even when generation fully succeeded. This was also main's "second prompt
+  always errors" bug. Never gate the clean-finalize on `finish_reason` alone.
+- **Gemini endpoint normalization** (`resolveChatCompletionsUrl`) maps any
+  `generativelanguage.googleapis.com` base to
+  `/v1beta/openai/chat/completions` — Google's ONLY chat surface for AI Studio
+  keys. Without it every chat 404'd regardless of key (looked like "Gemini
+  doesn't work"). NVIDIA/OpenAI/custom URLs untouched, so both providers work
+  side by side.
+
+
+## Multi-feature bugfix round (TSX preview, DEBUG banners, drag-drop, web search, Gemini, errors)
+- **TSX/JSX live preview styling**: `SandpackTsxPreview` overrides
+  `/public/index.html` (hidden) with the Tailwind Play CDN `<script
+  src="https://cdn.tailwindcss.com">` and `/styles.css` with a margin/reset
+  base. Sandpack's stock `react-ts` template ships NO CSS framework, so AI
+  components using Tailwind utility classes (bg-purple-600, flex, …) rendered
+  completely unstyled (black text, top-left, white background) even though the
+  preview "worked". Keep the CDN script tag in INDEX_HTML if you touch that
+  file.
+- **Flutter DEBUG ribbons are fully gone**: the HTML corner ribbon + BANNER
+  toggle were removed from `FlutterPhoneSimulator`, and `ensureFlutterApp`
+  (`flutterEngine.ts`) injects `debugShowCheckedModeBanner: false` into the
+  first `MaterialApp(`/`MaterialApp.router(` (unless the source already sets
+  it) so the live DartPad canvas and any real `flutter run` of pasted code
+  never show Flutter's red DEBUG ribbon. The DEBUG bug-report button
+  (analyzer-driven) is unchanged.
+- **Artifact IDs are content-addressed**: `ArtifactParser.extractArtifacts`
+  ids are `art-${index}-${fnv1a(title+code)}` — never reuse `Date.now()`. The
+  old time-based ids collided across messages (index restarts at 1 per
+  message), so clicking a NEW same-named artifact selected the OLD one by id
+  (looked exactly like "the app overwrote my old file with new code").
+- **AI file naming rules** live in the main send path in `App.tsx`
+  ("Code Artifact Naming" block): first-line filename comment required,
+  unique names for NEW files (existing artifact names are injected into the
+  prompt), exact-name references in prose/run commands, one-line description
+  after each file.
+- **Gemini endpoint normalization**: `resolveChatCompletionsUrl` maps any
+  `generativelanguage.googleapis.com` base (bare root, `/v1beta`,
+  `/v1beta/models`, or `/v1beta/openai`) to
+  `/v1beta/openai/chat/completions` — the ONLY chat surface Google AI Studio
+  keys work against. Other providers (NVIDIA, OpenAI, custom) untouched.
+- **Sandbox workdir is per-chat**: universal chats use `chat-<chatId>` (was
+  the shared sandbox ROOT); project chats keep `proj-<id>`. Both
+  `SandboxPanel` and `sandboxAgent.runSandboxAgentStep` compute the same
+  workdir — keep them in sync.
+- **Drag & drop in the desktop app**: `tauri.conf.json` windows config has
+  `dragDropEnabled: false`. Without it, Tauri's webview intercepts OS file
+  drops natively and NO HTML5 dragenter/dragover/drop events ever reach the
+  JS handlers (chat drop, AddSkillModal drop, project drop all looked "broken"
+  despite correct JS). Never re-enable unless switching to Tauri-native drop
+  handling.
+- **Web search is BYOK-only**: providers are `tavily` | `serper` |
+  `langsearch` (one active at a time), keys in `webSearchApiKey` /
+  `serperApiKey` / `langsearchApiKey`. `performSearchRequest` never falls
+  back across providers. Old stored `duckduckgo*`/`wikipedia` values migrate
+  to `tavily` in `getSettingsAsync`.
+- **Error cards always quote the provider**: every error branch (auth, 429
+  quota, other 4xx, 5xx, transport) includes the real provider message
+  verbatim — never render a banner without it.
+- **Tauri window close handler**: `win` is obtained via a lazy
+  `await import('@tauri-apps/api/window')` + `getCurrentWindow()` inside the
+  effect — a bare/top-level reference breaks the pure-web typecheck.
+

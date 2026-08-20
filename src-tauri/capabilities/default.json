@@ -19,6 +19,8 @@
         { "url": "http://127.0.0.1:**" },
         { "url": "http://127.0.0.1:**/**" }
       ]
-    }
+    },
+    "core:event:default",
+    "core:window:allow-destroy"
   ]
 }

@@ -11,8 +11,8 @@ import {
   Link,
   ShieldCheck,
 } from 'lucide-react';
-import { MCPServer, MCPTool } from '../types';
-import { universalFetch } from '../utils/chatProxy';
+import { MCPServer } from '../types';
+import { probeMcpServer } from '../utils/mcpExecutor';
 
 interface MCPTabProps {
   servers: MCPServer[];
@@ -81,81 +81,14 @@ export const MCPTab: React.FC<MCPTabProps> = ({ servers, onUpdateServers }) => {
 
   const testServerPing = async (server: MCPServer) => {
     setTestingId(server.id);
-    const startTime = Date.now();
     try {
-      // Step 1: reachability probe.
-      // SSE endpoints respond to GET with a stream; JSON-RPC endpoints respond
-      // to POST. We use a short timeout and treat any HTTP response as "online".
-      const method = server.type === 'jsonrpc' ? 'POST' : 'GET';
-      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-      const body =
-        server.type === 'jsonrpc'
-          ? JSON.stringify({ jsonrpc: '2.0', method: 'ping', id: 1 })
-          : undefined;
-
-      const res = await universalFetch(server.url, {
-        method,
-        headers,
-        body,
-        signal: AbortSignal.timeout(6000),
-      });
-      const latencyMs = Date.now() - startTime;
-      const online = res.status > 0 && res.status < 500;
-
-      // Step 2: discover real tools via JSON-RPC tools/list (best-effort).
-      // Many MCP servers expose a JSON-RPC endpoint; if CORS allows it we
-      // replace the placeholder tool list with the server's actual tools.
-      let discoveredTools: MCPTool[] | null = null;
-      if (online) {
-        try {
-          const toolsRes = await universalFetch(server.url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-            body: JSON.stringify({ jsonrpc: '2.0', method: 'tools/list', id: 2 }),
-            signal: AbortSignal.timeout(6000),
-          });
-          if (toolsRes.ok) {
-            const toolsJson = await toolsRes.json();
-            const list = toolsJson?.result?.tools || toolsJson?.tools;
-            if (Array.isArray(list) && list.length > 0) {
-              discoveredTools = list.map((t: any, i: number) => ({
-                id: `t-${server.id}-${i}-${Date.now()}`,
-                name: t.name || `tool-${i}`,
-                description: t.description || '',
-                enabled: true,
-              }));
-            }
-          }
-        } catch {
-          // CORS or transport blocked tool discovery — keep existing tools.
-        }
-      }
-
+      // Reuse the unified probe so SSE servers get the proper endpoint-handshake
+      // treatment (GET → `endpoint` event → POST to that URL) and JSON-RPC
+      // servers get the plain POST path. This keeps "Test connection" identical
+      // to the auto status-check + tool execution paths.
+      const probed = await probeMcpServer(server);
       onUpdateServers(
-        servers.map((s) => {
-          if (s.id !== server.id) return s;
-          return {
-            ...s,
-            status: online ? 'online' : 'offline',
-            latencyMs: latencyMs,
-            ...(discoveredTools ? { tools: discoveredTools } : {}),
-          };
-        })
-      );
-    } catch (e) {
-      // For SSE streams the connection opens but never "completes" until closed;
-      // an AbortError after the stream started still means the server is reachable.
-      const latencyMs = Date.now() - startTime;
-      const isAbort = (e as any)?.name === 'TimeoutError' || (e as any)?.name === 'AbortError';
-      onUpdateServers(
-        servers.map((s) => {
-          if (s.id !== server.id) return s;
-          return {
-            ...s,
-            status: isAbort && server.type === 'sse' ? 'online' : 'offline',
-            latencyMs,
-          };
-        })
+        servers.map((s) => (s.id === server.id ? probed : s))
       );
     } finally {
       setTestingId(null);

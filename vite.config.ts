@@ -28,9 +28,15 @@ export default defineConfig(() => {
             'react-vendor': ['react', 'react-dom'],
             'markdown-vendor': ['katex'],
             'tauri-vendor': ['@tauri-apps/api', '@tauri-apps/plugin-fs', '@tauri-apps/plugin-http'],
+            // gpt-tokenizer ships large BPE tables; isolate it so it loads
+            // lazily and never bloats the app entry chunk.
+            'tokenizer-vendor': ['gpt-tokenizer'],
             // motion and dexie/jszip share transitive imports; grouping them
             // avoids a circular-chunk warning and keeps both out of the app chunk.
             'data-vendor': ['dexie', 'dexie-react-hooks', 'jszip', 'motion', 'lucide-react'],
+            // Sandpack pulls in a large bundler UI; isolate so it loads lazily
+            // only when a TSX/JSX preview is opened.
+            'sandpack-vendor': ['@codesandbox/sandpack-react'],
           },
         },
       },

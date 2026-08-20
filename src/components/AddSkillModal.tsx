@@ -16,6 +16,8 @@ import {
 } from 'lucide-react';
 import { Skill, SkillFile } from '../types';
 import { FileSecurity } from '../utils/fileSecurity';
+import { extractZipFiles, isZipFileExport } from '../utils/zipImporter';
+import { collectDroppedFiles } from '../utils/dropHandler';
 
 interface AddSkillModalProps {
   isOpen: boolean;
@@ -119,14 +121,49 @@ triggers:
     }
   };
 
-  // Folder & File Upload parser (drag-and-drop or webkitdirectory input)
+  // Folder & File Upload parser (drag-and-drop or webkitdirectory input).
+  // Handles loose files, whole folders (webkitdirectory), AND .zip archives
+  // (e.g. a downloaded skill from GitHub). Zips are extracted in-browser so
+  // every file inside — SKILL.md, Python/TS helpers, templates — is imported.
   const handleUploadedFilesList = async (uploadedFileList: FileList | File[]) => {
     const newFilesList: SkillFile[] = [];
     let detectedSkillName = name;
     let detectedDescription = description;
 
+    // First pass: expand any .zip into its constituent files. This lets the
+    // user drop a single downloaded zip and still get the full skill bundle.
+    const expandedFiles: File[] = [];
     for (let i = 0; i < uploadedFileList.length; i++) {
-      const file = uploadedFileList[i];
+      const f = uploadedFileList[i];
+      if (isZipFileExport(f)) {
+        const result = await extractZipFiles(f);
+        if (result.error) {
+          console.warn(result.error);
+          setUploadNotice(`Could not read "${f.name}".`);
+          setTimeout(() => setUploadNotice(null), 3000);
+          continue;
+        }
+        // Project each extracted entry into a lightweight File-like object the
+        // shared read loop below already understands (webkitRelativePath
+        // preserves the in-archive folder structure).
+        for (const ef of result.files) {
+          const fake = new File([ef.content], ef.name, { type: 'text/plain' });
+          Object.defineProperty(fake, 'webkitRelativePath', {
+            value: f.name.replace(/\.zip$/i, '') + '/' + ef.path,
+            configurable: true,
+          });
+          expandedFiles.push(fake);
+        }
+        if (result.skipped.length > 0) {
+          console.warn(`Skipped inside ${f.name}:`, result.skipped);
+        }
+      } else {
+        expandedFiles.push(f);
+      }
+    }
+
+    for (let i = 0; i < expandedFiles.length; i++) {
+      const file = expandedFiles[i];
       // Get relative path if available from webkitRelativePath
       const relPath = (file as any).webkitRelativePath
         ? (file as any).webkitRelativePath.split('/').slice(1).join('/')
@@ -177,7 +214,7 @@ triggers:
       }
       if (detectedDescription) setDescription(detectedDescription);
 
-      setUploadNotice(`Loaded ${newFilesList.length} files from skill folder!`);
+      setUploadNotice(`Loaded ${newFilesList.length} file(s)${newFilesList.length > 1 ? ' (including extracted zip contents)' : ''}!`);
       setTimeout(() => setUploadNotice(null), 3000);
     }
   };
@@ -264,11 +301,26 @@ ${triggerConditions ? `Trigger: ${triggerConditions}\n` : ''}
                 setDragOver(true);
               }}
               onDragLeave={() => setDragOver(false)}
-              onDrop={(e) => {
+              onDrop={async (e) => {
                 e.preventDefault();
                 setDragOver(false);
-                if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-                  handleUploadedFilesList(e.dataTransfer.files);
+                // Use the shared drop handler so dragging a whole FOLDER onto
+                // this tile traverses every nested file (browsers expose folder
+                // contents via DataTransferItem.getAsEntry, not via .files).
+                // Each dropped file is tagged with its relative path so the
+                // existing read loop picks it up. Zips are expanded inside
+                // collectDroppedFiles too.
+                const dropped = await collectDroppedFiles(e.dataTransfer);
+                if (dropped.length > 0) {
+                  const tagged: File[] = dropped.map((d) => {
+                    const fake = new File([d.file], d.file.name, { type: d.file.type });
+                    Object.defineProperty(fake, 'webkitRelativePath', {
+                      value: d.path,
+                      configurable: true,
+                    });
+                    return fake;
+                  });
+                  handleUploadedFilesList(tagged);
                 }
               }}
               className={`p-4 rounded-xl border-2 border-dashed transition-all text-center flex flex-col items-center justify-center gap-2 ${

@@ -219,6 +219,23 @@ function findFilenameComment(code: string): { name: string; lineIndex: number } 
 }
 
 /**
+ * Small FNV-1a hash so artifact ids are unique per (title + code). The old id
+ * scheme (`art-${index}-${Date.now()}`) restarted `index` at 1 for EVERY
+ * message, so two different responses that both produced "App.tsx" ended up
+ * with colliding ids — clicking the NEW artifact selected the OLD one by id,
+ * which looked exactly like "the app overwrote my old file with the new code".
+ */
+function artifactHash(title: string, code: string): string {
+  const s = `${title}${code}`;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(36);
+}
+
+/**
  * Extracts Claude-style artifacts from markdown code blocks
  */
 export const ArtifactParser = {
@@ -277,7 +294,7 @@ export const ArtifactParser = {
       }
 
       artifacts.push({
-        id: `art-${index}-${Date.now().toString(36)}`,
+        id: `art-${index}-${artifactHash(title, code)}`,
         title,
         language: lang,
         code,

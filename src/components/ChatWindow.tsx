@@ -46,6 +46,9 @@ import { SandboxPanel } from './SandboxPanel';
 import type { SandboxStoreValue } from '../utils/sandboxStore';
 import { ContextInjector } from '../utils/contextInjector';
 import { FileSecurity } from '../utils/fileSecurity';
+import { collectDroppedFiles, type DroppedFile } from '../utils/dropHandler';
+import { countTokens, estimateTokensSync } from '../utils/tokenCounter';
+import { ArtifactParser } from '../utils/artifactParser';
 import {
   REASONING_MODES,
   detectModelReasoningCapability,
@@ -184,6 +187,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   const [webSearchActive, setWebSearchActive] = useState(settings.webSearchEnabled);
   const [showTokenInfo, setShowTokenInfo] = useState(false);
   const [isDragOverChat, setIsDragOverChat] = useState(false);
+  const [isDragOverInput, setIsDragOverInput] = useState(false);
   const [uploadNotice, setUploadNotice] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
@@ -253,10 +257,15 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
     };
   }, [showMcpPopover, showReasoningPopover, showSkillsPopover, showAutomationPopover]);
 
-  const activeMcpServers = (settings.mcpServers || []).filter((s) => s.enabled);
+  // "Active" = enabled by the user in this chat AND actually online. This must
+  // match the filter App.tsx uses when building mcp_tools, otherwise the badge
+  // would claim active tools that never reach the request.
+  const activeMcpServers = (settings.mcpServers || []).filter(
+    (s) => s.enabled && s.status === 'online',
+  );
   const totalMcpToolsCount = (settings.mcpServers || []).reduce(
-    (acc, s) => acc + (s.enabled ? (s.tools || []).filter((t) => t.enabled).length : 0),
-    0
+    (acc, s) => acc + (s.enabled && s.status === 'online' ? (s.tools || []).filter((t) => t.enabled).length : 0),
+    0,
   );
 
   const toggleServer = (serverId: string) => {
@@ -341,33 +350,49 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault();
     setIsDragOverChat(false);
-    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      processIncomingFiles(Array.from(e.dataTransfer.files));
+    if (e.dataTransfer) {
+      const dropped = await collectDroppedFiles(e.dataTransfer);
+      if (dropped.length > 0) {
+        processIncomingFiles(dropped);
+      }
     }
   };
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
-      processIncomingFiles(Array.from(e.target.files));
+      // Build DroppedFile[] preserving folder structure (webkitRelativePath)
+      // and let processIncomingFiles handle zip expansion too.
+      const dropped: DroppedFile[] = [];
+      for (let i = 0; i < e.target.files.length; i++) {
+        const f = e.target.files[i];
+        const rel = (f as any).webkitRelativePath
+          ? (f as any).webkitRelativePath.split('/').slice(1).join('/') || f.name
+          : f.name;
+        dropped.push({ file: f, path: rel || f.name });
+      }
+      processIncomingFiles(dropped);
     }
   };
 
-  const processIncomingFiles = async (fileList: File[]) => {
+  const processIncomingFiles = async (fileList: DroppedFile[]) => {
     const newProjectFiles: ProjectFile[] = [];
     let blockedCount = 0;
 
-    for (const f of fileList) {
-      const readResult = await FileSecurity.readFileSafely(f, f.name);
+    for (const entry of fileList) {
+      const f = entry.file;
+      const path = entry.path || f.name;
+      const fileName = path.split('/').pop() || path;
+      const readResult = await FileSecurity.readFileSafely(f, path);
       if (!readResult.allowed) {
         blockedCount++;
-        console.warn(`File rejected by security scanner: ${f.name} (${readResult.reason})`);
+        console.warn(`File rejected by security scanner: ${fileName} (${readResult.reason})`);
         continue;
       }
 
       newProjectFiles.push({
         id: `file-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        name: f.name,
-        path: f.name,
+        name: fileName,
+        path,
         size: f.size,
         includedInContext: true,
         language: readResult.language,
@@ -391,6 +416,30 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
 
   // Compute context tokens
   const contextStats = project ? ContextInjector.buildProjectPromptContext(project) : null;
+
+  // Accurate token count for the prompt the user is *about to send*: the
+  // injected project context (if any) + the current input text. Computed via
+  // a real BPE tokenizer (gpt-tokenizer), refreshed whenever the input or
+  // bound project changes. Falls back to a fast heuristic while loading.
+  const [promptTokenCount, setPromptTokenCount] = useState<number>(0);
+  useEffect(() => {
+    let cancelled = false;
+    const contextText = contextStats?.promptText || '';
+    const fullText = contextText + (inputText || '');
+    if (!fullText) {
+      setPromptTokenCount(0);
+      return;
+    }
+    // Instant heuristic so the number never flickers to 0.
+    setPromptTokenCount(estimateTokensSync(fullText));
+    countTokens(fullText).then((n) => {
+      if (!cancelled) setPromptTokenCount(n);
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inputText, contextStats?.promptText]);
   
   const activeProfile = (settings.aiProfiles || []).find(p => p.id === settings.activeProfileId) || (settings.aiProfiles && settings.aiProfiles[0]);
 
@@ -458,8 +507,8 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
       {isDragOverChat && (
         <div className="absolute inset-0 z-40 flex flex-col items-center justify-center bg-[#FAF8F5]/90 backdrop-blur-xs border-2 border-dashed border-[#C58B51] m-4 rounded-3xl animate-in fade-in">
           <Upload size={36} className="text-[#C58B51] mb-2 animate-bounce" />
-          <h3 className="text-sm font-bold text-[#2C2825]">Drop Files or Folder Here</h3>
-          <p className="text-xs text-[#7C756E]">Instant unchunked memory ingestion with 100% full-file retention</p>
+          <h3 className="text-sm font-bold text-[#2C2825]">Drop Files, Folder, or .zip Here</h3>
+          <p className="text-xs text-[#7C756E]">Folders &amp; zips are extracted automatically — every file ingested</p>
         </div>
       )}
 
@@ -765,7 +814,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
             title={
               sandboxStore?.accessGranted
                 ? 'AI has sandbox access — commands run from chat (even with this panel closed). Click to open & revoke.'
-                : 'Open the restricted in-app sandbox to run build commands (npm/flutter/cargo) and download artifacts'
+                : 'Open the sandbox to run Python (in-browser) and build commands (desktop). Per-chat, multi-page terminal.'
             }
           >
             <Terminal size={15} />
@@ -775,9 +824,13 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
                 AI
               </span>
             )}
-            {sandboxStore?.running && (
-              <span className="ml-0.5 h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" title="A sandbox command is running" />
-            )}
+            {sandboxStore && chat && (() => {
+              const cs = sandboxStore.states[chat.id];
+              const anyRunning = !!(cs && cs.tabs.some((t) => t.running));
+              return anyRunning ? (
+                <span className="ml-0.5 h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" title="A sandbox command is running" />
+              ) : null;
+            })()}
           </button>
 
           {/* Clear Chat */}
@@ -813,8 +866,8 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
             <span className="font-bold text-xs">Pure Context Retention Active</span>
             <span className="text-[11px] text-[#7C756E]">
               Holding <strong>{contextStats.includedFilesCount}</strong> raw files (
-              <strong>{contextStats.totalCharacters.toLocaleString()}</strong> characters / ~
-              <strong>{contextStats.estimatedTokens.toLocaleString()}</strong> tokens) in memory without chunking.
+              <strong>{promptTokenCount.toLocaleString()}</strong> tokens counted via BPE tokenizer,
+              <strong>{contextStats.totalCharacters.toLocaleString()}</strong> chars) in memory without chunking.
             </span>
           </div>
           <button
@@ -918,11 +971,64 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
         </div>
       </div>
 
-      {/* Sandbox Runner Dock — restricted in-app command execution (Feature 3).
-          Slides up from the bottom of the chat when toggled. */}
-      {showSandbox && (
+      {/* Sandbox Runner Dock — per-chat sandbox (Python via Pyodide + build
+          commands via Tauri). Slides up from the bottom when toggled. */}
+      {showSandbox && chat && sandboxStore && (
         <div className="h-[42vh] min-h-[280px] shrink-0 border-t-2 border-[#C58B51]/40 shadow-2xl animate-in slide-in-from-bottom-4 duration-300">
-          <SandboxPanel project={project || null} onClose={() => setShowSandbox(false)} store={sandboxStore!} />
+          <SandboxPanel
+            project={project || null}
+            onClose={() => setShowSandbox(false)}
+            store={sandboxStore}
+            chatId={chat.id}
+            allArtifactFiles={(() => {
+              // Seed EVERY code artifact from this chat's history so any file the
+              // AI created is runnable by name (python foo.py, node bar.js,
+              // multi-file imports). Deduped by path (latest wins).
+              const byPath = new Map<string, { path: string; content: string; language: string }>();
+              for (const m of chat.messages) {
+                if (m.role !== 'assistant' || !m.content) continue;
+                const arts = ArtifactParser.extractArtifacts(m.content);
+                for (const a of arts) {
+                  // Use the AI's filename when it carries a real extension;
+                  // otherwise derive `snippet.<ext>` from the language so the file
+                  // is still runnable by name (e.g. `python snippet.py`). The old
+                  // "python snippet" label had no extension, so `python main.py`
+                  // could never find it → "failed".
+                  const lang = (a.language || 'file').toLowerCase();
+                  const ext = lang === 'javascript' ? 'js'
+                    : lang === 'typescript' ? 'ts'
+                    : lang === 'python' ? 'py'
+                    : lang === 'rust' ? 'rs'
+                    : lang === 'html' ? 'html'
+                    : lang === 'css' ? 'css'
+                    : lang === 'json' ? 'json'
+                    : 'txt';
+                  const p = (a.title && a.title.includes('.'))
+                    ? a.title
+                    : `snippet.${ext}`;
+                  byPath.set(p, { path: p, content: a.code, language: a.language });
+                }
+              }
+              return Array.from(byPath.values());
+            })()}
+            latestArtifactCode={(() => {
+              // Seed the latest Python code artifact so `python <file>.py` has
+              // the file the AI just produced in chat.
+              for (let i = chat.messages.length - 1; i >= 0; i--) {
+                const m = chat.messages[i];
+                if (m.role !== 'assistant' || !m.content) continue;
+                const arts = ArtifactParser.extractArtifacts(m.content);
+                const py = arts.find(
+                  (a) => a.language.toLowerCase() === 'python' || a.title.endsWith('.py'),
+                );
+                // Ensure a .py extension so `python <name>.py` always resolves.
+                const rawName = py?.title || 'main.py';
+                const filename = rawName.endsWith('.py') ? rawName : `${rawName.replace(/\.[^.]+$/, '')}.py`;
+                if (py) return { filename, language: py.language, code: py.code };
+              }
+              return null;
+            })()}
+          />
         </div>
       )}
 
@@ -1006,7 +1112,9 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
               className="w-full resize-none text-xs outline-none placeholder:text-[#A09890] text-[#2C2825] leading-relaxed bg-transparent"
             />
 
-            {/* Hidden File Input for Paperclip */}
+            {/* Hidden File Input for Paperclip — accepts any file type (files,
+                folders dropped onto the chat/input are handled by the drop
+                handler; zips are extracted in-browser). */}
             <input
               type="file"
               ref={fileInputRef}
@@ -1018,12 +1126,12 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
             {/* Input Controls Footer */}
             <div className="mt-2 flex items-center justify-between pt-1 relative">
               <div className="flex items-center gap-1.5 flex-wrap">
-                {/* Paperclip File Upload */}
+                {/* Paperclip File Upload (any file type; folders/zips handled via drag-drop) */}
                 <button
                   type="button"
                   onClick={() => fileInputRef.current?.click()}
                   className="flex items-center justify-center h-7 w-7 rounded-lg text-[#7C756E] hover:text-[#2C2825] hover:bg-[#FAF8F5] transition-colors cursor-pointer"
-                  title="Upload files to prompt context"
+                  title="Add files (or drop a file/folder/.zip onto the chat)"
                 >
                   <Paperclip size={14} />
                 </button>
@@ -1109,6 +1217,24 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
                                   <span className="text-[9px] font-mono px-1.5 py-0.2 rounded bg-white border border-[#E6DFD3] text-[#7C756E] uppercase">
                                     {server.type}
                                   </span>
+                                  <span
+                                    className={`text-[9px] font-mono px-1.5 py-0.2 rounded uppercase ${
+                                      server.status === 'online'
+                                        ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                                        : server.status === 'checking'
+                                        ? 'bg-amber-50 text-amber-700 border border-amber-200'
+                                        : 'bg-red-50 text-red-600 border border-red-200'
+                                    }`}
+                                    title={
+                                      server.status === 'online'
+                                        ? 'Server reachable — tools will be sent to the model'
+                                        : server.status === 'checking'
+                                        ? 'Checking connectivity…'
+                                        : 'Server not reachable — enable and test in Settings'
+                                    }
+                                  >
+                                    {server.status || 'unknown'}
+                                  </span>
                                 </div>
 
                                 <button
@@ -1124,9 +1250,18 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
                                 </button>
                               </div>
 
-                              {/* Tool items */}
+                              {/* Tool items — or a hint when enabled but no tools discovered */}
                               <div className="space-y-1 mt-1 pl-1">
-                                {(server.tools || []).map((tool) => (
+                                {(server.tools || []).length === 0 ? (
+                                  <div className="text-[10px] text-[#7C756E] italic px-1 py-0.5">
+                                    {server.status === 'online'
+                                      ? 'Connected, but no tools discovered yet.'
+                                      : server.enabled
+                                      ? 'Enabled but offline — tools load once the server is reachable.'
+                                      : 'No tools (server is OFF).'}
+                                  </div>
+                                ) : (
+                                  (server.tools || []).map((tool) => (
                                   <div
                                     key={tool.id}
                                     onClick={() => server.enabled && toggleTool(server.id, tool.id)}
@@ -1146,7 +1281,8 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
                                       className="accent-[#C58B51] w-3 h-3 cursor-pointer"
                                     />
                                   </div>
-                                ))}
+                                  ))
+                                )}
                               </div>
                             </div>
                           ))

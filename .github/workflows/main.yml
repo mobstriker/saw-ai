@@ -3,7 +3,8 @@ name: Build Windows App
 on:
   push:
     branches:
-      - main
+      - fix/multi-feature-overhaul
+      - fix-multi-feature-overhaul
   workflow_dispatch:
  
 jobs:
@@ -43,6 +44,6 @@ jobs:
           tagName: app-v__VERSION__
           releaseName: 'SAW AI Workspace v__VERSION__'
           releaseBody: 'Here is the latest Windows release.'
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false
           args: --target x86_64-pc-windows-msvc

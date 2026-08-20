@@ -16,8 +16,14 @@ import {
   Database,
   Upload,
   LogOut,
+  MoreVertical,
+  FileCode,
+  Hash,
+  ArrowDownRight,
+  ArrowUpRight,
 } from 'lucide-react';
 import { Project, ChatSession, SidebarTab } from '../types';
+import { deriveChatStats } from '../utils/chatStats';
 
 interface SidebarProps {
   isOpen: boolean;
@@ -68,6 +74,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
   const [isDragOver, setIsDragOver] = useState(false);
+  const [infoChatId, setInfoChatId] = useState<string | null>(null);
 
   if (!isOpen) return null;
 
@@ -395,15 +402,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
                       <div className="truncate text-xs font-semibold text-[#2C2825]">
                         {displayTitle}
                       </div>
-                      <div className="text-[10px] text-[#A09890] flex items-center gap-1 mt-0.5">
-                        <span>{chat.messages.length} messages</span>
-                        <span>•</span>
+                      <div className="text-[10px] text-[#A09890] flex items-center gap-1.5 mt-0.5 whitespace-nowrap overflow-hidden">
+                        <span className="shrink-0 tabular-nums">{chat.messages.length} msg</span>
+                        <span className="shrink-0 text-[#E6DFD3]">•</span>
                         {parentProject ? (
-                          <span className="text-[#C58B51] font-medium truncate max-w-[90px]">
+                          <span className="text-[#C58B51] font-medium truncate">
                             {parentProject.name}
                           </span>
                         ) : (
-                          <span className="text-[#7C756E] font-medium">Universal Chat</span>
+                          <span className="text-[#7C756E] font-medium shrink-0">Universal Chat</span>
                         )}
                       </div>
                     </div>
@@ -412,6 +419,16 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
                 {!isEditing && (
                   <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setInfoChatId(infoChatId === chat.id ? null : chat.id);
+                      }}
+                      className={`p-1 rounded hover:bg-[#F5E6D3] ${infoChatId === chat.id ? 'text-[#C58B51]' : 'hover:text-[#C58B51]'}`}
+                      title="Chat info (files & tokens)"
+                    >
+                      <MoreVertical size={13} />
+                    </button>
                     <button
                       onClick={(e) => startRename(chat.id, chat.title, e)}
                       className="p-1 hover:text-[#C58B51]"
@@ -431,6 +448,189 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     </button>
                   </div>
                 )}
+
+                {/* Three-dots info drawer: chat scope, files touched, token
+                    spend (total input+output + per model with breakdown).
+                    Renders as a RIGHT-SIDE drawer over the chat/code area (not
+                    a tiny sidebar dropdown) so it has room to show everything. */}
+                {infoChatId === chat.id && (() => {
+                  const stats = deriveChatStats(chat, projects);
+                  return (
+                    <>
+                      {/* click-away catcher */}
+                      <div
+                        className="fixed inset-0 z-[60] bg-black/20"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setInfoChatId(null);
+                        }}
+                      />
+                      <div
+                        onClick={(e) => e.stopPropagation()}
+                        className="fixed right-0 top-0 z-[61] h-full w-[min(420px,92vw)] bg-white border-l border-[#E6DFD3] shadow-2xl flex flex-col text-[#2C2825] font-sans animate-in fade-in slide-in-from-right"
+                      >
+                        {/* Header */}
+                        <div className="flex items-center justify-between px-4 py-3 border-b border-[#E6DFD3] bg-[#FAF8F5]">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <Layers size={16} className="text-[#C58B51] shrink-0" />
+                            <div className="min-w-0">
+                              <div className="text-sm font-bold truncate">{chat.title}</div>
+                              <div className="text-[10px] text-[#7C756E]">Chat info &amp; usage</div>
+                            </div>
+                          </div>
+                          <button
+                            onClick={(e) => { e.stopPropagation(); setInfoChatId(null); }}
+                            className="p-1 rounded-lg text-[#A09890] hover:text-[#2C2825] hover:bg-white"
+                            title="Close"
+                          >
+                            <X size={16} />
+                          </button>
+                        </div>
+
+                        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+                          {/* Scope */}
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className={`text-[10px] font-bold px-2 py-1 rounded-lg ${stats.isUniversal ? 'bg-[#FAF8F5] text-[#7C756E] border border-[#E6DFD3]' : 'bg-[#F5E6D3] text-[#C58B51] border border-[#C58B51]/30'}`}>
+                              {stats.isUniversal ? 'Universal Chat' : 'Project Chat'}
+                            </span>
+                            {!stats.isUniversal && stats.projectName && (
+                              <span className="text-[11px] text-[#7C756E] truncate">{stats.projectName}</span>
+                            )}
+                            <span className="text-[10px] text-[#A09890] ml-auto">
+                              {stats.assistantResponses} assistant response{stats.assistantResponses === 1 ? '' : 's'}
+                            </span>
+                          </div>
+
+                          {/* Token spend — total + breakdown */}
+                          <div>
+                            <div className="flex items-center gap-1.5 mb-2">
+                              <Hash size={13} className="text-[#C58B51]" />
+                              <span className="text-xs font-bold text-[#2C2825]">Token spend</span>
+                            </div>
+                            <div className="rounded-2xl bg-[#FAF8F5] border border-[#E6DFD3] p-3">
+                              {/* Total */}
+                              <div className="flex items-baseline justify-between pb-2 mb-2 border-b border-[#E6DFD3]">
+                                <span className="text-[10px] font-bold text-[#7C756E] uppercase tracking-wide">Total</span>
+                                <span className="text-xl font-mono font-bold text-[#C58B51]">
+                                  {stats.totalTokens.toLocaleString()}
+                                </span>
+                              </div>
+                              {/* Input / output split */}
+                              <div className="grid grid-cols-2 gap-2 mb-2">
+                                <div className="rounded-xl bg-white border border-[#E6DFD3] px-2.5 py-2">
+                                  <div className="flex items-center gap-1 text-[9px] font-bold text-[#A09890] uppercase tracking-wide mb-0.5">
+                                    <ArrowDownRight size={10} /> Input
+                                  </div>
+                                  <div className="text-sm font-mono font-bold text-[#2C2825]">
+                                    {stats.totalInputTokens.toLocaleString()}
+                                  </div>
+                                </div>
+                                <div className="rounded-xl bg-white border border-[#E6DFD3] px-2.5 py-2">
+                                  <div className="flex items-center gap-1 text-[9px] font-bold text-[#A09890] uppercase tracking-wide mb-0.5">
+                                    <ArrowUpRight size={10} /> Output
+                                  </div>
+                                  <div className="text-sm font-mono font-bold text-[#2C2825]">
+                                    {stats.totalOutputTokens.toLocaleString()}
+                                  </div>
+                                </div>
+                              </div>
+                              {/* Per-model breakdown — Input / Output / Total for each model */}
+                              {stats.perModel.length > 0 ? (
+                                <div className="space-y-1.5">
+                                  <div className="flex items-center justify-between">
+                                    <div className="text-[9px] font-bold text-[#A09890] uppercase tracking-wide">Per model</div>
+                                    {/* inline column legend */}
+                                    <div className="flex items-center gap-2 text-[8px] font-bold text-[#A09890] uppercase tracking-wide">
+                                      <span className="flex items-center gap-0.5"><ArrowDownRight size={9} />In</span>
+                                      <span className="flex items-center gap-0.5"><ArrowUpRight size={9} />Out</span>
+                                      <span>Total</span>
+                                    </div>
+                                  </div>
+                                  {stats.perModel.map((s) => {
+                                    const pct = stats.totalTokens > 0 ? (s.tokens / stats.totalTokens) * 100 : 0;
+                                    return (
+                                      <div key={s.model} className="rounded-lg bg-white border border-[#E6DFD3] px-2.5 py-1.5">
+                                        {/* model name + response count + share bar */}
+                                        <div className="flex items-center justify-between mb-1.5">
+                                          <span className="text-[11px] font-mono text-[#2C2825] truncate max-w-[180px]">{s.model}</span>
+                                          <span className="text-[9px] text-[#A09890] font-mono shrink-0">{s.responses}× · {pct.toFixed(0)}%</span>
+                                        </div>
+                                        {/* Input / Output / Total row per model */}
+                                        <div className="grid grid-cols-3 gap-1.5 mb-1">
+                                          <div className="rounded-md bg-[#FAF8F5] border border-[#E6DFD3] px-1.5 py-1 text-center">
+                                            <div className="text-[8px] font-bold text-[#A09890] uppercase tracking-wide mb-0.5">Input</div>
+                                            <div className="text-[11px] font-mono font-bold text-[#2C2825]">{s.inputTokens.toLocaleString()}</div>
+                                          </div>
+                                          <div className="rounded-md bg-[#FAF8F5] border border-[#E6DFD3] px-1.5 py-1 text-center">
+                                            <div className="text-[8px] font-bold text-[#A09890] uppercase tracking-wide mb-0.5">Output</div>
+                                            <div className="text-[11px] font-mono font-bold text-[#2C2825]">{s.outputTokens.toLocaleString()}</div>
+                                          </div>
+                                          <div className="rounded-md bg-[#F5E6D3] border border-[#C58B51]/30 px-1.5 py-1 text-center">
+                                            <div className="text-[8px] font-bold text-[#C58B51] uppercase tracking-wide mb-0.5">Total</div>
+                                            <div className="text-[11px] font-mono font-bold text-[#C58B51]">{s.tokens.toLocaleString()}</div>
+                                          </div>
+                                        </div>
+                                        <div className="h-1 rounded-full bg-[#F5E6D3] overflow-hidden">
+                                          <div className="h-full bg-[#C58B51]" style={{ width: `${pct}%` }} />
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
+                                  {/* All-models total row */}
+                                  <div className="rounded-lg bg-[#F5E6D3] border border-[#C58B51]/30 px-2.5 py-1.5">
+                                    <div className="flex items-center justify-between mb-1">
+                                      <span className="text-[10px] font-bold text-[#C58B51] uppercase tracking-wide">All models</span>
+                                      <span className="text-[11px] font-mono font-bold text-[#C58B51]">{stats.totalTokens.toLocaleString()}</span>
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-1.5">
+                                      <div className="flex items-center gap-1 text-[9px] text-[#7C756E] font-mono">
+                                        <ArrowDownRight size={9} /> {stats.totalInputTokens.toLocaleString()}
+                                      </div>
+                                      <div className="flex items-center gap-1 text-[9px] text-[#7C756E] font-mono justify-end">
+                                        <ArrowUpRight size={9} /> {stats.totalOutputTokens.toLocaleString()}
+                                      </div>
+                                    </div>
+                                  </div>
+                                </div>
+                              ) : (
+                                <div className="text-[10px] text-[#A09890] text-center py-1">No responses yet</div>
+                              )}
+                              <div className="text-[9px] text-[#A09890] mt-2 leading-snug">
+                                Input = prompt tokens (system prompt + conversation). Output = completion tokens.
+                                Figures are provider-reported when available; otherwise estimated with a real BPE tokenizer.
+                              </div>
+                            </div>
+                          </div>
+
+                          {/* Files touched */}
+                          <div>
+                            <div className="flex items-center gap-1.5 mb-2">
+                              <FileCode size={13} className="text-[#C58B51]" />
+                              <span className="text-xs font-bold text-[#2C2825]">
+                                Files created / edited / added
+                              </span>
+                              <span className="text-[10px] text-[#A09890]">({stats.touchedFiles.length})</span>
+                            </div>
+                            {stats.touchedFiles.length > 0 ? (
+                              <div className="space-y-0.5 max-h-64 overflow-y-auto rounded-xl bg-[#FAF8F5] border border-[#E6DFD3] p-2">
+                                {stats.touchedFiles.map((p) => (
+                                  <div key={p} className="text-[11px] font-mono text-[#7C756E] truncate flex items-center gap-1.5 px-1 py-0.5">
+                                    <span className="text-[#C58B51]">•</span>
+                                    <span className="truncate">{p}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : (
+                              <div className="text-[11px] text-[#A09890] rounded-xl bg-[#FAF8F5] border border-[#E6DFD3] p-3 text-center">
+                                No files created or edited in this chat yet.
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    </>
+                  );
+                })()}
               </div>
             );
           })

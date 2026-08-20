@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   X,
   Key,
@@ -25,6 +25,7 @@ import {
   Code,
   ChevronDown,
   ChevronRight,
+  Flame,
 } from 'lucide-react';
 import { BYOKSettings, Skill, AIProfile, SubModelConfig } from '../types';
 import { MCPTab } from './MCPTab';
@@ -87,6 +88,22 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [editingProfileId, setEditingProfileId] = useState<string | null>(
     formData.activeProfileId || formData.aiProfiles?.[0]?.id || null
   );
+
+  // Re-sync the form from the latest persisted settings every time the modal
+  // is OPENED. This component stays mounted while closed, so without this the
+  // form keeps whatever `settings` was at app start — the synchronous
+  // defaults captured before the async DB load finished — showing ZERO
+  // profiles/keys even though they were saved, and wiping the user's real
+  // API keys if they hit "Save Settings" in that state.
+  useEffect(() => {
+    if (isOpen) {
+      setFormData({ ...settings });
+      setEditingProfileId(settings.activeProfileId || settings.aiProfiles?.[0]?.id || null);
+    }
+    // Only re-sync on open — not on every settings change while the user is
+    // editing (that would clobber in-progress edits).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen]);
 
   if (!isOpen) return null;
 
@@ -205,19 +222,29 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   };
 
   const handleSave = () => {
-    // Ensure active profile synchronization
-    const currentActive = profiles.find((p) => p.id === formData.activeProfileId) || profiles[0];
-    const finalSettings: BYOKSettings = {
-      ...formData,
-      baseUrl: currentActive?.baseUrl || '',
-      apiKey: currentActive?.apiKey || '',
-      defaultModel: currentActive?.model || '',
-      customHeaders: currentActive?.customHeaders || '',
-      systemPrompt: currentActive?.systemPrompt || formData.systemPrompt,
-    };
-    onSaveSettings(finalSettings);
-    onClose();
+  // Ensure active profile synchronization
+  const currentActive = profiles.find((p) => p.id === formData.activeProfileId) || profiles[0];
+  const finalSettings: BYOKSettings = {
+    ...formData,
+    baseUrl: currentActive?.baseUrl || '',
+    apiKey: currentActive?.apiKey || '',
+    defaultModel: currentActive?.model || '',
+    customHeaders: currentActive?.customHeaders || '',
+    systemPrompt: currentActive?.systemPrompt || formData.systemPrompt,
   };
+
+  // Persist immediately to IndexedDB so the app can safely close/restart
+  try {
+    StorageService.saveSettings(finalSettings);
+  } catch (e) {
+    // Fall back to updating state even if persistence fails
+    console.error('Failed to persist settings to DB', e);
+  }
+
+  // Update app state via parent callback and close modal
+  onSaveSettings(finalSettings);
+  onClose();
+};
 
   const testProfileConnection = async (id: string, baseUrl: string, apiKey: string, model: string, customHeaders?: string) => {
     const trimmedUrl = (baseUrl || '').trim();
@@ -1509,10 +1536,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 <div className="p-4 rounded-2xl bg-[#FAF8F5] border border-[#E6DFD3]">
                   <div className="flex items-center gap-2 mb-1">
                     <Globe size={16} className="text-[#C58B51]" />
-                    <h4 className="text-xs font-bold text-[#2C2825]">Built-In Web Grounding (Free & Universal)</h4>
+                    <h4 className="text-xs font-bold text-[#2C2825]">Web Grounding (Bring Your Own Search Key)</h4>
                   </div>
                   <p className="text-xs text-[#7C756E] leading-relaxed">
-                    Real-time web search scrapes authoritative snippets and knowledge via DuckDuckGo and Wikipedia, then injects ground-truth citations into the prompt context prior to answer generation.
+                    Pick ONE search provider and paste its API key — results are injected as ground-truth citations
+                    into the prompt before the answer is generated. All three providers offer generous free credits
+                    on a fresh account (enough to get through the month for typical use): Tavily, Serper (real
+                    Google results), and LangSearch.
                   </p>
                 </div>
 
@@ -1527,6 +1557,58 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     onChange={(e) => setFormData({ ...formData, webSearchEnabled: e.target.checked })}
                     className="w-4 h-4 accent-[#C58B51] cursor-pointer"
                   />
+                </div>
+
+                <div>
+                  <label className="text-xs font-bold text-[#2C2825] mb-1.5 block">Search Provider (one active at a time)</label>
+                  <select
+                    value={formData.webSearchProvider || 'tavily'}
+                    onChange={(e) => setFormData({ ...formData, webSearchProvider: e.target.value as 'tavily' | 'serper' | 'langsearch' })}
+                    className="w-full px-3 py-2 rounded-lg border border-[#E6DFD3] bg-white text-xs text-[#2C2825] focus:outline-none focus:ring-2 focus:ring-[#C58B51]/40"
+                  >
+                    <option value="tavily">Tavily (clean answers + ranked sources)</option>
+                    <option value="serper">Serper (real Google results — 2,500 free queries)</option>
+                    <option value="langsearch">LangSearch (free web-search API, no credit card)</option>
+                  </select>
+                  <p className="text-[10px] text-[#7C756E] mt-1">
+                    Only the selected provider is used. Add keys for any of them below and switch freely.
+                  </p>
+                </div>
+
+                <div>
+                  <label className="text-xs font-bold text-[#2C2825] mb-1.5 block">Tavily API Key</label>
+                  <input
+                    type="password"
+                    value={formData.webSearchApiKey || ''}
+                    onChange={(e) => setFormData({ ...formData, webSearchApiKey: e.target.value })}
+                    placeholder="tvly-..."
+                    className="w-full px-3 py-2 rounded-lg border border-[#E6DFD3] bg-white text-xs text-[#2C2825] focus:outline-none focus:ring-2 focus:ring-[#C58B51]/40"
+                  />
+                  <p className="text-[10px] text-[#7C756E] mt-1">Free key at tavily.com. Stored locally only.</p>
+                </div>
+
+                <div>
+                  <label className="text-xs font-bold text-[#2C2825] mb-1.5 block">Serper API Key</label>
+                  <input
+                    type="password"
+                    value={formData.serperApiKey || ''}
+                    onChange={(e) => setFormData({ ...formData, serperApiKey: e.target.value })}
+                    placeholder="Serper API key..."
+                    className="w-full px-3 py-2 rounded-lg border border-[#E6DFD3] bg-white text-xs text-[#2C2825] focus:outline-none focus:ring-2 focus:ring-[#C58B51]/40"
+                  />
+                  <p className="text-[10px] text-[#7C756E] mt-1">Free key at serper.dev (2,500 free queries). Stored locally only.</p>
+                </div>
+
+                <div>
+                  <label className="text-xs font-bold text-[#2C2825] mb-1.5 block">LangSearch API Key</label>
+                  <input
+                    type="password"
+                    value={formData.langsearchApiKey || ''}
+                    onChange={(e) => setFormData({ ...formData, langsearchApiKey: e.target.value })}
+                    placeholder="LangSearch API key..."
+                    className="w-full px-3 py-2 rounded-lg border border-[#E6DFD3] bg-white text-xs text-[#2C2825] focus:outline-none focus:ring-2 focus:ring-[#C58B51]/40"
+                  />
+                  <p className="text-[10px] text-[#7C756E] mt-1">Free key at langsearch.com (no credit card). Stored locally only.</p>
                 </div>
 
                 <div>
@@ -1613,6 +1695,37 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     {importStatus}
                   </div>
                 )}
+
+                {/* Live Flutter preview via real DartPad (gist-based embed) */}
+                <div className="p-4 rounded-2xl bg-[#FAF8F5] border border-[#E6DFD3]">
+                  <div className="flex items-center gap-2 mb-1">
+                    <Flame size={16} className="text-[#C58B51]" />
+                    <h4 className="text-xs font-bold text-[#2C2825]">Live Flutter Preview (DartPad)</h4>
+                  </div>
+                  <p className="text-xs text-[#7C756E] leading-relaxed mb-3">
+                    Google deprecated DartPad's free source-injection, so to render the AI's Flutter
+                    code in a real DartPad canvas we push it to an anonymous GitHub gist and embed
+                    the gist. Paste a GitHub token with the <code className="font-mono">gist</code> scope
+                    to enable live previews. Without it, a faithful structural widget-tree preview is used.
+                  </p>
+                  <div className="rounded-xl bg-white border border-[#E6DFD3] p-2.5 mb-3 text-[10px] text-[#7C756E] leading-relaxed">
+                    <span className="font-bold text-[#2C2825]">How to get a token:</span><br />
+                    1. Go to <span className="font-mono text-[#C58B51]">github.com → Settings → Developer settings → Personal access tokens</span><br />
+                    2. Pick <span className="font-bold">"Tokens (classic)"</span> → <span className="font-bold">Generate new token (classic)</span><br />
+                    3. Tick the <span className="font-mono text-[#C58B51]">gist</span> scope (everything else can stay unticked)<br />
+                    4. Generate, then copy the <span className="font-mono">ghp_…</span> token and paste it here. (Stored locally only — never sent anywhere except GitHub's gist API.)
+                  </div>
+                  <label className="block text-[10px] font-bold text-[#2C2825] mb-1">
+                    GitHub Gist Token (optional)
+                  </label>
+                  <input
+                    type="password"
+                    value={formData.gistToken || ''}
+                    onChange={(e) => setFormData({ ...formData, gistToken: e.target.value })}
+                    placeholder="github_pat… or ghp_… (needs gist scope)"
+                    className="w-full px-3 py-2 rounded-xl border border-[#E6DFD3] bg-white text-xs font-mono text-[#2C2825] focus:outline-none focus:border-[#C58B51]"
+                  />
+                </div>
               </div>
             )}
           </div>

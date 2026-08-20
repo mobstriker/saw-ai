@@ -26,6 +26,7 @@ interface RightPanelProps {
   isUniversalChat?: boolean;
   onSaveAsProject?: () => void;
   isSavingAsProject?: boolean;
+  gistToken?: string;
 }
 
 export const RightPanel: React.FC<RightPanelProps> = ({
@@ -50,6 +51,7 @@ export const RightPanel: React.FC<RightPanelProps> = ({
   isUniversalChat,
   onSaveAsProject,
   isSavingAsProject,
+  gistToken,
 }) => {
   const handleMouseDownResize = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -217,6 +219,7 @@ export const RightPanel: React.FC<RightPanelProps> = ({
             onClose={onCloseArtifact}
             onSelectArtifact={onSelectArtifact}
             onReportBug={onReportBug}
+            gistToken={gistToken}
           />
         )}
       </div>

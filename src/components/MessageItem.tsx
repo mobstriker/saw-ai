@@ -29,6 +29,7 @@ import { formatDuration } from '../utils/reasoning';
 import { MarkdownRenderer } from '../utils/markdownRenderer';
 import { PatchChunk } from '../utils/patchApplier';
 import { ReasoningPathViewer } from './ReasoningPathViewer';
+import { useMessageTokenCount } from '../utils/useMessageTokenCount';
 
 interface MessageItemProps {
   message: Message;
@@ -79,6 +80,10 @@ export const MessageItem: React.FC<MessageItemProps> = React.memo(({
   const [answers, setAnswers] = useState<string[]>(message.clarificationAnswers?.map(a => a.answer) || []);
   const [copied, setCopied] = useState(false);
   const isUser = message.role === 'user';
+
+  // Accurate token count for this response (BPE tokenizer). For assistant
+  // messages this is the per-response token spend shown at the end of the box.
+  const responseTokenCount = useMessageTokenCount(message);
 
   const isClarificationFinished = requests.length > 0 && answers.length >= requests.length;
   const currentRequest = requests[currentQuestionIndex];
@@ -433,12 +438,37 @@ export const MessageItem: React.FC<MessageItemProps> = React.memo(({
           </div>
         )}
 
-        {/* Connection Error Notification Card with Retry */}
+        {/* Connection Error Notification Card with Retry.
+            Shows the REAL provider error (HTTP status + message) so the user
+            can see the true cause (e.g. "400 model not found", "unknown
+            parameter reasoning_effort") instead of a generic line — which made
+            real 400s look like a confusing quota issue. The error text is
+            stored on message.content by the App's error classifier. */}
         {message.isError && !message.isStopped && onRetry && (
-          <div className="mt-3 p-3 rounded-xl bg-[#FAF8F5] border border-rose-200 flex items-center justify-between gap-3">
-            <span className="text-xs font-medium text-rose-800">
-              An error occurred during generation.
-            </span>
+          <div className="mt-3 p-3 rounded-xl bg-[#FAF8F5] border border-rose-200 flex items-start justify-between gap-3">
+            <div className="flex-1 min-w-0">
+              <div className="text-xs font-semibold text-rose-800 mb-1">
+                An error occurred during generation.
+              </div>
+              {(() => {
+                // Surface the real provider error text if present.
+                const raw = (message.content || '').trim();
+                if (!raw) return null;
+                // Strip the leading "⚠️ **...**" markdown header line if the
+                // content is one of the styled error banners; show the detail.
+                const lines = raw.split('\n').filter(Boolean);
+                const detail = lines
+                  .filter((l) => !/^>\s*\*?/.test(l) && !/^\s*\*\*/.test(l))
+                  .join(' ')
+                  .trim();
+                const shown = detail || raw;
+                return (
+                  <div className="text-[11px] font-mono text-rose-700/90 break-words max-h-24 overflow-auto">
+                    {shown.length > 400 ? shown.slice(0, 400) + '…' : shown}
+                  </div>
+                );
+              })()}
+            </div>
             <button
               type="button"
               onClick={() => onRetry(message.id)}
@@ -453,7 +483,9 @@ export const MessageItem: React.FC<MessageItemProps> = React.memo(({
         {/* Bottom hover / action tools */}
         <div className="mt-2 pt-2 border-t border-[#E6DFD3]/60 flex items-center justify-between text-[10px] text-[#A09890]">
           <div className="flex items-center gap-2">
-            <span>~{message.content.length} chars</span>
+            <span title="Accurate token count for this response (real BPE tokenizer)">
+              ~{responseTokenCount.toLocaleString()} tokens
+            </span>
             {message.modelUsed && (
               <>
                 <span>•</span>
@@ -554,6 +586,7 @@ export const MessageItem: React.FC<MessageItemProps> = React.memo(({
   if (pm.searchResults !== nm.searchResults) return false;
   if (pm.modelUsed !== nm.modelUsed) return false;
   if (pm.generationDurationMs !== nm.generationDurationMs) return false;
+  if (pm.tokensEstimate !== nm.tokensEstimate) return false;
   if (pm.restoredAt !== nm.restoredAt) return false;
   // Restore button visibility depends on whether a snapshot exists; re-render
   // when that presence flips (the snapshot is attached in a separate update

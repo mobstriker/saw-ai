@@ -1,8 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { Terminal, Play, Loader2, X, FolderDown, ShieldCheck, AlertTriangle, ChevronDown, ShieldAlert, Check } from 'lucide-react';
+import { Terminal, Play, Loader2, X, FolderDown, ShieldCheck, AlertTriangle, ChevronDown, ShieldAlert, Check, Plus } from 'lucide-react';
 import {
   parseSandboxCommand,
-  ALLOWED_SANDBOX_COMMANDS,
   type SandboxArtifact,
 } from '../utils/sandboxRunner';
 import { type SandboxLogLine, type SandboxStoreValue } from '../utils/sandboxStore';
@@ -14,32 +13,59 @@ interface SandboxPanelProps {
   onClose: () => void;
   /** Shared sandbox store (created at App level so runs survive panel close). */
   store: SandboxStoreValue;
+  /** The chat this sandbox panel belongs to (per-chat isolation). */
+  chatId: string;
+  /** Latest code artifact (e.g. a Python file the AI just produced) to seed
+   *  before running `python <file>.py` so the file actually exists. */
+  latestArtifactCode?: { filename: string; language: string; code: string } | null;
+  /** ALL code artifacts from this chat's history, so any file the AI created
+   *  can be run by name (e.g. `python foo.py`, `node bar.js`, multi-file
+   *  projects where foo.py imports bar.py). Deduped by path. */
+  allArtifactFiles?: { path: string; content: string; language: string }[];
 }
 
 type LogLine = SandboxLogLine;
 
 const QUICK_COMMANDS: { label: string; cmd: string; desc: string }[] = [
-  { label: 'npm install', cmd: 'npm install', desc: 'Install Node deps' },
+  { label: 'Run Python', cmd: 'python main.py', desc: 'Run the AI-generated Python file' },
+  { label: 'npm install', cmd: 'npm install', desc: 'Install Node deps (desktop)' },
   { label: 'Build (Vite)', cmd: 'npm run build', desc: 'Vite production build → dist/' },
-  { label: 'Tauri build (.exe/.msi)', cmd: 'npm run tauri build', desc: 'Desktop installer build' },
-  { label: 'Flutter APK', cmd: 'flutter build apk', desc: 'Android APK → build/app/outputs/' },
-  { label: 'cargo build', cmd: 'cargo build --release', desc: 'Rust release build → target/release' },
+  { label: 'Flutter APK', cmd: 'flutter build apk', desc: 'Android APK (desktop)' },
+  { label: 'cargo build', cmd: 'cargo build --release', desc: 'Rust release build (desktop)' },
 ];
 
-export function SandboxPanel({ project, onClose, store }: SandboxPanelProps) {
-  const [command, setCommand] = useState('npm run build');
+export function SandboxPanel({ project, onClose, store, chatId, latestArtifactCode, allArtifactFiles }: SandboxPanelProps) {
+  const [command, setCommand] = useState('python main.py');
   const [autoSeed, setAutoSeed] = useState(true);
   const [showQuick, setShowQuick] = useState(false);
   const quickRef = useRef<HTMLDivElement | null>(null);
   const logEndRef = useRef<HTMLDivElement | null>(null);
 
-  // The store is created at the App level (passed via props) so AI-driven runs
-  // survive closing this panel and the agent loop shares the same log.
-  const { available, running, logs, exitCode, artifacts, accessGranted, pendingApproval } = store;
+  // Ensure this chat has a sandbox session.
+  useEffect(() => {
+    store.ensureChat(chatId);
+  }, [chatId, store]);
+
+  const chatState = store.states[chatId];
+  const tabs = chatState?.tabs ?? [];
+  const activeTabId = chatState?.activeTabId ?? '';
+  const activeTab = tabs.find((t) => t.id === activeTabId) || tabs[0];
+  const logs = activeTab?.logs ?? [];
+  const running = activeTab?.running ?? false;
+  const exitCode = activeTab?.exitCode ?? null;
+  const artifacts = chatState?.artifacts ?? [];
+  const { available, pythonAvailable, accessGranted, pendingApproval } = store;
+
+  // Per-chat sandbox workdir. A project-bound chat uses the project's dir;
+  // a universal chat gets its OWN dir keyed by chat id (`chat-<id>`) — the old
+  // code used the sandbox ROOT for every universal chat, so files from
+  // different chats leaked into each other and commands ran in a shared,
+  // stale directory instead of a per-chat workdir.
+  const workdir = project ? `proj-${project.id}` : `chat-${chatId}`;
 
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [logs]);
+  }, [logs.length]);
 
   // Close the quick-commands dropdown on outside click.
   useEffect(() => {
@@ -51,23 +77,81 @@ export function SandboxPanel({ project, onClose, store }: SandboxPanelProps) {
     return () => document.removeEventListener('mousedown', handler);
   }, [showQuick]);
 
+  // Build the seed files for a run: the bound project's files + EVERY artifact
+  // the AI created in this chat (so `python foo.py`, `node bar.js`, and
+  // multi-file imports all resolve). Deduped by path (project files win).
+  const buildSeedFiles = useCallback((): { path: string; content: string }[] => {
+    const byPath = new Map<string, { path: string; content: string }>();
+    if (project && project.files.length > 0) {
+      for (const f of project.files) {
+        const p = f.path.startsWith('/') ? f.path.slice(1) : f.path;
+        byPath.set(p, { path: p, content: f.content });
+      }
+    }
+    if (allArtifactFiles && allArtifactFiles.length > 0) {
+      for (const a of allArtifactFiles) {
+        const p = a.path.startsWith('/') ? a.path.slice(1) : a.path;
+        if (!byPath.has(p)) byPath.set(p, { path: p, content: a.content });
+      }
+    }
+    // Fall back to the latest single artifact if the full list wasn't passed.
+    if (byPath.size === 0 && latestArtifactCode && latestArtifactCode.code) {
+      byPath.set(latestArtifactCode.filename || 'main.py', {
+        path: latestArtifactCode.filename || 'main.py',
+        content: latestArtifactCode.code,
+      });
+    }
+    return Array.from(byPath.values());
+  }, [project, allArtifactFiles, latestArtifactCode]);
+
   const handleRun = useCallback(async () => {
     if (running) return;
+    const trimmed = command.trim();
+    if (!trimmed) {
+      store.pushLog('error', 'Command is empty.');
+      return;
+    }
+
+    // Seed project + ALL chat artifacts into the Tauri workdir (desktop) so any
+    // file the AI created is runnable by name. For web (Pyodide) we pass them
+    // inline below.
+    const seedFiles = buildSeedFiles();
+    if (available && autoSeed && seedFiles.length > 0) {
+      try {
+        await store.seedFiles(workdir, seedFiles);
+      } catch (e) {
+        store.pushLog('error', `Seeding files failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+
+    // Parse into {command, args} for routing + the leading-token allowlist
+    // check. The store builds a quote-aware command line from these.
     let opts;
     try {
-      opts = parseSandboxCommand(command);
+      opts = parseSandboxCommand(trimmed);
     } catch (e) {
+      // The leading token isn't on the toolchain list. In the desktop build the
+      // backend is a real shell, so shell builtins (cd, ls, pipes, &&) are fine
+      // — surface a clear note and still try to run it as a raw command line so
+      // `cd src && ls` works instead of being rejected.
+      if (available) {
+        await store.runCommand(
+          { command: trimmed, args: [], workdir, rawCommandLine: true } as any,
+          'manual',
+          chatId,
+          undefined,
+        );
+        if (available) await store.refreshArtifacts(workdir);
+        return;
+      }
       store.pushLog('error', e instanceof Error ? e.message : String(e));
       return;
     }
 
-    const workdir = project ? `proj-${project.id}` : '';
-    if (autoSeed && project && project.files.length > 0) {
-      await store.seedProject(project);
-    }
-    await store.runCommand({ ...opts, workdir }, 'manual');
-    await store.refreshArtifacts(workdir);
-  }, [command, running, project, autoSeed, store]);
+    const pySeed = (opts.command === 'python' || opts.command === 'python3') ? seedFiles : undefined;
+    await store.runCommand({ ...opts, workdir }, 'manual', chatId, pySeed);
+    if (available) await store.refreshArtifacts(workdir);
+  }, [command, running, project, autoSeed, store, chatId, available, buildSeedFiles, workdir]);
 
   const downloadArtifact = useCallback((a: SandboxArtifact) => {
     // Use the Tauri FS plugin's readTextFile/binary read is overkill; instead
@@ -182,17 +266,63 @@ export function SandboxPanel({ project, onClose, store }: SandboxPanelProps) {
         </div>
       )}
 
-      {/* Unavailable notice */}
+      {/* Unavailable notice — only for non-Python commands in web builds.
+          Python (Pyodide) works everywhere, so the panel stays enabled. */}
       {!available && (
         <div className="px-4 py-3 bg-amber-900/30 border-b border-amber-700/40 text-amber-200 text-xs flex items-start gap-2">
           <AlertTriangle size={14} className="mt-0.5 shrink-0" />
           <span>
-            The sandbox only runs inside the installed <strong>SAW AI desktop app</strong> (Tauri). Run
-            <code className="mx-1 px-1 bg-black/30 rounded">npm run tauri dev</code> or use the built app to
-            execute commands here. Everything stays scoped to the app's sandbox folder — it cannot touch your PC.
+            <strong>Web build: only Python runs here</strong> (via in-browser Pyodide, free, no install). For the
+            full CLI — <strong>npm, node, dart, flutter, cargo, git, pipes, &&, dev servers</strong> — run
+            <code className="mx-1 px-1 bg-black/30 rounded">npm run tauri dev</code> or the built desktop app. The
+            desktop sandbox is a real jailed shell: it cannot touch your PC or file explorer.
           </span>
         </div>
       )}
+      {available && !pythonAvailable && (
+        <div className="px-4 py-2 bg-sky-900/20 border-b border-sky-700/30 text-sky-200 text-[11px] flex items-center gap-2">
+          <ShieldCheck size={12} className="shrink-0 text-emerald-400" />
+          <span>Desktop sandbox active — a real jailed shell. Python, npm, flutter, cargo, git, pipes, &&, and dev servers all run here, scoped to the app's folder (no access to your PC).</span>
+        </div>
+      )}
+
+      {/* CLI Pages (tabs) — create/delete multiple terminals per chat */}
+      <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[#333] bg-[#1d1d1d] overflow-x-auto">
+        {tabs.map((t) => {
+          const isActive = t.id === activeTabId;
+          return (
+            <div
+              key={t.id}
+              className={`group flex items-center gap-1 pl-2.5 pr-1 py-1 rounded-md text-[11px] font-mono cursor-pointer transition-colors ${
+                isActive ? 'bg-[#2a2a2a] text-[#e8e8e8] border border-[#3a3a3a]' : 'text-[#9a9a9a] hover:bg-[#262626]'
+              }`}
+              onClick={() => store.setActiveTab(chatId, t.id)}
+            >
+              <span className="flex items-center gap-1">
+                {t.running && <Loader2 size={10} className="animate-spin text-emerald-400" />}
+                {t.name}
+              </span>
+              {tabs.length > 1 && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); store.closeTab(chatId, t.id); }}
+                  className="ml-1 p-0.5 rounded hover:bg-[#444] text-[#9a9a9a] hover:text-white cursor-pointer"
+                  title="Close page"
+                >
+                  <X size={11} />
+                </button>
+              )}
+            </div>
+          );
+        })}
+        <button
+          onClick={() => store.addTab(chatId)}
+          className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-[#9a9a9a] hover:text-white hover:bg-[#262626] transition-colors cursor-pointer shrink-0"
+          title="New CLI page (terminal)"
+        >
+          <Plus size={12} />
+          <span>New Page</span>
+        </button>
+      </div>
 
       {/* Command bar */}
       <div className="px-4 py-3 border-b border-[#333] space-y-2.5">
@@ -201,17 +331,16 @@ export function SandboxPanel({ project, onClose, store }: SandboxPanelProps) {
             <input
               value={command}
               onChange={(e) => setCommand(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter' && !running && available) handleRun(); }}
-              disabled={!available}
-              placeholder="e.g. npm run tauri build"
+              onKeyDown={(e) => { if (e.key === 'Enter' && !running) handleRun(); }}
+              disabled={running}
+              placeholder="e.g. python main.py"
               className="w-full bg-[#111] border border-[#3a3a3a] rounded-lg px-3 py-2 text-sm font-mono text-emerald-300 placeholder-[#555] focus:outline-none focus:border-[#C58B51] disabled:opacity-50"
               spellCheck={false}
             />
             <button
               type="button"
               onClick={() => setShowQuick((v) => !v)}
-              disabled={!available}
-              className="absolute right-1 top-1/2 -translate-y-1/2 flex items-center gap-1 px-2 py-1 rounded-md text-[10px] text-[#9a9a9a] hover:bg-[#333] hover:text-white transition-all cursor-pointer disabled:opacity-40"
+              className="absolute right-1 top-1/2 -translate-y-1/2 flex items-center gap-1 px-2 py-1 rounded-md text-[10px] text-[#9a9a9a] hover:bg-[#333] hover:text-white transition-all cursor-pointer"
               title="Quick commands"
             >
               Quick
@@ -234,7 +363,7 @@ export function SandboxPanel({ project, onClose, store }: SandboxPanelProps) {
           </div>
           <button
             onClick={handleRun}
-            disabled={running || !available}
+            disabled={running}
             className="flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-[#C58B51] hover:bg-[#B0783F] text-white text-sm font-bold transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {running ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} className="fill-white" />}
@@ -249,20 +378,26 @@ export function SandboxPanel({ project, onClose, store }: SandboxPanelProps) {
               checked={autoSeed}
               onChange={(e) => setAutoSeed(e.target.checked)}
               className="w-3.5 h-3.5 accent-[#C58B51] cursor-pointer"
-              disabled={!project}
+              disabled={!project && !latestArtifactCode}
             />
-            Seed project files into sandbox before run
-            {!project && <span className="text-[#666]">(no project bound)</span>}
+            Seed project + latest AI code before run
+            {!project && !latestArtifactCode && <span className="text-[#666]">(nothing to seed)</span>}
           </label>
           {project && (
             <span className="text-[10px] text-[#666] font-mono truncate max-w-[50%]" title={project.name}>
               📦 {project.name} · {project.files.length} files
             </span>
           )}
+          {latestArtifactCode && !project && (
+            <span className="text-[10px] text-[#666] font-mono truncate max-w-[50%]" title={latestArtifactCode.filename}>
+              🐍 {latestArtifactCode.filename}
+            </span>
+          )}
         </div>
         <p className="text-[10px] text-[#666] leading-relaxed">
-          Allowed: {ALLOWED_SANDBOX_COMMANDS.join(', ')}. Runs in an app-scoped folder — no shell, no access
-          outside the sandbox. Caches (npm/cargo/pub) are redirected inside it.
+          {available
+            ? 'Real jailed shell — run python, npm, flutter, cargo, git, pipes, &&, cd, and dev servers. Everything is scoped to this app folder; your PC stays off-limits.'
+            : 'Web build: Python runs in-browser (Pyodide). The full CLI (npm/node/dart/flutter/cargo/git, pipes, &&, dev servers) runs in the desktop app — run "npm run tauri dev" or the built app.'}
         </p>
       </div>
 

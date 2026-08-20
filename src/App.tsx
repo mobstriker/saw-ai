@@ -71,6 +71,100 @@ function parseClarificationRequest(content: string): { requests: Array<{ questio
   return null;
 }
 
+/**
+ * A thrown error that carries the provider's HTTP status code. We only treat a
+ * response as a genuine quota/rate-limit error when there is a REAL 429 — never
+ * from a loose substring match on an arbitrary transport error message (which
+ * produced false "Your model provider reported a quota limit" banners on the
+ * desktop webview when the SSE socket closed abruptly after a normal response).
+ */
+class HttpProviderError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'HttpProviderError';
+    this.status = status;
+  }
+}
+function isHttpProviderError(e: any): e is HttpProviderError {
+  return e && typeof e.status === 'number';
+}
+
+/** Extract the human-readable error message from a provider error JSON body.
+ *  Providers nest the message in many shapes:
+ *    OpenAI:   { error: { message: "...", type, code } }
+ *    Anthropic:{ error: { type, message: "..." } }
+ *    Gemini:   { error: { code, message: "...", status } }
+ *    DeepSeek/Together/custom: { message: "..." } or { error: "..." }
+ *  Fall back to the raw body string, then to the HTTP status. This guarantees
+ *  the REAL cause (e.g. "model_not_found", "unknown parameter") is surfaced
+ *  in the error card instead of a generic "HTTP 400" that reads like a quota
+ *  issue. */
+function extractProviderErrorMessage(json: any, status: number, rawText?: string): string {
+  if (!json) return rawText?.trim() || `HTTP ${status}`;
+  if (typeof json === 'string') return json;
+  if (typeof json.message === 'string') return json.message;
+  if (typeof json.error === 'string') return json.error;
+  if (json.error && typeof json.error === 'object') {
+    if (typeof json.error.message === 'string') return json.error.message;
+    if (typeof json.error.type === 'string') return `${json.error.type}: ${json.error.message || ''}`.trim();
+  }
+  if (json.detail && typeof json.detail === 'string') return json.detail;
+  if (rawText && rawText.length < 500) return rawText.trim();
+  return `HTTP ${status}`;
+}
+
+/**
+ * Accumulate streamed OpenAI-style tool_call deltas into a map keyed by the
+ * tool_call index. The first delta for a given index carries `id` + `name`;
+ * later deltas carry `arguments` fragments that must be concatenated (the
+ * arguments JSON is streamed token-by-token across many deltas).
+ */
+function accumulateToolCalls(
+  buffers: Map<number, { id: string; name: string; arguments: string }>,
+  toolCalls: any[] | undefined,
+) {
+  if (!Array.isArray(toolCalls)) return;
+  for (const tc of toolCalls) {
+    const idx: number = typeof tc.index === 'number' ? tc.index : 0;
+    const existing = buffers.get(idx) || { id: '', name: '', arguments: '' };
+    if (tc.id) existing.id = tc.id;
+    if (tc.function?.name) existing.name = tc.function.name;
+    if (typeof tc.function?.arguments === 'string') {
+      existing.arguments += tc.function.arguments;
+    }
+    buffers.set(idx, existing);
+  }
+}
+
+/**
+ * Capture provider-reported token usage from a streamed SSE chunk. Providers
+ * emit usage on the final chunk in a few shapes; we recognize the common ones:
+ *  - OpenAI-compatible: `usage: { prompt_tokens, completion_tokens, total_tokens }`
+ *  - Anthropic (message_delta): `usage: { input_tokens, output_tokens }` (the
+ *    initial message_start also carries input_tokens)
+ *  - Google/Gemini: `usageMetadata: { promptTokenCount, candidatesTokenCount }`
+ * The caller passes the hoisted `usageInput`/`usageOutput` accumulators via the
+ * returned values, so the latest non-zero usage wins (providers send it once).
+ */
+function captureUsage(data: any): { input: number; output: number } | null {
+  // Mutates the module-level refs is not possible here; this is a pure reader
+  // used by the inline closure below. (Kept as a standalone fn for clarity.)
+  const u = data?.usage;
+  if (u && typeof u === 'object') {
+    const i = u.prompt_tokens ?? u.input_tokens ?? u.promptTokenCount ?? 0;
+    const o = u.completion_tokens ?? u.output_tokens ?? u.candidatesTokenCount ?? 0;
+    if (i || o) return { input: Number(i) || 0, output: Number(o) || 0 };
+  }
+  const um = data?.usageMetadata;
+  if (um && typeof um === 'object') {
+    const i = um.promptTokenCount ?? 0;
+    const o = um.candidatesTokenCount ?? um.outputTokenCount ?? 0;
+    if (i || o) return { input: Number(i) || 0, output: Number(o) || 0 };
+  }
+  return null;
+}
+
 import { ArtifactParser } from './utils/artifactParser';
 import { PatchApplier, PatchChunk } from './utils/patchApplier';
 import { WorkspaceAutopilot } from './utils/workspaceAutopilot';
@@ -80,7 +174,9 @@ import { ALLOWED_SANDBOX_COMMANDS } from './utils/sandboxRunner';
 import { IntentDetector } from './utils/intentDetector';
 import { ModelRouter } from './utils/modelRouter';
 import { ChatTitler } from './utils/chatTitler';
+import { countTokens } from './utils/tokenCounter';
 import { parseThinkingFromStream } from './utils/reasoning';
+import { probeMcpServer, callMcpTool, parseToolCallsFromText } from './utils/mcpExecutor';
 import { Sidebar } from './components/Sidebar';
 import { ChatWindow } from './components/ChatWindow';
 import { RightPanel } from './components/RightPanel';
@@ -187,6 +283,45 @@ export default function App() {
     };
   }, []);
 
+  // Desktop (Tauri): pagehide/beforeunload do NOT reliably fire when the
+  // window is closed — the webview process is destroyed immediately, taking
+  // any pending debounced write (and even a just-issued settings put) with
+  // it. That is why saved API keys / new chats vanished and deletions
+  // reverted after closing the desktop app. Intercept the close request,
+  // await the pending writes, then destroy the window.
+  useEffect(() => {
+  if (typeof window === 'undefined' || !(window as any).__TAURI_INTERNALS__) return;
+  let unlisten: (() => void) | undefined;
+  let disposed = false;
+  
+  (async () => {
+    try {
+      // Resolve the Tauri window handle lazily so the web build (no Tauri
+      // internals) never touches the API. `win` was previously used without
+      // being defined — the actual fix for the typecheck/runtime failure.
+      const { getCurrentWindow } = await import('@tauri-apps/api/window');
+      const win = getCurrentWindow();
+      const un = await win.onCloseRequested(async (event) => {
+        event.preventDefault();
+        try {
+          StorageService.flushPending();
+        } finally {
+          await win.destroy();
+        }
+      });
+      if (disposed) un();
+      else unlisten = un;
+    } catch {
+      // Window API unavailable — nothing to do.
+    }
+  })();
+  
+  return () => {
+    disposed = true;
+    unlisten?.();
+  };
+}, []);
+
   // 2. Selection & Panel Layout State
   const [isLeftSidebarOpen, setIsLeftSidebarOpen] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState<number>(270);
@@ -202,6 +337,11 @@ export default function App() {
   const [rightPanelTab, setRightPanelTab] = useState<RightPanelTab>('files');
   const [currentArtifact, setCurrentArtifact] = useState<Artifact | null>(null);
   const [allArtifacts, setAllArtifacts] = useState<Artifact[]>([]);
+  // Tracks the chat id whose artifacts we last derived, so switching chats
+  // resets the artifact panel instead of letting the previous chat's artifact
+  // bleed into the new one. Without this, setCurrentArtifact's "only set when
+  // null" guard kept the old artifact visible after a chat switch.
+  const lastArtifactChatIdRef = useRef<string | null>(null);
 
   // 3b. Shared sandbox store (App-level so AI-driven runs survive closing the
   // SandboxPanel). Passed to the panel and used by the sandbox agent loop.
@@ -210,6 +350,10 @@ export default function App() {
   // runaway loops. Reset whenever the user sends a fresh message.
   const sandboxFollowupRef = useRef(0);
   const SANDBOX_MAX_FOLLOWUPS = 6;
+  const MCP_MAX_TOOL_ROUNDS = 6;
+  // Bounds AI→MCP tool→AI follow-up rounds per manual user prompt (tool-calling
+  // loop). Reset whenever the user sends a fresh message.
+  const mcpFollowupRef = useRef(0);
 
   // 4. Modals
   const [selectedFileForModal, setSelectedFileForModal] = useState<ProjectFile | null>(null);
@@ -433,9 +577,32 @@ export default function App() {
     }
   };
 
-  // Extract all artifacts from the active chat messages
+  // Extract all artifacts from the active chat messages.
+  //
+  // CRITICAL: when the active chat changes we must RESET currentArtifact and
+  // allArtifacts BEFORE re-deriving. The old guard `!currentArtifact` skipped
+  // the update when an artifact from the *previous* chat was still selected,
+  // so switching to a chat with no (or different) artifacts left the stale
+  // artifact pinned in the right panel. Now we detect the chat switch via a
+  // ref and clear first — for a universal chat with no artifacts this leaves
+  // the panel in the "No Active Artifact" state; for project chats the
+  // re-derived artifacts still show (projects keep their own codebase).
   useEffect(() => {
-    if (!activeChat) return;
+    if (!activeChat) {
+      setAllArtifacts([]);
+      setCurrentArtifact(null);
+      lastArtifactChatIdRef.current = null;
+      return;
+    }
+
+    const switchedChats = lastArtifactChatIdRef.current !== activeChat.id;
+    if (switchedChats) {
+      // Reset the panel for the newly-selected chat before deriving.
+      setAllArtifacts([]);
+      setCurrentArtifact(null);
+      lastArtifactChatIdRef.current = activeChat.id;
+    }
+
     const extracted: Artifact[] = [];
     for (const msg of activeChat.messages) {
       if (msg.role === 'assistant') {
@@ -444,10 +611,45 @@ export default function App() {
       }
     }
     setAllArtifacts(extracted);
-    if (extracted.length > 0 && !currentArtifact) {
-      setCurrentArtifact(extracted[extracted.length - 1]);
+
+    if (switchedChats) {
+      // On a fresh chat selection, auto-select the latest artifact if any
+      // (otherwise leave null → "No Active Artifact" placeholder shows).
+      setCurrentArtifact(extracted.length > 0 ? extracted[extracted.length - 1] : null);
+    } else if (extracted.length > 0) {
+      // Same chat, new artifacts arrived: select the latest only if nothing is
+      // currently selected (preserves the user's manual selection otherwise).
+      setCurrentArtifact((prev) => prev ?? extracted[extracted.length - 1]);
     }
   }, [activeChatId, activeChat?.messages.length]);
+
+  // On load, automatically probe every enabled MCP server so their real status
+  // (online/offline) + discovered tools are known before the first chat. Without
+  // this, servers show as "unknown"/"untested" and their tools are never sent to
+  // the model (the runtime filter requires status === 'online'), so MCP would
+  // silently do nothing even when servers are configured.
+  useEffect(() => {
+    if (!isDataLoaded) return;
+    const enabled = (settings.mcpServers || []).filter((s) => s.enabled);
+    if (enabled.length === 0) return;
+    let cancelled = false;
+    (async () => {
+      const probed = await Promise.all(enabled.map((s) => probeMcpServer(s)));
+      if (cancelled) return;
+      setSettings((prev) => {
+        const map = new Map(probed.map((s) => [s.id, s]));
+        const next = (prev.mcpServers || []).map((s) => map.get(s.id) || s);
+        return { ...prev, mcpServers: next };
+      });
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // Only re-probe when the set of enabled servers changes (by id), not on
+    // every settings mutation (which would re-probe after each probe writes
+    // status back and loop). isDataLoaded gates the first run.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isDataLoaded, (settings.mcpServers || []).filter((s) => s.enabled).map((s) => s.id).join(',')]);
 
   // In a universal (no-project) chat the Files tab has no project to show, so
   // it is hidden in the RightPanel header. Make sure the active tab lands on
@@ -856,15 +1058,22 @@ export default function App() {
       return stillThere ? prev : (keptArtifacts[keptArtifacts.length - 1] ?? null);
     });
 
-    // Mark the message as restored so the UI shows a "Restored" badge.
+    // Mark the message as restored so the UI shows a "Restored" badge, AND
+    // truncate the conversation to the restored message. Restore is a true
+    // "go back to this point": files, artifacts, AND the conversation itself
+    // all reflect the state at the restored turn — later turns (and the
+    // edits/files they produced) are removed. The project files + artifacts
+    // were already rolled back above; this drops the now-orphaned messages.
     setChats((prevChats) =>
       prevChats.map((c) => {
         if (c.id !== activeChat.id) return c;
         return {
           ...c,
-          messages: c.messages.map((m) =>
-            m.id === messageId ? { ...m, restoredAt: Date.now() } : m
-          ),
+          messages: c.messages
+            .slice(0, restoreIndex + 1)
+            .map((m) =>
+              m.id === messageId ? { ...m, restoredAt: Date.now() } : m
+            ),
           updatedAt: Date.now(),
         };
       })
@@ -987,9 +1196,15 @@ export default function App() {
     let rawAccumulatedStream = '';
     let rawAccumulatedThinking = (targetMsg.thinkingContent || '').trim();
     let accumulatedNewText = '';
+    // finish_reason captured from the continuation stream (same rationale as
+    // handleSendMessage): only a "length" truncation is a real cutoff.
+    let streamFinishReason: string | null = null;
 
     try {
       let fullSystemPrompt = settings.systemPrompt || '';
+      // Same output-discipline guardrail as the main send path (see handleSendMessage).
+      fullSystemPrompt += `\n\n# Output Discipline (IMPORTANT)
+Only produce code, code files, or artifacts when the user's current message explicitly asks you to write, create, build, generate, refactor, or fix code (or a component/app/script/site). For general questions — including factual questions, weather, news, explanations, advice, or anything that does not require code to answer — respond in plain prose with NO code blocks and NO artifacts. Never create code just because code exists elsewhere in the conversation or project. If a previous turn involved code but the current question is unrelated, ignore the code and answer the question directly.`;
       // Project context is injected ONLY for chats bound to a project.
       // Universal chats (no projectId) must not see any project files.
       const chatProject = targetChat.projectId
@@ -1012,7 +1227,14 @@ export default function App() {
         console.warn('Failed to parse custom headers JSON', e);
       }
 
-      const activeMcps = (settings.mcpServers || []).filter((s) => s.status === 'connected');
+      // A server contributes tools only when the user has enabled it in the
+      // chat AND it is actually reachable (status 'online'). The previous
+      // filter used `status === 'connected'` — a value that never exists in
+      // the MCPServer type (status is 'online'|'offline'|'checking'|'unknown'),
+      // so this always returned zero tools ("no tools available" bug).
+      const activeMcps = (settings.mcpServers || []).filter(
+        (s) => s.enabled && s.status === 'online',
+      );
 
       const response = await performChatRequest({
         method: 'POST',
@@ -1033,8 +1255,13 @@ export default function App() {
       });
 
       if (!response.ok) {
-        const errJson = await response.json().catch(() => ({}));
-        throw new Error(errJson.message || errJson.error || `HTTP ${response.status}`);
+        const errRawText = await response.text().catch(() => '');
+        let errJson: any = {};
+        try { errJson = JSON.parse(errRawText); } catch { errJson = {}; }
+        throw new HttpProviderError(
+          extractProviderErrorMessage(errJson, response.status, errRawText),
+          response.status,
+        );
       }
 
       const reader = response.body?.getReader();
@@ -1073,6 +1300,8 @@ export default function App() {
                 data.choices?.[0]?.delta?.reasoning ||
                 data.choices?.[0]?.delta?.thinking ||
                 '';
+              const fr = data.choices?.[0]?.finish_reason;
+              if (fr) streamFinishReason = fr;
             } catch {}
           } else if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
             try {
@@ -1089,6 +1318,8 @@ export default function App() {
                 data.choices?.[0]?.delta?.reasoning ||
                 data.choices?.[0]?.delta?.thinking ||
                 '';
+              const fr = data.choices?.[0]?.finish_reason;
+              if (fr) streamFinishReason = fr;
             } catch {}
           }
 
@@ -1164,6 +1395,8 @@ export default function App() {
               data.choices?.[0]?.delta?.reasoning ||
               data.choices?.[0]?.delta?.thinking ||
               '';
+            const fr = data.choices?.[0]?.finish_reason;
+            if (fr) streamFinishReason = fr;
             if (delta) {
               accumulatedNewText += delta;
               rawAccumulatedStream += delta;
@@ -1178,6 +1411,11 @@ export default function App() {
       // Commit complete: clear the live-stream overlay so the message now
       // renders from the committed chats state (single source of truth).
       clearLiveStream();
+
+      // A continuation is only genuinely cut off if THIS continuation also hit
+      // the token limit (finish_reason "length"). A clean stop means the
+      // continued response is complete — do not flag it isStopped.
+      const continuationTruncated = streamFinishReason === 'length';
 
       // Final save on completion
       const parsedStream = parseThinkingFromStream(rawAccumulatedStream);
@@ -1235,7 +1473,7 @@ export default function App() {
                     content: fullCombinedFinal || previousAssistantContent,
                     thinkingContent: combinedThinking || m.thinkingContent,
                     isThinking: false,
-                    isStopped: false,
+                    isStopped: continuationTruncated,
                     isError: false,
                     artifacts: newArtifacts.length > 0 ? newArtifacts : m.artifacts,
                     artifactsState:
@@ -1277,6 +1515,10 @@ export default function App() {
       ).trim();
 
       const hasContent = Boolean(fullCombinedSoFar || previousAssistantContent);
+      // Same rule as the main send path: content already streamed + a mere
+      // transport/socket error means the model WORKED — finalize as success.
+      // Only a real provider HTTP error (HttpProviderError) is a true failure.
+      const isRealHttpError = isHttpProviderError(err);
 
       let updatedTargetChat: ChatSession | null = null;
       setChats((prevChats) => {
@@ -1296,8 +1538,8 @@ export default function App() {
                         : `Generation error: ${err.message || 'Stream interrupted'}`),
                     thinkingContent: combinedThinking || m.thinkingContent,
                     isThinking: false,
-                    isStopped: hasContent,
-                    isError: !hasContent,
+                    isStopped: isAbort,
+                    isError: isRealHttpError || !hasContent,
                   }
                 : m
             ),
@@ -1372,14 +1614,16 @@ export default function App() {
     useWebSearch: boolean,
     priorMessagesOverride?: Message[],
     forcedChatId?: string,
-    isSandboxFollowup = false
+    isSandboxFollowup = false,
+    isMcpToolFollowup = false
   ) => {
     if (!userPrompt.trim() || isGenerating) return;
 
     // A fresh manual user message starts a new agent turn — reset the
     // sandbox follow-up round counter. Follow-up re-prompts keep it counting.
-    if (!isSandboxFollowup) {
+    if (!isSandboxFollowup && !isMcpToolFollowup) {
       sandboxFollowupRef.current = 0;
+      mcpFollowupRef.current = 0;
     }
 
     let targetChat = forcedChatId ? chats.find(c => c.id === forcedChatId) || activeChat : activeChat;
@@ -1413,8 +1657,19 @@ export default function App() {
       ? priorMessagesOverride
       : (targetChat ? targetChat.messages : []);
 
-    // Check if web search is genuinely needed for this query (incorporating chat history for follow-ups)
-    const willSearchWeb = IntentDetector.shouldSearchWeb(userPrompt, useWebSearch, baseHistory);
+    // Check if web search is genuinely needed for this query (incorporating chat history for follow-ups).
+    //
+    // IMPORTANT (fixes "connected but not truly connected"): when the user has
+    // EXPLICITLY enabled web search (the chat-bar toggle or the default-on
+    // setting → useWebSearch === true), we ALWAYS run a search. The intent
+    // detector is only used to REFINE the query (resolve pronouns/context) — it
+    // must never suppress a search the user explicitly turned on. Previously,
+    // the detector returned false for queries that didn't match its keyword/
+    // pattern rules, so an enabled search silently did nothing and the AI never
+    // received web context. Now: enabled ⇒ search (the detector's role is only
+    // to shape the query, gated below). The detector can still ADD a search for
+    // real-time/factual queries when the toggle is off.
+    const willSearchWeb = useWebSearch || IntentDetector.shouldSearchWeb(userPrompt, useWebSearch, baseHistory);
 
     // Contextually resolve the exact search query (e.g. resolving pronouns, locations from prior turns)
     const resolvedSearchQuery = willSearchWeb
@@ -1524,17 +1779,40 @@ export default function App() {
     let rawAccumulatedStream = '';
     let rawAccumulatedThinking = '';
     let webSearchResults: SearchResult[] = [];
+    // Tracks the provider's finish_reason from the final SSE chunk so we can
+    // distinguish a genuine truncation ("length" = hit max_tokens) from a clean
+    // completion ("stop"). Only "length" (or an AbortError) should mark the
+    // message isStopped — a clean "stop" must NOT show the false "cut off"
+    // continue/retry banner.
+    let streamFinishReason: string | null = null;
+    // Provider-reported token usage, captured from the final SSE chunk when the
+    // endpoint emits one (OpenAI-compatible `usage` or Anthropic's
+    // `message_delta.usage`). When present this is the EXACT token spend; we fall
+    // back to a BPE estimate otherwise.
+    let usageInput = 0;
+    let usageOutput = 0;
 
     // Hoisted for the post-completion sandbox agent follow-up (which runs after
     // the try/catch/finally). Filled in inside the try once known.
     let completedAssistantText = '';
     let completedChatId = chatTargetId;
     let completedAutoMode: AutomationMode = 'automatic';
+    // Hoisted for the post-completion MCP tool-execution follow-up: native
+    // tool_calls captured from the stream + text-parsed mcp_tool_call blocks.
+    let completedNativeToolCalls: Array<{ id: string; name: string; arguments: string }> = [];
 
     try {
-      // 2. Perform Web Search ONLY if IntentDetector verified it is genuinely required
+      // 2. Perform Web Search when enabled or when the intent detector flagged
+      // a real-time/factual query. (See willSearchWeb above: an explicitly enabled
+      // toggle always searches, so the AI genuinely receives web context.)
       if (willSearchWeb) {
         setAiStatus('searching_web');
+        // The search runs BEFORE the chat and shares the chat's AbortController,
+        // so cap it with its own short timeout — a slow/hung search-provider
+        // request must never block the AI response. If it times out the chat
+        // simply proceeds without web context (graceful degradation).
+        const searchTimeout = new AbortController();
+        const searchTimer = setTimeout(() => searchTimeout.abort(), 7000);
         try {
           const searchRes = await performSearchRequest({
             method: 'POST',
@@ -1542,8 +1820,16 @@ export default function App() {
             body: JSON.stringify({
               query: resolvedSearchQuery || userPrompt,
               maxResults: settings.webSearchMaxResults || 5,
+              provider: settings.webSearchProvider || 'tavily',
+              // Exactly ONE provider is active at a time; resolve its key.
+              apiKey:
+                settings.webSearchProvider === 'serper'
+                  ? settings.serperApiKey || ''
+                  : settings.webSearchProvider === 'langsearch'
+                  ? settings.langsearchApiKey || ''
+                  : settings.webSearchApiKey || '',
             }),
-            signal: controller.signal,
+            signal: searchTimeout.signal,
           });
           if (searchRes.ok) {
             const sData = await searchRes.json();
@@ -1552,8 +1838,32 @@ export default function App() {
             }
           }
         } catch (sErr) {
+          // Includes the timeout abort + a user-initiated stop — never fatal.
           console.warn('Web search fetch error:', sErr);
+        } finally {
+          clearTimeout(searchTimer);
         }
+      }
+
+      // Attach the grounded search results to the USER message so the
+      // "Web Search Grounding (N sources)" pill renders and the user can see
+      // the search actually communicated (fixes "connected but not truly
+      // connected" — now there's a visible indicator + the AI receives the
+      // injected context).
+      if (webSearchResults.length > 0) {
+        const umId = userMessage.id;
+        setChats((prev) =>
+          prev.map((c) =>
+            c.id === chatTargetId
+              ? {
+                  ...c,
+                  messages: c.messages.map((m) =>
+                    m.id === umId ? { ...m, searchResults: webSearchResults } : m
+                  ),
+                }
+              : c
+          )
+        );
       }
 
       // If reasoning mode is active, set status to thinking
@@ -1571,6 +1881,37 @@ export default function App() {
 
       // 3. Prepare Pure Context Injection from Project Files, Skills, and Active MCP Servers
       let fullSystemPrompt = settings.systemPrompt || '';
+
+      // Core behavioral guardrail: the AI must NOT produce code files / artifacts
+      // unless the user's prompt explicitly asks for them. This stops the model
+      // from spawning a Python/TSX file in response to an unrelated question
+      // (e.g. "what's the weather?" creating an unwanted script). Answer the
+      // question directly; only write code when the user requests code, a build,
+      // a component, an app, a script, a refactor, a fix, etc.
+      fullSystemPrompt += `\n\n# Output Discipline (IMPORTANT)
+Only produce code, code files, or artifacts when the user's current message explicitly asks you to write, create, build, generate, refactor, or fix code (or a component/app/script/site). For general questions — including factual questions, weather, news, explanations, advice, or anything that does not require code to answer — respond in plain prose with NO code blocks and NO artifacts. Never create code just because code exists elsewhere in the conversation or project. If a previous turn involved code but the current question is unrelated, ignore the code and answer the question directly. When web search results are provided, use them to answer concisely and cite sources; do not generate files from them.`;
+
+      // Artifact naming rules: the app saves every code block as a file named
+      // from its first-line filename comment. Without these rules the model
+      // (a) reuses the same filename for a "new" file (silently overwriting
+      // the previous artifact in the workspace), and (b) references a made-up
+      // name in its prose/run instructions ("run python calculator.py") that
+      // doesn't match the real saved artifact ("python_run.py").
+      const existingArtifactNames: string[] = [];
+      for (const m of targetChat.messages) {
+        if (m.role !== 'assistant' || !m.content) continue;
+        for (const a of ArtifactParser.extractArtifacts(m.content)) {
+          if (a.title && !existingArtifactNames.includes(a.title)) {
+            existingArtifactNames.push(a.title);
+          }
+        }
+      }
+      fullSystemPrompt += `\n\n# Code Artifact Naming (IMPORTANT)
+When you produce a code file/artifact:
+1. Begin EVERY code block with a filename comment on the FIRST line naming the exact file you intend to create (e.g. \`// calculator.py\`, \`// login-form.tsx\`, \`// lib/main.dart\`). The app saves the artifact under EXACTLY that name.
+2. When the user asks for a NEW file, choose a fresh, unique, descriptive filename — NEVER reuse the name of an existing artifact unless the user explicitly asked you to modify that same file. Files already created in this chat: ${existingArtifactNames.length > 0 ? existingArtifactNames.join(', ') : '(none yet)'}.
+3. In your prose, always refer to the file by its EXACT filename — including in run instructions (only write \`python calculator.py\` if the file is actually named calculator.py).
+4. After delivering a file, add a short one-line description of what it does and how to run or use it.`;
 
       // Add active Agent Skills context
       const skillsContext = ContextInjector.buildSkillsPromptContext(
@@ -1607,16 +1948,33 @@ export default function App() {
         fullSystemPrompt += `\n\n# Workspace Projects Catalog:\n${projectsCatalog}\n`;
       }
 
-      // Add active MCP capabilities to system context
-      const activeMcps = (settings.mcpServers || []).filter((s) => s.enabled);
+      // Add active MCP capabilities to system context. Mirror the runtime
+      // filter: enabled AND online, otherwise the prompt advertises tools the
+      // request body won't actually send.
+      const activeMcps = (settings.mcpServers || []).filter(
+        (s) => s.enabled && s.status === 'online',
+      );
+      // Namespaced tool list for the request body + a server-lookup map. Each
+      // tool is sent as "<serverName>/<toolName>" so a returned tool_call can be
+      // routed back to the originating MCP server.
+      const mcpNamespacedTools = activeMcps.flatMap((s) =>
+        (s.tools || [])
+          .filter((t) => t.enabled)
+          .map((t) => ({ ...t, _namespaced: `${s.name}/${t.name}`, _serverName: s.name, _serverUrl: s.url })),
+      );
+      // serverName -> server (for executing tool calls after the model returns).
+      const mcpServerByName = new Map(activeMcps.map((s) => [s.name, s]));
+
       if (activeMcps.length > 0) {
         const mcpDescriptions = activeMcps.map((s) => {
           const enabledTools = (s.tools || []).filter((t) => t.enabled);
-          const toolList = enabledTools.map((t) => `  - ${t.name}: ${t.description}`).join('\n');
-          return `[MCP Server: ${s.name} (${s.type})]\n${toolList}`;
+          const toolList = enabledTools.length > 0
+            ? enabledTools.map((t) => `  - ${s.name}/${t.name}: ${t.description}`).join('\n')
+            : '  (server reachable but no tools discovered)';
+          return `[MCP Server: ${s.name} (${s.type}) — ${s.url}]\n${toolList}`;
         }).join('\n\n');
 
-        fullSystemPrompt += `\n\n# Active Model Context Protocol (MCP) Tools:\nThe following MCP tools are active for this workspace and can be invoked or referenced to inspect data, execute analytical queries, or read files:\n${mcpDescriptions}\n\nWhen tool execution is requested, format tool usage clearly so the client and MCP execution layer can run it seamlessly.`;
+        fullSystemPrompt += `\n\n# Active Model Context Protocol (MCP) Tools:\nThe following MCP servers are connected and their tools are available for this chat. You may invoke or reference them to inspect data, run analytical queries, or read external resources:\n${mcpDescriptions}\n\n## How to call MCP tools\nIf your runtime supports native tool/function calling, call a tool by its full namespaced id (e.g. \`${activeMcps[0]?.name}/${(activeMcps[0]?.tools?.find((t) => t.enabled)?.name) || 'toolName'}\`). If it does NOT support native function calling, emit a fenced block:\n\n\`\`\`mcp_tool_call\n{ "tool": "<serverName>/<toolName>", "arguments": { ... } }\n\`\`\`\n\nYou may make multiple tool calls. The MCP execution layer runs each call against the named server and returns the result text to you automatically so you can read it and continue. Only call tools that are relevant to the user's request.`;
       }
 
       // In Autonomous Multi-Step Planning mode, instruct AI on interactive checklists for complex tasks
@@ -1633,9 +1991,9 @@ When handling complex multi-step tasks:
 
       // Sandbox access: when the user has granted the AI sandbox command
       // execution and the automation mode permits it, tell the AI how to run
-      // commands. Each allowlisted command it emits in a bash/sh (or
-      // <sandbox_run>) block is executed in the restricted sandbox and the
-      // output is fed back automatically so it can read results and iterate.
+      // commands. Commands emitted in a bash/sh (or <sandbox_run>) block run in
+      // the restricted jailed shell and the output is fed back automatically so
+      // it can read results and iterate.
       if (sandboxStore.available && sandboxStore.accessGranted && effectiveAutoMode !== 'review') {
         const allowList = ALLOWED_SANDBOX_COMMANDS.join(', ');
         const approvalNote =
@@ -1643,7 +2001,21 @@ When handling complex multi-step tasks:
             ? 'Each command you emit will be shown to the user for approval before it runs.'
             : 'Each command you emit runs automatically (the user chose Auto Planner).';
         fullSystemPrompt += `\n\n# Sandbox Command Execution (granted by user)
-You have been granted access to run commands in the user's restricted in-app sandbox. When the task calls for building, installing, or running code, emit the command(s) in a fenced bash/sh code block (or <sandbox_run>...</sandbox_run>). ${approvalNote} Only the leading command per line is honored and it must be one of the allowlisted tools: ${allowList}. Each command runs in the project's sandbox workdir (its files are seeded first). The stdout/stderr and exit code are returned to you automatically — read them and continue. Do NOT emit commands you don't intend to run (e.g. as illustrative examples); if you only want to show a command without running it, use a plain (non-shell) code block or say so explicitly.`;
+You have been granted access to run commands in the user's restricted in-app sandbox — a real jailed shell (NOT just an allowlist). When the task calls for building, installing, or running code, emit the command(s) in a fenced bash/sh code block (or <sandbox_run>...</sandbox_run>). ${approvalNote} The sandbox runs a real shell, so you may use cd, &&, pipes, redirects, and quoted arguments; the available toolchain includes: ${allowList}. Each command runs in the project's sandbox workdir, whose files (including the code you produced this turn) are seeded first — so \`python <file>.py\`, \`npm run dev\`, \`flutter build apk\`, etc. work by name. The stdout/stderr and exit code are returned to you automatically — read them and continue. The sandbox is jailed: it cannot read or write outside the app's sandbox folder, so do not try to access the host filesystem. Do NOT emit commands you don't intend to run (e.g. as illustrative examples); if you only want to show a command without running it, use a plain (non-shell) code block or say so explicitly.
+
+## CRITICAL — Naming files you create (filename consistency)
+Every code artifact you produce in this chat becomes a REAL file in the sandbox workdir, named from the FIRST line of the code block. You MUST begin EVERY code block with an explicit filename comment naming the file you intend to create, in the form:
+  // path/to/file.ext   (or for non-C-like langs: # file.ext, <!-- file.html -->)
+Examples:
+  \`\`\`python
+  // calculator.py
+  def main(): ...
+  \`\`\`
+  \`\`\`tsx
+  // src/components/Counter.tsx
+  export default function Counter() { ... }
+  \`\`\`
+Then reference that EXACT name when you emit a run command (\`python calculator.py\`, not a guessed name). The sandbox seeds files under these names, so the name in the comment and the name in your run command MUST match — otherwise the run fails with "file not found". Never let the app auto-derive a placeholder name; always state the filename yourself. When editing an existing file, reuse its existing path/name as the comment.`;
       }
 
       let parsedHeaders = {};
@@ -1668,7 +2040,7 @@ You have been granted access to run commands in the user's restricted in-app san
           system_prompt: fullSystemPrompt,
           web_search_context: webSearchResults,
           custom_headers: parsedHeaders,
-          mcp_tools: activeMcps.flatMap(s => (s.tools || []).filter(t => t.enabled)),
+          mcp_tools: mcpNamespacedTools,
           reasoning_effort: reasoningMode,
           max_tokens: activeProfile?.maxTokens || settings.maxTokens || 0,
         }),
@@ -1676,8 +2048,13 @@ You have been granted access to run commands in the user's restricted in-app san
       });
 
       if (!response.ok) {
-        const errJson = await response.json().catch(() => ({}));
-        throw new Error(errJson.message || errJson.error || `HTTP ${response.status}`);
+        const errRawText = await response.text().catch(() => '');
+        let errJson: any = {};
+        try { errJson = JSON.parse(errRawText); } catch { errJson = {}; }
+        throw new HttpProviderError(
+          extractProviderErrorMessage(errJson, response.status, errRawText),
+          response.status,
+        );
       }
 
       // 5. Read SSE stream
@@ -1691,6 +2068,9 @@ You have been granted access to run commands in the user's restricted in-app san
       let buffer = '';
       rawAccumulatedStream = '';
       rawAccumulatedThinking = '';
+      // Accumulates native OpenAI-style tool_calls streamed across deltas.
+      // Index -> { id, name(nameSpaced), arguments(string, built up across deltas) }.
+      const toolCallBuffers = new Map<number, { id: string; name: string; arguments: string }>();
 
       while (true) {
         const { done, value } = await reader.read();
@@ -1716,6 +2096,11 @@ You have been granted access to run commands in the user's restricted in-app san
               const data = JSON.parse(trimmed.slice(6));
               delta = data.choices?.[0]?.delta?.content || data.choices?.[0]?.delta?.text || data.choices?.[0]?.text || data.choices?.[0]?.message?.content || data.content || '';
               reasoningDelta = data.choices?.[0]?.delta?.reasoning_content || data.choices?.[0]?.delta?.reasoning || data.choices?.[0]?.delta?.thinking || '';
+              const fr = data.choices?.[0]?.finish_reason;
+              if (fr) streamFinishReason = fr;
+              accumulateToolCalls(toolCallBuffers, data.choices?.[0]?.delta?.tool_calls);
+              const _u = captureUsage(data);
+              if (_u) { usageInput = _u.input; usageOutput = _u.output; }
             } catch (pErr) {
               // Non-fatal SSE chunk parse
             }
@@ -1724,6 +2109,11 @@ You have been granted access to run commands in the user's restricted in-app san
               const data = JSON.parse(trimmed);
               delta = data.choices?.[0]?.delta?.content || data.choices?.[0]?.delta?.text || data.choices?.[0]?.message?.content || data.choices?.[0]?.text || data.content || '';
               reasoningDelta = data.choices?.[0]?.delta?.reasoning_content || data.choices?.[0]?.delta?.reasoning || data.choices?.[0]?.delta?.thinking || '';
+              const fr = data.choices?.[0]?.finish_reason;
+              if (fr) streamFinishReason = fr;
+              accumulateToolCalls(toolCallBuffers, data.choices?.[0]?.delta?.tool_calls || data.choices?.[0]?.message?.tool_calls);
+              const _u = captureUsage(data);
+              if (_u) { usageInput = _u.input; usageOutput = _u.output; }
             } catch (pErr) {
               // Non-fatal JSON chunk parse
             }
@@ -1775,6 +2165,8 @@ You have been granted access to run commands in the user's restricted in-app san
             const data = JSON.parse(trimmed.slice(6));
             const delta = data.choices?.[0]?.delta?.content || data.choices?.[0]?.delta?.text || data.choices?.[0]?.text || data.choices?.[0]?.message?.content || data.content || '';
             const reasoningDelta = data.choices?.[0]?.delta?.reasoning_content || data.choices?.[0]?.delta?.reasoning || data.choices?.[0]?.delta?.thinking || '';
+            const fr = data.choices?.[0]?.finish_reason;
+            if (fr) streamFinishReason = fr;
             if (delta) {
               assistantMessageContent += delta;
               rawAccumulatedStream += delta;
@@ -1788,6 +2180,37 @@ You have been granted access to run commands in the user's restricted in-app san
         }
       }
 
+      // Determine whether the generation was genuinely truncated (hit the
+      // token limit) vs. a clean completion. Only a "length" finish_reason
+      // (or a missing finish_reason with no content) is a real cutoff.
+      const wasTruncatedByLimit = streamFinishReason === 'length';
+
+      // Accurate token count for this completed assistant response.
+      //  - If the provider reported `usage` (prompt_tokens + completion_tokens),
+      //    use those EXACT figures — this is the gold standard.
+      //  - Otherwise estimate output tokens with the real BPE tokenizer, and
+      //    estimate input tokens by counting the system prompt + conversation
+      //    we actually sent. This gives a true total-spend number (input +
+      //    output) instead of only counting output.
+      const finalParsed0 = parseThinkingFromStream(rawAccumulatedStream);
+      const outputTokens = usageOutput || await countTokens(
+        (finalParsed0.content || assistantMessageContent || '').trim(),
+      );
+      // Input token estimate: count the full system prompt + every message we
+      // sent in the request. (We can't count the model's internal reasoning
+      // tokens, but this captures the bulk of input cost.)
+      let inputTokens = usageInput;
+      if (!inputTokens) {
+        try {
+          const promptText = (fullSystemPrompt || '') + '\n' +
+            cleanApiMessages.map((mm: any) => `${mm.role}: ${mm.content || ''}`).join('\n');
+          inputTokens = await countTokens(promptText);
+        } catch {
+          inputTokens = 0;
+        }
+      }
+      const responseTokenCount = outputTokens; // kept for the per-response footer
+
       // Finalize thinking state on message. Persist immediately (not just
       // via the debounced effect) so the completed assistant message survives
       // a reload even if it happens within the debounce window.
@@ -1798,10 +2221,16 @@ You have been granted access to run commands in the user's restricted in-app san
           const combinedThinking = (rawAccumulatedThinking + (parsedStream.thinking ? (rawAccumulatedThinking ? '\n' : '') + parsedStream.thinking : '')).trim();
           const finalContent = (parsedStream.content || assistantMessageContent || '').trim();
           const clarification = parseClarificationRequest(finalContent);
-          
+
+          // Only treat an empty response body as a real problem when the stream
+          // did NOT finish cleanly (finish_reason !== 'stop'). A clean "stop"
+          // with reasoning but no body is a normal "model chose not to respond"
+          // case, not a cutoff — so no Retry banner.
+          const cleanStop = streamFinishReason === 'stop' || streamFinishReason === 'stop_sequence' || streamFinishReason === 'tool_calls';
+
           let displayFinalContent = finalContent;
           if (!displayFinalContent) {
-            if (combinedThinking) {
+            if (combinedThinking && !cleanStop) {
               displayFinalContent = `*(The model completed its reasoning phase but did not produce a response body before the stream ended. Click **Retry** below to regenerate the response.)*`;
             } else {
               displayFinalContent = `I have analyzed your workspace context and files. Let me know if you would like me to perform any specific code edits, deep reviews, or file modifications.`;
@@ -1819,10 +2248,19 @@ You have been granted access to run commands in the user's restricted in-app san
                       : displayFinalContent,
                     thinkingContent: combinedThinking,
                     isThinking: false,
+                    // isStopped = TRUE only on a genuine token-limit truncation
+                    // (finish_reason "length"). A clean completion must NOT flag
+                    // the message as cut off (that caused the false "continue/
+                    // retry" banner on every normal response).
+                    isStopped: wasTruncatedByLimit,
+                    isError: false,
                     clarificationRequests: clarification ? clarification.requests : undefined,
                     clarificationAnswers: [],
                     modelUsed: chosenModelDisplayName,
                     generationDurationMs: Date.now() - requestStartTime,
+                    tokensEstimate: responseTokenCount,
+                    inputTokens,
+                    outputTokens,
                   }
                 : m
             ),
@@ -1844,6 +2282,10 @@ You have been granted access to run commands in the user's restricted in-app san
 
       // Capture for the post-completion sandbox agent follow-up.
       completedAssistantText = fullAssistantOutput;
+      // Capture native tool_calls streamed this turn for the MCP follow-up.
+      completedNativeToolCalls = Array.from(toolCallBuffers.values()).filter(
+        (tc) => tc.name,
+      );
 
       let targetProject = targetChat.projectId
         ? projects.find((p) => p.id === targetChat.projectId) || null
@@ -2021,6 +2463,8 @@ You have been granted access to run commands in the user's restricted in-app san
                   ? {
                       ...m,
                       isThinking: false,
+                      // Genuine user-initiated stop → show continue/retry so the
+                      // user can resume. (Not a false positive.)
                       isStopped: true,
                     }
                   : m
@@ -2032,72 +2476,167 @@ You have been granted access to run commands in the user's restricted in-app san
           return updated;
         });
       } else {
-        const isApiKeyError =
-          err.message?.includes('No API') ||
-          err.message?.includes('API key') ||
-          err.message?.includes('API Key') ||
-          err.message?.includes('configure an API') ||
-          err.message?.includes('401') ||
-          err.message?.includes('Unauthorized') ||
-          err.message?.includes('Invalid Authentication');
+        // If the stream already produced a clean finish_reason (stop/length) and
+        // real content, a trailing connection error (e.g. the socket closing
+        // right after [DONE]) is NOT a generation failure — finalize the message
+        // as completed instead of marking it errored/cut-off. This is the path
+        // that produced the false "continue/retry" banner on normal responses
+        // for providers whose connection tears down abruptly post-stream.
+        // The model WORKED if any real tokens arrived. Providers (NVIDIA NIM
+        // especially) and the desktop webview often close the SSE socket
+        // abruptly right after the content — that trailing transport error is
+        // NOT a generation failure. Finalize as a success instead of surfacing
+        // a false "error / continue / retry" card. Only a real provider HTTP
+        // error (HttpProviderError) still counts as an error.
+        const parsedStream = parseThinkingFromStream(rawAccumulatedStream);
+        const combinedThinking = (rawAccumulatedThinking + (parsedStream.thinking ? (rawAccumulatedThinking ? '\n' : '') + parsedStream.thinking : '')).trim();
+        const existingPartialContent = (parsedStream.content || assistantMessageContent || '').trim();
+        const cleanStop =
+          streamFinishReason === 'stop' ||
+          streamFinishReason === 'stop_sequence' ||
+          streamFinishReason === 'tool_calls' ||
+          (Boolean(existingPartialContent) && !isHttpProviderError(err));
 
-        const isQuotaError =
-          err.message?.includes('resource_exhausted') ||
-          err.message?.includes('RESOURCE_EXHAUSTED') ||
-          err.message?.includes('quota') ||
-          err.message?.includes('Quota') ||
-          err.message?.includes('429') ||
-          err.message?.includes('rate limit') ||
-          err.message?.includes('Rate limit') ||
-          err.message?.includes('exceeded your current quota');
-
-        let errorContent = '';
-        if (isApiKeyError) {
-          errorContent = `⚠️ **API Key Configuration Required**\n\nTo connect to your configured model, please enter your API key in **Settings** (⚙️).\n\n*Click the "Open Settings" button in the top header or sidebar to configure your key.*`;
-        } else if (isQuotaError) {
-          errorContent = `⚠️ **API Rate Limit / Quota Exceeded**\n\nYour model provider reported a quota limit (\`RESOURCE_EXHAUSTED\` / \`429\`):\n\n> *${err.message}*\n\n**Recommended Solutions:**\n- ⏳ **Wait 30–60 seconds** for the model provider's rate limit window to reset.\n- ⚙️ **Switch Model/Profile:** Open **Settings (⚙️)** to switch to a different model (e.g., Claude 3.5 Sonnet, GPT-4o, DeepSeek R1, or another Gemini tier).\n- 🔑 **Custom Key:** If using your own API key, check your quota and billing tier in your provider's developer console.`;
-        } else {
-          errorContent = `⚠️ **Connection Error**\n\n${err.message || 'Unable to connect to the model endpoint. Please check your settings or network connection.'}`;
-        }
-
-        setChats((prevChats) => {
-          const updated = prevChats.map((c) => {
-            if (c.id !== targetChat.id) return c;
-            const hasExisting = c.messages.some((m) => m.id === assistantMsgId);
-            const parsedStream = parseThinkingFromStream(rawAccumulatedStream);
-            const combinedThinking = (rawAccumulatedThinking + (parsedStream.thinking ? (rawAccumulatedThinking ? '\n' : '') + parsedStream.thinking : '')).trim();
-            const existingPartialContent = (parsedStream.content || assistantMessageContent || '').trim();
-
-            const updatedMsgs = hasExisting
-              ? c.messages.map((m) =>
-                  m.id === assistantMsgId
-                    ? {
-                        ...m,
-                        content: existingPartialContent || errorContent,
-                        thinkingContent: combinedThinking || m.thinkingContent,
-                        isThinking: false,
-                        isError: !existingPartialContent,
-                        isStopped: Boolean(existingPartialContent),
-                      }
-                    : m
-                )
-              : [
-                  ...c.messages,
-                  {
-                    id: assistantMsgId,
-                    role: 'assistant' as const,
-                    content: existingPartialContent || errorContent,
-                    thinkingContent: combinedThinking,
-                    timestamp: Date.now(),
-                    isError: !existingPartialContent,
-                    isStopped: Boolean(existingPartialContent),
-                  },
-                ];
-            return { ...c, messages: updatedMsgs, updatedAt: Date.now() };
+        if (cleanStop && existingPartialContent) {
+          // Treat as a successful completion (the model finished cleanly; the
+          // error was just the transport closing).
+          const completedOutputTokens = usageOutput || await countTokens(existingPartialContent);
+          // usageInput was hoisted before the try, so it's accessible here. If
+          // the provider didn't report usage we can't re-derive the prompt
+          // tokens in this catch path (the try-scoped vars aren't visible), so
+          // we leave input at 0 — the main try path computes it when present.
+          const completedInputTokens = usageInput;
+          setChats((prevChats) => {
+            const updated = prevChats.map((c) => {
+              if (c.id !== targetChat.id) return c;
+              const updatedMsgs = c.messages.map((m) =>
+                m.id === assistantMsgId
+                  ? {
+                      ...m,
+                      content: existingPartialContent,
+                      thinkingContent: combinedThinking || m.thinkingContent,
+                      isThinking: false,
+                      isStopped: false,
+                      isError: false,
+                      modelUsed: chosenModelDisplayName,
+                      generationDurationMs: Date.now() - requestStartTime,
+                      tokensEstimate: completedOutputTokens,
+                      inputTokens: completedInputTokens,
+                      outputTokens: completedOutputTokens,
+                    }
+                  : m
+              );
+              return { ...c, messages: updatedMsgs, updatedAt: Date.now() };
+            });
+            StorageService.saveChats(updated);
+            return updated;
           });
-          StorageService.saveChats(updated);
-          return updated;
-        });
+        } else {
+          // Classify the error. CRITICAL: a genuine quota/rate-limit error is
+          // recognized ONLY from a real HTTP 429 status (carried on
+          // HttpProviderError) — never from a loose substring match on an
+          // arbitrary thrown transport error message. The old substring matcher
+          // turned benign desktop-webview socket-close errors into false
+          // "Your model provider reported a quota limit" banners on the 2nd/3rd
+          // prompt. Transport errors with partial content are treated as a
+          // stop (continue/retry), not a hard error.
+          const httpStatus = isHttpProviderError(err) ? err.status : 0;
+
+          const isApiKeyError =
+            httpStatus === 401 ||
+            err.message?.includes('No API') ||
+            err.message?.includes('API key') ||
+            err.message?.includes('API Key') ||
+            err.message?.includes('configure an API') ||
+            err.message?.includes('Unauthorized') ||
+            err.message?.includes('Invalid Authentication');
+
+          // Real 429, or an explicit provider quota payload (only from a real
+          // HTTP response, not a transport error).
+          const isQuotaError =
+            httpStatus === 429 ||
+            (isHttpProviderError(err) && (
+              err.message?.includes('resource_exhausted') ||
+              err.message?.includes('RESOURCE_EXHAUSTED') ||
+              err.message?.includes('exceeded your current quota')
+            ));
+
+          // Provider-side 4xx (not 401/429): a REAL HTTP response with a real
+          // error body — e.g. 400 "unknown parameter reasoning_effort", 404
+          // "model not found", 403 forbidden. These are NOT quota errors and
+          // NOT transport interruptions; they must surface the true cause so a
+          // fresh API key + a wrong model name isn't misread as "quota". Show
+          // the real HTTP status + provider message.
+          const isProvider4xx =
+            httpStatus >= 400 && httpStatus < 500 && httpStatus !== 401 && httpStatus !== 429;
+
+          // The REAL provider error detail is always included verbatim in the
+          // card — never swallowed — so the user sees the true cause (invalid
+          // key, wrong model, exhausted quota) instead of a one-size-fits-all
+          // banner they can't act on.
+          const providerDetail = (err.message || '').trim();
+          let errorContent = '';
+          if (isApiKeyError) {
+            errorContent = `⚠️ **API Key Problem** (HTTP ${httpStatus || 'auth'})\n\n${providerDetail ? `> *${providerDetail}*\n\n` : ''}The provider rejected the request as an authentication/key problem. Open **Settings (⚙️)** and check that the API key is correct, active, and has access to the configured model.`;
+          } else if (isQuotaError) {
+            errorContent = `⚠️ **API Rate Limit / Quota Exceeded** (HTTP ${httpStatus || 429})\n\nYour model provider reported a real quota/rate-limit error:\n\n> *${providerDetail || 'RESOURCE_EXHAUSTED'}*\n\n**Recommended Solutions:**\n- ⏳ **Wait 30–60 seconds** for the provider's rate-limit window to reset.\n- ⚙️ **Switch Model/Profile:** Open **Settings (⚙️)** to switch to a different model or provider.\n- 🔑 **Custom Key:** Check your usage quota and billing tier in your provider's developer console.`;
+          } else if (isProvider4xx) {
+            // Surface the REAL provider error with its HTTP status so the user
+            // sees the actual cause (e.g. "400 model_not_found", "400 unknown
+            // parameter reasoning_effort") instead of a misleading generic
+            // banner. This is the common cause of "fresh key but it errors"
+            // complaints — the key is fine; the model/param is wrong.
+            errorContent = `⚠️ **Provider Error (HTTP ${httpStatus})**\n\n${err.message || 'The model provider rejected the request.'}\n\n**What to check:**\n- Verify the **Base URL** and **Model name** in Settings (⚙️) match your provider exactly (e.g. a typo'd model name returns 404).\n- If the message mentions an unknown parameter, it usually means your provider doesn't support that option (e.g. reasoning_effort) — try switching Reasoning Mode to **Off**.\n- A fresh API key does NOT cause this; it's a request-shape problem. Open Settings (⚙️) to adjust.`;
+          } else if (existingPartialContent) {
+            // Transport interruption with partial content: NOT a hard error.
+            // Keep what the model produced and offer Continue/Retry. Do not
+            // show a scary quota/connection banner — the response itself is
+            // useful and the user can just continue.
+            errorContent = '';
+          } else {
+            errorContent = `⚠️ **Connection Interrupted**\n\nThe response stream was interrupted before any content arrived. Click **Retry** to try again.\n\n\`${err.message || 'Network/stream error'}\``;
+          }
+
+          setChats((prevChats) => {
+            const updated = prevChats.map((c) => {
+              if (c.id !== targetChat.id) return c;
+              const hasExisting = c.messages.some((m) => m.id === assistantMsgId);
+
+              const updatedMsgs = hasExisting
+                ? c.messages.map((m) =>
+                    m.id === assistantMsgId
+                      ? {
+                          ...m,
+                          content: existingPartialContent || errorContent,
+                          thinkingContent: combinedThinking || m.thinkingContent,
+                          isThinking: false,
+                          // A transport error with partial content is an
+                          // interruption (continue/retry) — NOT a hard error
+                          // and NOT a fake quota banner. Only show isError when
+                          // there is no content at all.
+                          isError: !existingPartialContent && Boolean(errorContent),
+                          isStopped: Boolean(existingPartialContent),
+                        }
+                      : m
+                  )
+                : [
+                    ...c.messages,
+                    {
+                      id: assistantMsgId,
+                      role: 'assistant' as const,
+                      content: existingPartialContent || errorContent,
+                      thinkingContent: combinedThinking,
+                      timestamp: Date.now(),
+                      isError: !existingPartialContent && Boolean(errorContent),
+                      isStopped: Boolean(existingPartialContent),
+                    },
+                  ];
+              return { ...c, messages: updatedMsgs, updatedAt: Date.now() };
+            });
+            StorageService.saveChats(updated);
+            return updated;
+          });
+        }
       }
     } finally {
       // Belt-and-suspenders: ensure no live-stream overlay lingers after the
@@ -2107,6 +2646,91 @@ You have been granted access to run commands in the user's restricted in-app san
       setCurrentGeneratingModelName(null);
       setAiStatus('idle');
       abortControllerRef.current = null;
+    }
+
+    // 6.5. MCP tool-execution follow-up (AI → MCP server → AI). When the model
+    // requested MCP tools this turn — either via native tool_calls (OpenAI
+    // function calling) or via ```mcp_tool_call text blocks — the app actually
+    // executes each call against the named MCP server (JSON-RPC tools/call) and
+    // feeds the result text back as a follow-up user turn so the model can read
+    // the data and continue. This is the real tool-execution bridge: the model's
+    // tool calls are no longer just described in the prompt — they're run, and
+    // the output is returned. Capped to avoid runaway loops.
+    if (
+      completedAssistantText &&
+      mcpFollowupRef.current < MCP_MAX_TOOL_ROUNDS &&
+      !isSandboxFollowup // sandbox follow-ups must not spawn MCP rounds (avoid cross-loops)
+      // isMcpToolFollowup IS allowed to continue the MCP tool-calling loop so
+      // the model can make multiple sequential tool calls across rounds.
+    ) {
+      // Build the list of tool calls requested this turn.
+      // Native tool_calls: name is namespaced "serverName/toolName".
+      const nativeCalls = completedNativeToolCalls
+        .map((tc) => {
+          const slash = tc.name.indexOf('/');
+          if (slash < 0) return null;
+          const serverName = tc.name.slice(0, slash);
+          const toolName = tc.name.slice(slash + 1);
+          let args: Record<string, unknown> = {};
+          try {
+            args = tc.arguments ? JSON.parse(tc.arguments) : {};
+          } catch {
+            args = { _raw: tc.arguments };
+          }
+          return { serverName, toolName, args, raw: tc.name };
+        })
+        .filter(Boolean) as Array<{ serverName: string; toolName: string; args: Record<string, unknown>; raw: string }>;
+
+      // Text-based fallback: ```mcp_tool_call blocks.
+      const textCalls = parseToolCallsFromText(completedAssistantText).map((p) => ({
+        serverName: p.serverName,
+        toolName: p.toolName,
+        args: p.args,
+        raw: p.raw,
+      }));
+
+      const allCalls = [...nativeCalls, ...textCalls];
+      if (allCalls.length > 0) {
+        mcpFollowupRef.current += 1;
+        const round = mcpFollowupRef.current;
+        const servers = (settings.mcpServers || []).filter((s) => s.enabled);
+        const serverByName = new Map(servers.map((s) => [s.name, s]));
+        const results: string[] = [];
+        for (const call of allCalls) {
+          const server = call.serverName ? serverByName.get(call.serverName) : servers[0];
+          if (!server) {
+            results.push(
+              `🔧 MCP tool call "${call.raw}" → no enabled server named "${call.serverName}". Available: ${servers.map((s) => s.name).join(', ') || '(none)'}.`,
+            );
+            continue;
+          }
+          if (server.status !== 'online') {
+            // Try to (re)probe before failing — it may just be stale status.
+            const probed = await probeMcpServer(server);
+            if (probed.status !== 'online') {
+              results.push(`🔧 MCP tool call "${call.raw}" → server "${server.name}" is offline (${server.url}).`);
+              continue;
+            }
+          }
+          const res = await callMcpTool(server, call.toolName, call.args);
+          const tag = res.isError ? '⚠️' : '✅';
+          results.push(
+            `${tag} MCP tool call "${call.raw}" → ${res.isError ? 'errored' : 'succeeded'}:\n${res.content}`,
+          );
+        }
+
+        if (results.length > 0) {
+          const combined = results.join('\n\n---\n\n');
+          await handleSendMessage(
+            `[MCP tool execution results — round ${round}]\n\n${combined}\n\nRead these results and continue the task. If you need more data, make additional MCP tool calls; otherwise, summarize the outcome for the user.`,
+            false,
+            undefined,
+            completedChatId,
+            false,
+            true,
+          );
+        }
+      }
     }
 
     // 7. Sandbox agent follow-up (AI → sandbox → AI). Only when the user has
@@ -2131,11 +2755,42 @@ You have been granted access to run commands in the user's restricted in-app san
         sandboxStore.pushLog('status', `[agent] Sandbox follow-up round ${round}: ${commands.length} command(s) proposed by AI.`, 'agent');
         const followChat = chats.find((c) => c.id === completedChatId);
         const proj = followChat?.projectId ? projects.find((p) => p.id === followChat.projectId) || null : null;
+        // Seed ALL code artifacts from the AI's latest response into the run
+        // workdir by their REAL title (the same filename the artifact parser
+        // / file viewer / files-list uses), so `python <file>.py`, `node
+        // <file>.js`, and multi-file imports all resolve by name. This fixes
+        // the inconsistency where the app named a file "python_1.py" but the
+        // AI referenced "calculator.py" — now every artifact the AI produced
+        // this turn is written under its real title, and the AI is told (via
+        // the system prompt) to name files explicitly so they match.
+        const seedFiles = (() => {
+          if (!followChat) return undefined;
+          const byPath = new Map<string, { path: string; content: string }>();
+          // Walk from the most recent assistant turn backwards; collect every
+          // code artifact (dedup by path). This catches the file the AI just
+          // wrote plus any companions from earlier turns in the same chat.
+          for (let i = followChat.messages.length - 1; i >= 0; i--) {
+            const m = followChat.messages[i];
+            if (m.role !== 'assistant' || !m.content) continue;
+            const arts = ArtifactParser.extractArtifacts(m.content);
+            for (const a of arts) {
+              // a.title is the real filename the parser derived (e.g.
+              // "calculator.py"); it's what the file viewer & sandbox should
+              // both reference. Skip markdown/empty.
+              if (!a.title || !a.code) continue;
+              const p = a.title.startsWith('/') ? a.title.slice(1) : a.title;
+              if (!byPath.has(p)) byPath.set(p, { path: p, content: a.code });
+            }
+          }
+          return byPath.size > 0 ? Array.from(byPath.values()) : undefined;
+        })();
         try {
           const result = await runSandboxAgentStep(commands, {
             mode: completedAutoMode,
             store: sandboxStore,
             project: proj,
+            chatId: completedChatId,
+            seedFiles,
           });
           if (result.ranAny && result.outputText) {
             // Feed the tool output back to the AI as a follow-up turn. This
@@ -2292,6 +2947,7 @@ You have been granted access to run commands in the user's restricted in-app san
         isUniversalChat={!activeChat?.projectId}
         onSaveAsProject={handleSaveArtifactsAsProject}
         isSavingAsProject={isSavingAsProject}
+        gistToken={settings.gistToken}
         onCreateFile={(initialFolder) => {
           if (!activeProject) handleNewProject();
           setCreateFileFolder(initialFolder || '');
@@ -2335,6 +2991,7 @@ You have been granted access to run commands in the user's restricted in-app san
           file={selectedFileForModal}
           onClose={() => setSelectedFileForModal(null)}
           onReportBug={(bugMessage) => handleSendMessage(bugMessage, false)}
+          gistToken={settings.gistToken}
           onToggleContext={(fileId) => {
             if (!activeProject) return;
             const updated = activeProject.files.map((f) =>
@@ -2376,11 +3033,18 @@ You have been granted access to run commands in the user's restricted in-app san
 
       {/* 5. BYOK Workspace Settings Modal */}
       <SettingsModal
-        isOpen={isSettingsModalOpen}
-        onClose={() => setIsSettingsModalOpen(false)}
-        settings={settings}
-        onSaveSettings={(newSettings) => setSettings(newSettings)}
-      />
+  isOpen={isSettingsModalOpen}
+  onClose={() => setIsSettingsModalOpen(false)}
+  settings={settings}
+  onSaveSettings={(newSettings) => {
+    setSettings(newSettings);
+    try {
+      StorageService.saveSettings(newSettings);
+    } catch (e) {
+      console.error('Failed to persist settings from App', e);
+    }
+  }}
+/>
 
       {/* 5b. Create New Project Workspace Modal */}
       <CreateProjectModal
